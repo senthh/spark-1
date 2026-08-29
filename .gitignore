@@ -62,6 +62,7 @@ docs/.local_ruby_bundle
 sql/docs
 sql/mkdocs.yml
 sql/site
+sql/native-cpp/build/
 lib_managed/
 lint-r-report.log
 lint-js-report.log

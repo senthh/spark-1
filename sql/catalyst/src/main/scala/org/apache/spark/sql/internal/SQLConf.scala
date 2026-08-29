@@ -1073,6 +1073,22 @@ object SQLConf {
     .booleanConf
     .createWithDefault(false)
 
+  val NATIVE_SQL_ENABLED = buildConf("spark.sql.nativesql.enabled")
+    .doc("When true, Spark may offload supported SQL subtrees (scan, filter, project, " +
+      "hash aggregate, hash join over primitive int/long/double/boolean) to the experimental " +
+      "Native SQL C++ engine via JNI. Unsupported plans fall back to the JVM engine.")
+    .version("4.2.0")
+    .booleanConf
+    .createWithDefault(false)
+
+  val NATIVE_SQL_LIB = buildConf("spark.sql.nativesql.lib")
+    .doc("Absolute path to the Native SQL JNI library (libspark_nativesql_jni.so or " +
+      "libspark_nativesql_jni.dylib). When unset, Spark looks for the library on " +
+      "java.library.path / LD_LIBRARY_PATH.")
+    .version("4.2.0")
+    .stringConf
+    .createOptional
+
   val ADAPTIVE_EXECUTION_APPLY_FINAL_STAGE_SHUFFLE_OPTIMIZATIONS =
     buildConf("spark.sql.adaptive.applyFinalStageShuffleOptimizations")
       .internal()
@@ -7809,6 +7825,10 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
   def objectLevelCollationsEnabled: Boolean = getConf(OBJECT_LEVEL_COLLATIONS_ENABLED)
 
   def schemaLevelCollationsEnabled: Boolean = getConf(SCHEMA_LEVEL_COLLATIONS_ENABLED)
+
+  def nativeSqlEnabled: Boolean = getConf(NATIVE_SQL_ENABLED)
+
+  def nativeSqlLib: Option[String] = getConf(NATIVE_SQL_LIB)
 
   def adaptiveExecutionEnabled: Boolean = getConf(ADAPTIVE_EXECUTION_ENABLED)
 

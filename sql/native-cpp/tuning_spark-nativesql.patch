@@ -1,0 +1,1833 @@
+diff --git a/.gitignore b/.gitignore
+index a3c760b9b8e..000cd3f1f0a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -62,6 +62,7 @@ docs/.local_ruby_bundle
+ sql/docs
+ sql/mkdocs.yml
+ sql/site
++sql/native-cpp/build/
+ lib_managed/
+ lint-r-report.log
+ lint-js-report.log
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/internal/SQLConf.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/internal/SQLConf.scala
+index 688ca93320b..cf2fa82d4b1 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/internal/SQLConf.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/internal/SQLConf.scala
+@@ -1073,6 +1073,22 @@ object SQLConf {
+     .booleanConf
+     .createWithDefault(false)
+ 
++  val NATIVE_SQL_ENABLED = buildConf("spark.sql.nativesql.enabled")
++    .doc("When true, Spark may offload supported SQL subtrees (scan, filter, project, " +
++      "hash aggregate, hash join over primitive int/long/double/boolean) to the experimental " +
++      "Native SQL C++ engine via JNI. Unsupported plans fall back to the JVM engine.")
++    .version("4.2.0")
++    .booleanConf
++    .createWithDefault(false)
++
++  val NATIVE_SQL_LIB = buildConf("spark.sql.nativesql.lib")
++    .doc("Absolute path to the Native SQL JNI library (libspark_nativesql_jni.so or " +
++      "libspark_nativesql_jni.dylib). When unset, Spark looks for the library on " +
++      "java.library.path / LD_LIBRARY_PATH.")
++    .version("4.2.0")
++    .stringConf
++    .createOptional
++
+   val ADAPTIVE_EXECUTION_APPLY_FINAL_STAGE_SHUFFLE_OPTIMIZATIONS =
+     buildConf("spark.sql.adaptive.applyFinalStageShuffleOptimizations")
+       .internal()
+@@ -7810,6 +7826,10 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
+ 
+   def schemaLevelCollationsEnabled: Boolean = getConf(SCHEMA_LEVEL_COLLATIONS_ENABLED)
+ 
++  def nativeSqlEnabled: Boolean = getConf(NATIVE_SQL_ENABLED)
++
++  def nativeSqlLib: Option[String] = getConf(NATIVE_SQL_LIB)
++
+   def adaptiveExecutionEnabled: Boolean = getConf(ADAPTIVE_EXECUTION_ENABLED)
+ 
+   def adaptiveExecutionEnabledInStatelessStreaming: Boolean =
+diff --git a/sql/core/src/main/java/org/apache/spark/sql/execution/nativesql/NativeSqlJni.java b/sql/core/src/main/java/org/apache/spark/sql/execution/nativesql/NativeSqlJni.java
+new file mode 100644
+index 00000000000..257c6b9d803
+--- /dev/null
++++ b/sql/core/src/main/java/org/apache/spark/sql/execution/nativesql/NativeSqlJni.java
+@@ -0,0 +1,32 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.execution.nativesql;
++
++/**
++ * JNI surface for {@code libspark_nativesql_jni}.
++ *
++ * <p>Each input is a columnar batch: {@code Object[]} of primitive arrays
++ * ({@code int[]}, {@code long[]}, {@code double[]}, {@code boolean[]}).
++ *
++ * <p>Result is {@code Object[]{ Integer numRows, Object[] columns }}.
++ */
++public final class NativeSqlJni {
++  private NativeSqlJni() {}
++
++  public static native Object[] execute(String planIr, Object[][] columns, int[] numRows);
++}
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkPlanner.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkPlanner.scala
+index 7e7f8390371..ccd60fda449 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkPlanner.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkPlanner.scala
+@@ -26,6 +26,7 @@ import org.apache.spark.sql.execution.adaptive.LogicalQueryStageStrategy
+ import org.apache.spark.sql.execution.command.v2.V2CommandStrategy
+ import org.apache.spark.sql.execution.datasources.{DataSourceStrategy, FileSourceStrategy}
+ import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Strategy
++import org.apache.spark.sql.execution.nativesql.NativeSqlStrategy
+ import org.apache.spark.sql.internal.SQLConf
+ 
+ class SparkPlanner(val session: SparkSession, val experimentalMethods: ExperimentalMethods)
+@@ -60,7 +61,7 @@ class SparkPlanner(val session: SparkSession, val experimentalMethods: Experimen
+    * Override to add extra planning strategies to the planner. These strategies are tried after
+    * the strategies defined in [[ExperimentalMethods]], and before the regular strategies.
+    */
+-  def extraPlanningStrategies: Seq[Strategy] = Nil
++  def extraPlanningStrategies: Seq[Strategy] = NativeSqlStrategy :: Nil
+ 
+   override protected def collectPlaceholders(plan: SparkPlan): Seq[(SparkPlan, LogicalPlan)] = {
+     plan.collect {
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/nativesql/NativeSqlExec.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/nativesql/NativeSqlExec.scala
+new file mode 100644
+index 00000000000..d8f33adf2cd
+--- /dev/null
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/nativesql/NativeSqlExec.scala
+@@ -0,0 +1,177 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.execution.nativesql
++
++import org.apache.spark.rdd.RDD
++import org.apache.spark.sql.catalyst.InternalRow
++import org.apache.spark.sql.catalyst.expressions.{Attribute, GenericInternalRow, UnsafeProjection}
++import org.apache.spark.sql.catalyst.plans.physical.Partitioning
++import org.apache.spark.sql.execution.LeafExecNode
++import org.apache.spark.sql.execution.metric.SQLMetrics
++import org.apache.spark.sql.types._
++import org.apache.spark.util.ArrayImplicits._
++
++/**
++ * Physical node that evaluates a Native SQL IR tree via JNI.
++ * Inputs are local (LocalRelation / Range); the C++ engine runs the full subtree.
++ */
++case class NativeSqlExec(compiled: NativeSqlPlan.Compiled) extends LeafExecNode {
++
++  override def output: Seq[Attribute] = compiled.output
++
++  override lazy val metrics = Map(
++    "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"))
++
++  @transient private lazy val resultRows: Array[InternalRow] = {
++    val (batches, numRows) = encodeLeaves(compiled.leaves)
++    val raw = NativeSqlLibrary.execute(compiled.ir, batches, numRows)
++    val outRows = raw(0).asInstanceOf[Integer].intValue()
++    val cols = raw(1).asInstanceOf[Array[AnyRef]]
++    decodeRows(cols, outRows, output)
++  }
++
++  @transient private lazy val rdd: RDD[InternalRow] = {
++    if (resultRows.isEmpty) {
++      sparkContext.emptyRDD
++    } else {
++      val n = math.min(resultRows.length, session.leafNodeDefaultParallelism)
++      sparkContext.parallelize(resultRows.toImmutableArraySeq, n)
++    }
++  }
++
++  protected override def doExecute(): RDD[InternalRow] = {
++    val numOutputRows = longMetric("numOutputRows")
++    rdd.map { r =>
++      numOutputRows += 1
++      r
++    }
++  }
++
++  override def executeCollect(): Array[InternalRow] = {
++    longMetric("numOutputRows") += resultRows.length
++    resultRows
++  }
++
++  override def outputPartitioning: Partitioning = super.outputPartitioning
++
++  override protected def stringArgs: Iterator[Any] =
++    Iterator(compiled.ir, output)
++
++  private def encodeLeaves(
++      leaves: Seq[NativeSqlPlan.LeafData]): (Array[Array[AnyRef]], Array[Int]) = {
++    val batches = new Array[Array[AnyRef]](math.max(leaves.length, 1))
++    val counts = new Array[Int](math.max(leaves.length, 1))
++    leaves.zipWithIndex.foreach { case (leaf, i) =>
++      leaf match {
++        case NativeSqlPlan.LocalLeaf(schema, rows) =>
++          batches(i) = encodeLocal(schema, rows)
++          counts(i) = rows.length
++        case NativeSqlPlan.RangeLeaf(start, end, step) =>
++          // Range is generated in C++; pass empty batch + encode params in IR.
++          batches(i) = Array.empty[AnyRef]
++          counts(i) = 0
++          val _ = (start, end, step)
++      }
++    }
++    if (leaves.isEmpty) {
++      batches(0) = Array.empty[AnyRef]
++      counts(0) = 0
++    }
++    (batches, counts)
++  }
++
++  private def encodeLocal(schema: Seq[Attribute], rows: Seq[InternalRow]): Array[AnyRef] = {
++    val n = rows.length
++    schema.iterator.zipWithIndex.map { case (a, col) =>
++      a.dataType match {
++        case IntegerType | ByteType | ShortType =>
++          val arr = new Array[Int](n)
++          var i = 0
++          while (i < n) {
++            if (!rows(i).isNullAt(col)) {
++              a.dataType match {
++                case IntegerType => arr(i) = rows(i).getInt(col)
++                case ByteType => arr(i) = rows(i).getByte(col)
++                case ShortType => arr(i) = rows(i).getShort(col)
++                case _ =>
++              }
++            }
++            i += 1
++          }
++          arr
++        case LongType =>
++          val arr = new Array[Long](n)
++          var i = 0
++          while (i < n) {
++            if (!rows(i).isNullAt(col)) arr(i) = rows(i).getLong(col)
++            i += 1
++          }
++          arr
++        case DoubleType | FloatType =>
++          val arr = new Array[Double](n)
++          var i = 0
++          while (i < n) {
++            if (!rows(i).isNullAt(col)) {
++              if (a.dataType == DoubleType) arr(i) = rows(i).getDouble(col)
++              else arr(i) = rows(i).getFloat(col).toDouble
++            }
++            i += 1
++          }
++          arr
++        case BooleanType =>
++          val arr = new Array[Boolean](n)
++          var i = 0
++          while (i < n) {
++            if (!rows(i).isNullAt(col)) arr(i) = rows(i).getBoolean(col)
++            i += 1
++          }
++          arr
++        case other =>
++          throw new UnsupportedOperationException(s"Native SQL cannot encode $other")
++      }
++    }.toArray
++  }
++
++  private def decodeRows(
++      cols: Array[AnyRef],
++      n: Int,
++      schema: Seq[Attribute]): Array[InternalRow] = {
++    val proj = UnsafeProjection.create(schema, schema)
++    val out = new Array[InternalRow](n)
++    var i = 0
++    while (i < n) {
++      val generic = new GenericInternalRow(schema.length)
++      var c = 0
++      while (c < schema.length) {
++        (schema(c).dataType, cols(c)) match {
++          case (IntegerType | ByteType | ShortType, a: Array[Int]) => generic.setInt(c, a(i))
++          case (IntegerType | ByteType | ShortType, a: Array[Long]) => generic.setInt(c, a(i).toInt)
++          case (LongType, a: Array[Long]) => generic.setLong(c, a(i))
++          case (LongType, a: Array[Int]) => generic.setLong(c, a(i).toLong)
++          case (DoubleType | FloatType, a: Array[Double]) => generic.setDouble(c, a(i))
++          case (BooleanType, a: Array[Boolean]) => generic.setBoolean(c, a(i))
++          case _ =>
++        }
++        c += 1
++      }
++      out(i) = proj(generic).copy()
++      i += 1
++    }
++    out
++  }
++}
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/nativesql/NativeSqlLibrary.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/nativesql/NativeSqlLibrary.scala
+new file mode 100644
+index 00000000000..8abced718fa
+--- /dev/null
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/nativesql/NativeSqlLibrary.scala
+@@ -0,0 +1,71 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.execution.nativesql
++
++import java.io.File
++
++import org.apache.spark.internal.Logging
++import org.apache.spark.sql.internal.SQLConf
++
++/**
++ * Loads `libspark_nativesql_jni` and forwards plan IR + columnar batches to C++.
++ *
++ * Column encoding: each column is a primitive Java array (int[] / long[] / double[] / boolean[]).
++ * Result is Object[]{ int numRows, Object[] columns } where columns use the same encoding.
++ */
++object NativeSqlLibrary extends Logging {
++
++  @volatile private var loaded = false
++  @volatile private var loadError: Option[Throwable] = None
++
++  def isAvailable: Boolean = {
++    ensureLoaded()
++    loaded
++  }
++
++  def execute(planIr: String, columns: Array[Array[AnyRef]], numRows: Array[Int]): Array[AnyRef] = {
++    ensureLoaded()
++    if (!loaded) {
++      throw loadError.getOrElse(new IllegalStateException("Native SQL library is not loaded"))
++    }
++    NativeSqlJni.execute(planIr, columns, numRows)
++  }
++
++  private def ensureLoaded(): Unit = synchronized {
++    if (loaded || loadError.isDefined) return
++    try {
++      val explicit = SQLConf.get.nativeSqlLib.filter(_.nonEmpty)
++      explicit match {
++        case Some(path) =>
++          val f = new File(path)
++          if (!f.isFile) {
++            throw new IllegalArgumentException(s"spark.sql.nativesql.lib does not exist: $path")
++          }
++          System.load(f.getAbsolutePath)
++        case None =>
++          System.loadLibrary("spark_nativesql_jni")
++      }
++      loaded = true
++      logInfo("Loaded Native SQL JNI library")
++    } catch {
++      case t: Throwable =>
++        loadError = Some(t)
++        logWarning(s"Native SQL library not loaded: ${t.getMessage}")
++    }
++  }
++}
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/nativesql/NativeSqlPlan.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/nativesql/NativeSqlPlan.scala
+new file mode 100644
+index 00000000000..2acb1e6f063
+--- /dev/null
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/nativesql/NativeSqlPlan.scala
+@@ -0,0 +1,186 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.execution.nativesql
++
++import org.apache.spark.sql.catalyst.expressions._
++import org.apache.spark.sql.catalyst.expressions.aggregate._
++import org.apache.spark.sql.catalyst.plans.Inner
++import org.apache.spark.sql.catalyst.plans.logical._
++import org.apache.spark.sql.types._
++
++/**
++ * Compact S-expression IR consumed by the Native SQL C++ engine.
++ *
++ * Supported subtree (primitive int / long / double / boolean):
++ *   scan → Filter col cmp literal → Project col±col → hash agg / hash join
++ */
++object NativeSqlPlan {
++
++  val supportedAtomic: Set[DataType] =
++    Set(IntegerType, LongType, DoubleType, BooleanType, ByteType, ShortType, FloatType)
++
++  def isSupportedType(dt: DataType): Boolean = supportedAtomic.contains(dt)
++
++  def compile(plan: LogicalPlan): Option[Compiled] = compile0(plan)
++
++  case class Compiled(ir: String, leaves: Seq[LeafData], output: Seq[Attribute])
++
++  sealed trait LeafData
++  case class LocalLeaf(output: Seq[Attribute], rows: Seq[org.apache.spark.sql.catalyst.InternalRow])
++    extends LeafData
++  case class RangeLeaf(start: Long, end: Long, step: Long) extends LeafData
++
++  private def compile0(plan: LogicalPlan): Option[Compiled] = plan match {
++    case l: LocalRelation if l.output.forall(a => isSupportedType(a.dataType)) =>
++      Some(Compiled(s"(scan 0)", Seq(LocalLeaf(l.output, l.data)), l.output))
++
++    case r: Range if r.step != 0 && r.numElements <= Int.MaxValue =>
++      Some(Compiled(
++        s"(range ${r.start} ${r.end} ${r.step})",
++        Seq(RangeLeaf(r.start, r.end, r.step)),
++        r.output))
++
++    case Filter(cond, child) =>
++      for {
++        c <- compile0(child)
++        pred <- compilePred(cond, c.output)
++      } yield c.copy(ir = s"(filter $pred ${c.ir})", output = child.output)
++
++    case Project(projectList, child) =>
++      compile0(child).flatMap { c =>
++        val exprs = projectList.map(compileNamed(_, c.output))
++        if (exprs.forall(_.isDefined)) {
++          Some(c.copy(
++            ir = s"(project (list ${exprs.map(_.get).mkString(" ")}) ${c.ir})",
++            output = projectList.map(_.toAttribute)))
++        } else None
++      }
++
++    case Aggregate(grouping, agg, child) if grouping.size <= 2 =>
++      compile0(child).flatMap { c =>
++        val keys = grouping.map(compileExpr(_, c.output))
++        val aggs = agg.map(compileNamed(_, c.output))
++        if (keys.forall(_.isDefined) && aggs.forall(_.isDefined) &&
++            grouping.forall(e => isSupportedType(e.dataType))) {
++          Some(c.copy(
++            ir = s"(hashagg (list ${keys.map(_.get).mkString(" ")}) (list ${aggs.map(_.get).mkString(" ")}) ${c.ir})",
++            output = agg.map(_.toAttribute)))
++        } else None
++      }
++
++    case Join(left, right, Inner, Some(cond), _) =>
++      for {
++        l <- compile0(left)
++        r <- compile0(right)
++        (lk, rk) <- compileJoinKeys(cond, l.output, r.output)
++        // shift right-side scan indices
++        rIr = shiftScans(r.ir, l.leaves.size)
++      } yield Compiled(
++        s"(hashjoin $lk $rk ${l.ir} $rIr)",
++        l.leaves ++ r.leaves,
++        left.output ++ right.output)
++
++    case _ => None
++  }
++
++  private def shiftScans(ir: String, delta: Int): String = {
++    if (delta == 0) ir
++    else """\(scan (\d+)\)""".r.replaceAllIn(ir, m => s"(scan ${m.group(1).toInt + delta})")
++  }
++
++  private def compilePred(e: Expression, schema: Seq[Attribute]): Option[String] = e match {
++    case And(l, r) =>
++      for (a <- compilePred(l, schema); b <- compilePred(r, schema)) yield s"(and $a $b)"
++    case EqualTo(l, r) => cmp("eq", l, r, schema)
++    case EqualNullSafe(l, r) => cmp("eq", l, r, schema)
++    case GreaterThan(l, r) => cmp("gt", l, r, schema)
++    case GreaterThanOrEqual(l, r) => cmp("ge", l, r, schema)
++    case LessThan(l, r) => cmp("lt", l, r, schema)
++    case LessThanOrEqual(l, r) => cmp("le", l, r, schema)
++    case Not(EqualTo(l, r)) => cmp("ne", l, r, schema)
++    case _ => None
++  }
++
++  private def cmp(op: String, l: Expression, r: Expression, schema: Seq[Attribute]): Option[String] = {
++    (compileExpr(l, schema), compileExpr(r, schema)) match {
++      case (Some(a), Some(b)) => Some(s"($op $a $b)")
++      case _ => None
++    }
++  }
++
++  private def compileNamed(e: NamedExpression, schema: Seq[Attribute]): Option[String] = e match {
++    case Alias(child, _) => compileExpr(child, schema)
++    case other => compileExpr(other, schema)
++  }
++
++  private def compileExpr(e: Expression, schema: Seq[Attribute]): Option[String] = e match {
++    case a: Attribute =>
++      val i = schema.indexWhere(_.exprId == a.exprId)
++      if (i >= 0) Some(s"c$i") else None
++    case Literal(null, _) => None
++    case Literal(v, IntegerType) => Some(s"${v}i32")
++    case Literal(v, LongType) => Some(s"${v}i64")
++    case Literal(v, DoubleType) => Some(s"${v}f64")
++    case Literal(v, FloatType) => Some(s"${v.toString.toDouble}f64")
++    case Literal(v, BooleanType) => Some(if (v == true) "true" else "false")
++    case Literal(v, ByteType) => Some(s"${v}i32")
++    case Literal(v, ShortType) => Some(s"${v}i32")
++    case Add(l, r, _) => bin("add", l, r, schema)
++    case Subtract(l, r, _) => bin("sub", l, r, schema)
++    case Multiply(l, r, _) => bin("mul", l, r, schema)
++    case Divide(l, r, _) => bin("div", l, r, schema)
++    case UnaryMinus(c, _) => compileExpr(c, schema).map(x => s"(neg $x)")
++    case Cast(c, dt, _, _) if isSupportedType(dt) => compileExpr(c, schema)
++    case AggregateExpression(af, _, _, _, _) => compileAgg(af, schema)
++    case af: AggregateFunction => compileAgg(af, schema)
++    case _ => None
++  }
++
++  private def compileAgg(af: AggregateFunction, schema: Seq[Attribute]): Option[String] = af match {
++    case Sum(c, _) => compileExpr(c, schema).map(x => s"(sum $x)")
++    case Count(Nil) => Some("(count)")
++    case Count(Seq(Literal(1, _))) => Some("(count)")
++    case Count(Seq(c)) => compileExpr(c, schema).map(x => s"(count $x)")
++    case Min(c) => compileExpr(c, schema).map(x => s"(min $x)")
++    case Max(c) => compileExpr(c, schema).map(x => s"(max $x)")
++    case Average(c, _) => compileExpr(c, schema).map(x => s"(avg $x)")
++    case _ => None
++  }
++
++  private def bin(op: String, l: Expression, r: Expression, schema: Seq[Attribute]): Option[String] =
++    for (a <- compileExpr(l, schema); b <- compileExpr(r, schema)) yield s"($op $a $b)"
++
++  private def compileJoinKeys(
++      cond: Expression,
++      left: Seq[Attribute],
++      right: Seq[Attribute]): Option[(String, String)] = cond match {
++    case EqualTo(l, r) =>
++      (compileExpr(l, left), compileExpr(r, right)) match {
++        case (Some(a), Some(b)) => Some((a, b))
++        case _ =>
++          (compileExpr(l, right), compileExpr(r, left)) match {
++            case (Some(a), Some(b)) => Some((b, a))
++            case _ => None
++          }
++      }
++    case And(l, r) =>
++      // single-key engine: only accept one equality
++      compileJoinKeys(l, left, right).orElse(compileJoinKeys(r, left, right))
++    case _ => None
++  }
++}
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/nativesql/NativeSqlStrategy.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/nativesql/NativeSqlStrategy.scala
+new file mode 100644
+index 00000000000..00e5df45de5
+--- /dev/null
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/nativesql/NativeSqlStrategy.scala
+@@ -0,0 +1,39 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.execution.nativesql
++
++import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
++import org.apache.spark.sql.execution.{SparkPlan, SparkStrategy}
++import org.apache.spark.sql.internal.SQLConf
++
++/**
++ * Planner hook: when `spark.sql.nativesql.enabled` is true, replace a supported
++ * logical subtree with [[NativeSqlExec]]. Otherwise return Nil so Spark falls back.
++ */
++object NativeSqlStrategy extends SparkStrategy {
++  override def apply(plan: LogicalPlan): Seq[SparkPlan] = {
++    if (!SQLConf.get.nativeSqlEnabled) {
++      Nil
++    } else {
++      NativeSqlPlan.compile(plan) match {
++        case Some(compiled) => NativeSqlExec(compiled) :: Nil
++        case None => Nil
++      }
++    }
++  }
++}
+diff --git a/sql/core/src/test/scala/org/apache/spark/sql/execution/nativesql/NativeSqlSuite.scala b/sql/core/src/test/scala/org/apache/spark/sql/execution/nativesql/NativeSqlSuite.scala
+new file mode 100644
+index 00000000000..94f3d47d689
+--- /dev/null
++++ b/sql/core/src/test/scala/org/apache/spark/sql/execution/nativesql/NativeSqlSuite.scala
+@@ -0,0 +1,93 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.execution.nativesql
++
++import java.io.File
++
++import org.apache.spark.sql.functions._
++import org.apache.spark.sql.internal.SQLConf
++import org.apache.spark.sql.test.SharedSparkSession
++
++class NativeSqlSuite extends SharedSparkSession {
++
++  private def nativeLib: Option[String] = {
++    val root = new File("sql/native-cpp/build")
++    val candidates = Seq(
++      new File(root, "libspark_nativesql_jni.dylib"),
++      new File(root, "libspark_nativesql_jni.so"))
++    candidates.find(_.isFile).map(_.getAbsolutePath)
++  }
++
++  private def withNative[T](f: => T): T = {
++    val lib = nativeLib.getOrElse {
++      cancel("Build sql/native-cpp first: sql/native-cpp/build.sh")
++      ""
++    }
++    withSQLConf(
++        SQLConf.NATIVE_SQL_ENABLED.key -> "true",
++        SQLConf.NATIVE_SQL_LIB.key -> lib,
++        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
++      f
++    }
++  }
++
++  test("disabled by default") {
++    assert(!SQLConf.get.nativeSqlEnabled)
++    val df = Seq((1, 10L), (2, 20L)).toDF("id", "v").filter($"id" > 1)
++    assert(df.queryExecution.executedPlan.collect { case n: NativeSqlExec => n }.isEmpty)
++  }
++
++  test("filter + project offload") {
++    withNative {
++      val df = Seq((1, 10L), (2, 20L), (3, 30L)).toDF("id", "v")
++        .filter($"id" > 1)
++        .select($"id", ($"id" + $"v").as("s"))
++      assert(df.queryExecution.executedPlan.exists(_.isInstanceOf[NativeSqlExec]))
++      checkAnswer(df, Seq(org.apache.spark.sql.Row(2, 22L), org.apache.spark.sql.Row(3, 33L)))
++    }
++  }
++
++  test("hash aggregate offload") {
++    withNative {
++      val df = Seq((1, 10L), (1, 15L), (2, 20L)).toDF("k", "v")
++        .groupBy($"k").agg(sum($"v").as("s"))
++      assert(df.queryExecution.sparkPlan.exists(_.isInstanceOf[NativeSqlExec]))
++      checkAnswer(df, Seq(org.apache.spark.sql.Row(1, 25L), org.apache.spark.sql.Row(2, 20L)))
++    }
++  }
++
++  test("hash join offload") {
++    withNative {
++      val a = Seq((1, 10L), (2, 20L), (3, 30L)).toDF("id", "av")
++      val b = Seq((2, 200L), (3, 300L)).toDF("id", "bv")
++      val df = a.join(b, a("id") === b("id"))
++      assert(df.queryExecution.sparkPlan.exists(_.isInstanceOf[NativeSqlExec]))
++      checkAnswer(
++        df.select(a("id"), $"av", $"bv"),
++        Seq(org.apache.spark.sql.Row(2, 20L, 200L), org.apache.spark.sql.Row(3, 30L, 300L)))
++    }
++  }
++
++  test("unsupported strings fall back") {
++    withNative {
++      val df = Seq("a", "b").toDF("s").filter($"s" === "a")
++      assert(df.queryExecution.sparkPlan.collect { case n: NativeSqlExec => n }.isEmpty)
++      checkAnswer(df, Seq(org.apache.spark.sql.Row("a")))
++    }
++  }
++}
+diff --git a/sql/native-cpp/README.md b/sql/native-cpp/README.md
+new file mode 100644
+index 00000000000..1d0c6510778
+--- /dev/null
++++ b/sql/native-cpp/README.md
+@@ -0,0 +1,52 @@
++# Native SQL (experimental)
++
++Optional C++ execution path for a supported Spark SQL subtree:
++
++`scan → Filter col cmp literal → Project col±col → hash aggregate / hash join`
++
++Primitive types only: `int` / `long` / `double` / `boolean`.
++
++The planner hook is `NativeSqlStrategy` → `NativeSqlExec` in `sql/core`. It is
++**off by default** (`spark.sql.nativesql.enabled=false`). Unsupported plans
++fall back to the JVM engine.
++
++## Build the JNI library
++
++```bash
++sql/native-cpp/build.sh
++```
++
++This writes `sql/native-cpp/build/libspark_nativesql_jni.so` (Linux) or
++`.dylib` (macOS), runs C++ unit tests, and builds a microbench.
++
++## Enable it
++
++```bash
++sql/native-cpp/build.sh
++export LD_LIBRARY_PATH=$PWD/sql/native-cpp/build:${LD_LIBRARY_PATH:-}
++# macOS: export DYLD_LIBRARY_PATH=$PWD/sql/native-cpp/build:$DYLD_LIBRARY_PATH
++
++spark-sql \
++  --conf spark.sql.nativesql.enabled=true \
++  --conf spark.sql.nativesql.lib=$PWD/sql/native-cpp/build/libspark_nativesql_jni.so
++```
++
++On macOS use `libspark_nativesql_jni.dylib` for `spark.sql.nativesql.lib`.
++
++## Apply these changes onto a clean Spark 4.2.0 tree
++
++```bash
++cd /path/to/spark
++git fetch --tags
++git checkout v4.2.0
++git checkout -B tuning_spark
++git apply --index sql/native-cpp/tuning_spark-nativesql.patch
++# or:
++sql/native-cpp/apply_tuning_spark.sh /path/to/spark
++```
++
++## Tests
++
++- C++: `sql/native-cpp/build/nativesql_test` (invoked by `build.sh`)
++- Spark: `NativeSqlSuite` (skips if the JNI library is not built)
++- Microbench: `sql/native-cpp/build/nativesql_bench`
+diff --git a/sql/native-cpp/apply_tuning_spark.sh b/sql/native-cpp/apply_tuning_spark.sh
+new file mode 100755
+index 00000000000..f57b6433c31
+--- /dev/null
++++ b/sql/native-cpp/apply_tuning_spark.sh
+@@ -0,0 +1,24 @@
++#!/usr/bin/env bash
++# Land the Native SQL changes on a Spark clone at v4.2.0 / branch tuning_spark.
++set -euo pipefail
++
++HERE="$(cd "$(dirname "$0")" && pwd)"
++PATCH="$HERE/tuning_spark-nativesql.patch"
++SPARK_DIR="${1:-}"
++
++if [[ -z "$SPARK_DIR" ]]; then
++  echo "Usage: $0 /path/to/spark" >&2
++  exit 1
++fi
++if [[ ! -f "$PATCH" ]]; then
++  echo "Missing $PATCH" >&2
++  exit 1
++fi
++
++cd "$SPARK_DIR"
++git fetch --tags
++git checkout v4.2.0
++git checkout -B tuning_spark
++git apply --index "$PATCH"
++echo "Applied Native SQL patch on branch tuning_spark (v4.2.0)."
++echo "Next: sql/native-cpp/build.sh"
+diff --git a/sql/native-cpp/build.sh b/sql/native-cpp/build.sh
+new file mode 100755
+index 00000000000..128c17cf002
+--- /dev/null
++++ b/sql/native-cpp/build.sh
+@@ -0,0 +1,56 @@
++#!/usr/bin/env bash
++# Build libspark_nativesql_jni for the experimental Native SQL engine.
++set -euo pipefail
++
++ROOT="$(cd "$(dirname "$0")" && pwd)"
++BUILD="$ROOT/build"
++mkdir -p "$BUILD"
++
++if [[ -z "${JAVA_HOME:-}" ]]; then
++  if [[ -x /usr/libexec/java_home ]]; then
++    JAVA_HOME="$(/usr/libexec/java_home)"
++  else
++    echo "JAVA_HOME is not set" >&2
++    exit 1
++  fi
++fi
++
++OS="$(uname -s)"
++case "$OS" in
++  Darwin)
++    JNI_OS=darwin
++    LIB="$BUILD/libspark_nativesql_jni.dylib"
++    ;;
++  Linux)
++    JNI_OS=linux
++    LIB="$BUILD/libspark_nativesql_jni.so"
++    ;;
++  *)
++    echo "Unsupported OS: $OS" >&2
++    exit 1
++    ;;
++esac
++
++CXX="${CXX:-c++}"
++"$CXX" -std=c++17 -O3 -fPIC -shared \
++  -I"$ROOT/include" \
++  -I"$JAVA_HOME/include" \
++  -I"$JAVA_HOME/include/$JNI_OS" \
++  "$ROOT/src/engine.cpp" \
++  "$ROOT/src/jni_bridge.cpp" \
++  -o "$LIB"
++
++echo "Built $LIB"
++
++# Native unit test + microbench (no JNI)
++"$CXX" -std=c++17 -O3 -I"$ROOT/include" \
++  "$ROOT/src/engine.cpp" \
++  "$ROOT/tests/nativesql_test.cpp" \
++  -o "$BUILD/nativesql_test"
++"$BUILD/nativesql_test"
++
++"$CXX" -std=c++17 -O3 -I"$ROOT/include" \
++  "$ROOT/src/engine.cpp" \
++  "$ROOT/tests/nativesql_bench.cpp" \
++  -o "$BUILD/nativesql_bench"
++echo "C++ tests passed. Run $BUILD/nativesql_bench for a microbench."
+diff --git a/sql/native-cpp/include/nativesql.h b/sql/native-cpp/include/nativesql.h
+new file mode 100644
+index 00000000000..f24aea8135e
+--- /dev/null
++++ b/sql/native-cpp/include/nativesql.h
+@@ -0,0 +1,56 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef SPARK_NATIVESQL_H
++#define SPARK_NATIVESQL_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef enum NsType {
++  NS_I32 = 1,
++  NS_I64 = 2,
++  NS_F64 = 3,
++  NS_BOOL = 4
++} NsType;
++
++typedef struct NsCol {
++  NsType type;
++  int32_t n_rows;
++  void *data; /* int32_t* / int64_t* / double* / uint8_t* */
++} NsCol;
++
++typedef struct NsBatch {
++  int32_t n_cols;
++  int32_t n_rows;
++  NsCol *cols;
++} NsBatch;
++
++/* Execute IR. inputs[i] may be empty when the leaf is a generated range. */
++int ns_execute(const char *plan_ir, const NsBatch *inputs, int n_inputs, NsBatch *out);
++
++void ns_batch_free(NsBatch *b);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* SPARK_NATIVESQL_H */
+diff --git a/sql/native-cpp/src/engine.cpp b/sql/native-cpp/src/engine.cpp
+new file mode 100644
+index 00000000000..542626e47e4
+--- /dev/null
++++ b/sql/native-cpp/src/engine.cpp
+@@ -0,0 +1,611 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "nativesql.h"
++
++#include <cctype>
++#include <cmath>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++#include <stdexcept>
++
++namespace {
++
++enum class ValKind { I64, F64, BOOL, COL, CALL };
++
++struct Val {
++  ValKind kind = ValKind::I64;
++  int64_t i = 0;
++  double d = 0;
++  bool b = false;
++  std::string name;
++  std::vector<Val> args;
++};
++
++struct Tok {
++  const char *p;
++  explicit Tok(const char *s) : p(s) {}
++  void skip() {
++    while (*p == ' ' || *p == '\n' || *p == '\t') ++p;
++  }
++  bool eat(char c) {
++    skip();
++    if (*p == c) {
++      ++p;
++      return true;
++    }
++    return false;
++  }
++  std::string ident() {
++    skip();
++    const char *s = p;
++    while (*p && *p != ' ' && *p != '(' && *p != ')' && *p != '\n' && *p != '\t') ++p;
++    return std::string(s, p);
++  }
++};
++
++Val parse_val(Tok &t);
++
++Val parse_list(Tok &t) {
++  if (!t.eat('(')) throw std::runtime_error("expected '('");
++  Val v;
++  v.kind = ValKind::CALL;
++  v.name = t.ident();
++  t.skip();
++  while (*t.p && *t.p != ')') {
++    v.args.push_back(parse_val(t));
++    t.skip();
++  }
++  if (!t.eat(')')) throw std::runtime_error("expected ')'");
++  return v;
++}
++
++Val parse_val(Tok &t) {
++  t.skip();
++  if (*t.p == '(') return parse_list(t);
++  std::string tok = t.ident();
++  Val v;
++  if (tok == "true") {
++    v.kind = ValKind::BOOL;
++    v.b = true;
++    return v;
++  }
++  if (tok == "false") {
++    v.kind = ValKind::BOOL;
++    v.b = false;
++    return v;
++  }
++  if (!tok.empty() && tok[0] == 'c' && tok.size() > 1 && std::isdigit(static_cast<unsigned char>(tok[1]))) {
++    v.kind = ValKind::COL;
++    v.i = std::stoll(tok.substr(1));
++    return v;
++  }
++  if (tok.size() > 3 && tok.compare(tok.size() - 3, 3, "i32") == 0) {
++    v.kind = ValKind::I64;
++    v.i = std::stoll(tok.substr(0, tok.size() - 3));
++    return v;
++  }
++  if (tok.size() > 3 && tok.compare(tok.size() - 3, 3, "i64") == 0) {
++    v.kind = ValKind::I64;
++    v.i = std::stoll(tok.substr(0, tok.size() - 3));
++    return v;
++  }
++  if (tok.size() > 3 && tok.compare(tok.size() - 3, 3, "f64") == 0) {
++    v.kind = ValKind::F64;
++    v.d = std::stod(tok.substr(0, tok.size() - 3));
++    return v;
++  }
++  /* bare integer / float (scan index, range bounds) */
++  try {
++    if (tok.find('.') != std::string::npos) {
++      v.kind = ValKind::F64;
++      v.d = std::stod(tok);
++      return v;
++    }
++    v.kind = ValKind::I64;
++    v.i = std::stoll(tok);
++    return v;
++  } catch (...) {
++    throw std::runtime_error("bad token: " + tok);
++  }
++}
++
++struct Batch {
++  int n_rows = 0;
++  std::vector<NsType> types;
++  std::vector<std::vector<int64_t>> i64;
++  std::vector<std::vector<double>> f64;
++  std::vector<std::vector<uint8_t>> b;
++
++  int n_cols() const { return static_cast<int>(types.size()); }
++
++  void add_col(NsType t, int n) {
++    types.push_back(t);
++    i64.emplace_back();
++    f64.emplace_back();
++    b.emplace_back();
++    n_rows = n;
++    const int c = n_cols() - 1;
++    if (t == NS_F64) f64[c].assign(n, 0);
++    else if (t == NS_BOOL) b[c].assign(n, 0);
++    else i64[c].assign(n, 0);
++  }
++
++  int64_t get_i(int col, int row) const {
++    if (types[col] == NS_F64) return static_cast<int64_t>(f64[col][row]);
++    if (types[col] == NS_BOOL) return b[col][row] ? 1 : 0;
++    return i64[col][row];
++  }
++  double get_f(int col, int row) const {
++    if (types[col] == NS_F64) return f64[col][row];
++    if (types[col] == NS_BOOL) return b[col][row] ? 1.0 : 0.0;
++    return static_cast<double>(i64[col][row]);
++  }
++  bool get_b(int col, int row) const { return get_i(col, row) != 0; }
++};
++
++Batch from_c(const NsBatch &in) {
++  Batch b;
++  b.n_rows = in.n_rows;
++  for (int c = 0; c < in.n_cols; ++c) {
++    const NsCol &col = in.cols[c];
++    b.add_col(col.type, in.n_rows);
++    if (col.type == NS_I32) {
++      const int32_t *p = static_cast<const int32_t *>(col.data);
++      for (int r = 0; r < in.n_rows; ++r) b.i64[c][r] = p[r];
++    } else if (col.type == NS_I64) {
++      const int64_t *p = static_cast<const int64_t *>(col.data);
++      for (int r = 0; r < in.n_rows; ++r) b.i64[c][r] = p[r];
++    } else if (col.type == NS_F64) {
++      const double *p = static_cast<const double *>(col.data);
++      for (int r = 0; r < in.n_rows; ++r) b.f64[c][r] = p[r];
++    } else {
++      const uint8_t *p = static_cast<const uint8_t *>(col.data);
++      for (int r = 0; r < in.n_rows; ++r) b.b[c][r] = p[r] ? 1 : 0;
++    }
++  }
++  return b;
++}
++
++struct EvalNum {
++  bool is_f = false;
++  int64_t i = 0;
++  double d = 0;
++  double as_f() const { return is_f ? d : static_cast<double>(i); }
++  int64_t as_i() const { return is_f ? static_cast<int64_t>(d) : i; }
++};
++
++EvalNum eval_num(const Val &v, const Batch &b, int row) {
++  if (v.kind == ValKind::I64) return {false, v.i, 0};
++  if (v.kind == ValKind::F64) return {true, 0, v.d};
++  if (v.kind == ValKind::BOOL) return {false, v.b ? 1 : 0, 0};
++  if (v.kind == ValKind::COL) {
++    const int c = static_cast<int>(v.i);
++    if (b.types[c] == NS_F64) return {true, 0, b.get_f(c, row)};
++    return {false, b.get_i(c, row), 0};
++  }
++  if (v.kind == ValKind::CALL) {
++    const auto &n = v.name;
++    if (n == "add" || n == "sub" || n == "mul" || n == "div") {
++      EvalNum l = eval_num(v.args[0], b, row);
++      EvalNum r = eval_num(v.args[1], b, row);
++      const bool f = l.is_f || r.is_f;
++      if (n == "add") {
++        if (f) return {true, 0, l.as_f() + r.as_f()};
++        return {false, l.i + r.i, 0};
++      }
++      if (n == "sub") {
++        if (f) return {true, 0, l.as_f() - r.as_f()};
++        return {false, l.i - r.i, 0};
++      }
++      if (n == "mul") {
++        if (f) return {true, 0, l.as_f() * r.as_f()};
++        return {false, l.i * r.i, 0};
++      }
++      if (f) return {true, 0, r.as_f() == 0 ? NAN : l.as_f() / r.as_f()};
++      return {false, r.i == 0 ? 0 : l.i / r.i, 0};
++    }
++    if (n == "neg") {
++      EvalNum x = eval_num(v.args[0], b, row);
++      if (x.is_f) return {true, 0, -x.d};
++      return {false, -x.i, 0};
++    }
++  }
++  throw std::runtime_error("cannot eval numeric");
++}
++
++bool eval_pred(const Val &v, const Batch &b, int row) {
++  if (v.kind == ValKind::BOOL) return v.b;
++  if (v.kind == ValKind::COL) return b.get_b(static_cast<int>(v.i), row);
++  if (v.kind != ValKind::CALL) return eval_num(v, b, row).as_i() != 0;
++  const auto &n = v.name;
++  if (n == "and") return eval_pred(v.args[0], b, row) && eval_pred(v.args[1], b, row);
++  EvalNum l = eval_num(v.args[0], b, row);
++  EvalNum r = eval_num(v.args[1], b, row);
++  const bool f = l.is_f || r.is_f;
++  const double ld = l.as_f(), rd = r.as_f();
++  if (n == "eq") return f ? ld == rd : l.as_i() == r.as_i();
++  if (n == "ne") return f ? ld != rd : l.as_i() != r.as_i();
++  if (n == "gt") return f ? ld > rd : l.as_i() > r.as_i();
++  if (n == "ge") return f ? ld >= rd : l.as_i() >= r.as_i();
++  if (n == "lt") return f ? ld < rd : l.as_i() < r.as_i();
++  if (n == "le") return f ? ld <= rd : l.as_i() <= r.as_i();
++  throw std::runtime_error("bad pred " + n);
++}
++
++Batch project_cols(const Batch &in, const std::vector<Val> &exprs) {
++  Batch out;
++  out.n_rows = in.n_rows;
++  for (const auto &e : exprs) {
++    NsType t = NS_I64;
++    if (e.kind == ValKind::F64) t = NS_F64;
++    else if (e.kind == ValKind::BOOL) t = NS_BOOL;
++    else if (e.kind == ValKind::COL) t = in.types[static_cast<int>(e.i)];
++    else if (e.kind == ValKind::CALL) {
++      /* arithmetic stays numeric; avg later */
++      t = NS_I64;
++      if (!e.args.empty()) {
++        EvalNum probe = eval_num(e, in, 0);
++        if (probe.is_f) t = NS_F64;
++      }
++    }
++    if (in.n_rows == 0 && e.kind == ValKind::CALL) t = NS_I64;
++    out.add_col(t, in.n_rows);
++    const int oc = out.n_cols() - 1;
++    for (int r = 0; r < in.n_rows; ++r) {
++      if (t == NS_BOOL) out.b[oc][r] = eval_pred(e, in, r) ? 1 : 0;
++      else {
++        EvalNum n = eval_num(e, in, r);
++        if (t == NS_F64) out.f64[oc][r] = n.as_f();
++        else out.i64[oc][r] = n.as_i();
++      }
++    }
++  }
++  return out;
++}
++
++Batch do_filter(const Batch &in, const Val &pred) {
++  std::vector<int> keep;
++  keep.reserve(in.n_rows);
++  for (int r = 0; r < in.n_rows; ++r) {
++    if (eval_pred(pred, in, r)) keep.push_back(r);
++  }
++  Batch out;
++  out.n_rows = static_cast<int>(keep.size());
++  for (int c = 0; c < in.n_cols(); ++c) {
++    out.add_col(in.types[c], out.n_rows);
++    for (int i = 0; i < out.n_rows; ++i) {
++      const int r = keep[i];
++      if (in.types[c] == NS_F64) out.f64[c][i] = in.f64[c][r];
++      else if (in.types[c] == NS_BOOL) out.b[c][i] = in.b[c][r];
++      else out.i64[c][i] = in.i64[c][r];
++    }
++  }
++  return out;
++}
++
++static uint64_t mix(uint64_t x) {
++  x ^= x >> 30;
++  x *= 0xbf58476d1ce4e5b9ULL;
++  x ^= x >> 27;
++  x *= 0x94d049bb133111ebULL;
++  x ^= x >> 31;
++  return x;
++}
++
++struct OpenHash {
++  struct Slot {
++    uint64_t key = 0;
++    int idx = -1;
++    bool used = false;
++  };
++  std::vector<Slot> t;
++  explicit OpenHash(size_t n) {
++    size_t cap = 8;
++    while (cap < n * 2 + 8) cap <<= 1;
++    t.assign(cap, Slot{});
++  }
++  int find(uint64_t k) const {
++    const size_t m = t.size() - 1;
++    size_t i = mix(k) & m;
++    for (size_t n = 0; n < t.size(); ++n) {
++      if (!t[i].used) return -1;
++      if (t[i].key == k) return t[i].idx;
++      i = (i + 1) & m;
++    }
++    return -1;
++  }
++  int insert(uint64_t k, int idx) {
++    const size_t m = t.size() - 1;
++    size_t i = mix(k) & m;
++    for (size_t n = 0; n < t.size(); ++n) {
++      if (!t[i].used) {
++        t[i].used = true;
++        t[i].key = k;
++        t[i].idx = idx;
++        return idx;
++      }
++      if (t[i].key == k) return t[i].idx;
++      i = (i + 1) & m;
++    }
++    throw std::runtime_error("hash full");
++  }
++};
++
++uint64_t row_key(const Batch &b, const std::vector<Val> &keys, int row) {
++  uint64_t h = 1469598103934665603ULL;
++  for (const auto &k : keys) {
++    const int64_t v = eval_num(k, b, row).as_i();
++    h ^= mix(static_cast<uint64_t>(v));
++    h *= 1099511628211ULL;
++  }
++  return h;
++}
++
++Batch do_hashagg(const Batch &in, const std::vector<Val> &keys, const std::vector<Val> &aggs) {
++  OpenHash ht(static_cast<size_t>(in.n_rows) + 8);
++  std::vector<int> first;
++  struct Acc {
++    int64_t cnt = 0;
++    int64_t isum = 0;
++    double fsum = 0;
++    bool is_f = false;
++    int64_t imin = 0, imax = 0;
++    double fmin = 0, fmax = 0;
++    bool init = false;
++  };
++  std::vector<std::vector<Acc>> accs;
++  for (int r = 0; r < in.n_rows; ++r) {
++    const uint64_t k = row_key(in, keys, r);
++    int g = ht.find(k);
++    if (g < 0) {
++      g = static_cast<int>(first.size());
++      ht.insert(k, g);
++      first.push_back(r);
++      accs.emplace_back(aggs.size());
++    }
++    for (size_t a = 0; a < aggs.size(); ++a) {
++      Acc &ac = accs[g][a];
++      const Val &fn = aggs[a];
++      if (fn.kind != ValKind::CALL) continue;
++      if (fn.name == "count") {
++        if (fn.args.empty()) ac.cnt += 1;
++        else ac.cnt += 1;
++        continue;
++      }
++      EvalNum x = eval_num(fn.args[0], in, r);
++      if (!ac.init) {
++        ac.init = true;
++        ac.is_f = x.is_f;
++        ac.imin = ac.imax = x.as_i();
++        ac.fmin = ac.fmax = x.as_f();
++      }
++      if (fn.name == "sum" || fn.name == "avg") {
++        ac.cnt += 1;
++        if (x.is_f || ac.is_f) {
++          ac.is_f = true;
++          ac.fsum += x.as_f();
++        } else ac.isum += x.i;
++      } else if (fn.name == "min") {
++        if (x.is_f || ac.is_f) {
++          ac.is_f = true;
++          ac.fmin = std::min(ac.fmin, x.as_f());
++        } else ac.imin = std::min(ac.imin, x.i);
++      } else if (fn.name == "max") {
++        if (x.is_f || ac.is_f) {
++          ac.is_f = true;
++          ac.fmax = std::max(ac.fmax, x.as_f());
++        } else ac.imax = std::max(ac.imax, x.i);
++      }
++    }
++  }
++
++  const int ng = static_cast<int>(first.size());
++  Batch out;
++  out.n_rows = ng;
++  /* output columns follow agg list only (Spark result expressions) */
++  for (size_t a = 0; a < aggs.size(); ++a) {
++    const Val &fn = aggs[a];
++    NsType t = NS_I64;
++    if (fn.kind == ValKind::COL) t = in.types[static_cast<int>(fn.i)];
++    else if (fn.kind == ValKind::CALL && (fn.name == "avg" ||
++             (!fn.args.empty() && fn.args[0].kind == ValKind::COL &&
++              in.types[static_cast<int>(fn.args[0].i)] == NS_F64))) {
++      t = NS_F64;
++    } else if (fn.kind == ValKind::CALL && fn.name == "avg") t = NS_F64;
++    else if (fn.kind != ValKind::CALL) {
++      /* grouping key passed through as col */
++    }
++    if (fn.kind != ValKind::CALL) {
++      /* e.g. key attribute in the agg list */
++      if (fn.kind == ValKind::COL) t = in.types[static_cast<int>(fn.i)];
++    }
++    out.add_col(t, ng);
++    for (int g = 0; g < ng; ++g) {
++      if (fn.kind != ValKind::CALL) {
++        EvalNum n = eval_num(fn, in, first[g]);
++        if (t == NS_F64) out.f64[a][g] = n.as_f();
++        else if (t == NS_BOOL) out.b[a][g] = n.as_i() ? 1 : 0;
++        else out.i64[a][g] = n.as_i();
++        continue;
++      }
++      const Acc &ac = accs[g][a];
++      if (fn.name == "count") out.i64[a][g] = ac.cnt;
++      else if (fn.name == "sum") {
++        if (t == NS_F64) out.f64[a][g] = ac.is_f ? ac.fsum : static_cast<double>(ac.isum);
++        else out.i64[a][g] = ac.isum;
++      } else if (fn.name == "avg") {
++        out.f64[a][g] = ac.cnt ? (ac.is_f ? ac.fsum : static_cast<double>(ac.isum)) / ac.cnt : NAN;
++      } else if (fn.name == "min") {
++        if (t == NS_F64) out.f64[a][g] = ac.fmin;
++        else out.i64[a][g] = ac.imin;
++      } else if (fn.name == "max") {
++        if (t == NS_F64) out.f64[a][g] = ac.fmax;
++        else out.i64[a][g] = ac.imax;
++      }
++    }
++  }
++  return out;
++}
++
++Batch do_join(const Batch &left, const Batch &right, const Val &lk, const Val &rk) {
++  OpenHash ht(static_cast<size_t>(right.n_rows) + 8);
++  std::vector<std::vector<int>> buckets(right.n_rows + 1);
++  int next = 0;
++  for (int r = 0; r < right.n_rows; ++r) {
++    const uint64_t k = mix(static_cast<uint64_t>(eval_num(rk, right, r).as_i()));
++    int g = ht.find(k);
++    if (g < 0) {
++      g = next++;
++      ht.insert(k, g);
++    }
++    buckets[g].push_back(r);
++  }
++  std::vector<int> lr, rr;
++  for (int l = 0; l < left.n_rows; ++l) {
++    const uint64_t k = mix(static_cast<uint64_t>(eval_num(lk, left, l).as_i()));
++    const int g = ht.find(k);
++    if (g < 0) continue;
++    for (int r : buckets[g]) {
++      if (eval_num(lk, left, l).as_i() == eval_num(rk, right, r).as_i()) {
++        lr.push_back(l);
++        rr.push_back(r);
++      }
++    }
++  }
++  Batch out;
++  out.n_rows = static_cast<int>(lr.size());
++  for (int c = 0; c < left.n_cols(); ++c) {
++    out.add_col(left.types[c], out.n_rows);
++    for (int i = 0; i < out.n_rows; ++i) {
++      const int r = lr[i];
++      if (left.types[c] == NS_F64) out.f64[out.n_cols() - 1][i] = left.f64[c][r];
++      else if (left.types[c] == NS_BOOL) out.b[out.n_cols() - 1][i] = left.b[c][r];
++      else out.i64[out.n_cols() - 1][i] = left.i64[c][r];
++    }
++  }
++  for (int c = 0; c < right.n_cols(); ++c) {
++    out.add_col(right.types[c], out.n_rows);
++    for (int i = 0; i < out.n_rows; ++i) {
++      const int r = rr[i];
++      if (right.types[c] == NS_F64) out.f64[out.n_cols() - 1][i] = right.f64[c][r];
++      else if (right.types[c] == NS_BOOL) out.b[out.n_cols() - 1][i] = right.b[c][r];
++      else out.i64[out.n_cols() - 1][i] = right.i64[c][r];
++    }
++  }
++  return out;
++}
++
++Batch make_range(int64_t start, int64_t end, int64_t step) {
++  if (step == 0) throw std::runtime_error("range step 0");
++  int64_t n = 0;
++  if ((end > start) == (step > 0)) {
++    n = (end - start) / step;
++    if ((end - start) % step != 0) n += 1;
++    if (n < 0) n = 0;
++  }
++  if (n > INT32_MAX) n = INT32_MAX;
++  Batch b;
++  b.add_col(NS_I64, static_cast<int>(n));
++  int64_t v = start;
++  for (int i = 0; i < b.n_rows; ++i) {
++    b.i64[0][i] = v;
++    v += step;
++  }
++  return b;
++}
++
++Batch eval_plan(const Val &node, const NsBatch *inputs, int n_inputs);
++
++Batch eval_plan(const Val &node, const NsBatch *inputs, int n_inputs) {
++  if (node.kind != ValKind::CALL) throw std::runtime_error("plan must be a call");
++  const auto &n = node.name;
++  if (n == "scan") {
++    const int idx = static_cast<int>(node.args[0].i);
++    if (idx < 0 || idx >= n_inputs) throw std::runtime_error("scan oob");
++    return from_c(inputs[idx]);
++  }
++  if (n == "range") {
++    return make_range(node.args[0].i, node.args[1].i, node.args[2].i);
++  }
++  if (n == "filter") {
++    Batch child = eval_plan(node.args[1], inputs, n_inputs);
++    return do_filter(child, node.args[0]);
++  }
++  if (n == "project") {
++    Batch child = eval_plan(node.args[1], inputs, n_inputs);
++    return project_cols(child, node.args[0].args);
++  }
++  if (n == "hashagg") {
++    Batch child = eval_plan(node.args[2], inputs, n_inputs);
++    return do_hashagg(child, node.args[0].args, node.args[1].args);
++  }
++  if (n == "hashjoin") {
++    Batch left = eval_plan(node.args[2], inputs, n_inputs);
++    Batch right = eval_plan(node.args[3], inputs, n_inputs);
++    return do_join(left, right, node.args[0], node.args[1]);
++  }
++  throw std::runtime_error("unknown op " + n);
++}
++
++} // namespace
++
++void ns_batch_free(NsBatch *b) {
++  if (!b) return;
++  if (b->cols) {
++    for (int i = 0; i < b->n_cols; ++i) std::free(b->cols[i].data);
++    std::free(b->cols);
++  }
++  b->cols = nullptr;
++  b->n_cols = 0;
++  b->n_rows = 0;
++}
++
++int ns_execute(const char *plan_ir, const NsBatch *inputs, int n_inputs, NsBatch *out) {
++  try {
++    Tok t(plan_ir);
++    Val plan = parse_val(t);
++    Batch r = eval_plan(plan, inputs, n_inputs);
++    out->n_cols = r.n_cols();
++    out->n_rows = r.n_rows;
++    out->cols = static_cast<NsCol *>(std::calloc(static_cast<size_t>(out->n_cols), sizeof(NsCol)));
++    for (int c = 0; c < r.n_cols(); ++c) {
++      out->cols[c].type = r.types[c];
++      out->cols[c].n_rows = r.n_rows;
++      if (r.types[c] == NS_I32 || r.types[c] == NS_I64) {
++        int64_t *p = static_cast<int64_t *>(std::malloc(sizeof(int64_t) * static_cast<size_t>(r.n_rows)));
++        if (r.n_rows) std::memcpy(p, r.i64[c].data(), sizeof(int64_t) * static_cast<size_t>(r.n_rows));
++        out->cols[c].type = NS_I64;
++        out->cols[c].data = p;
++      } else if (r.types[c] == NS_F64) {
++        double *p = static_cast<double *>(std::malloc(sizeof(double) * static_cast<size_t>(r.n_rows)));
++        if (r.n_rows) std::memcpy(p, r.f64[c].data(), sizeof(double) * static_cast<size_t>(r.n_rows));
++        out->cols[c].data = p;
++      } else {
++        uint8_t *p = static_cast<uint8_t *>(std::malloc(static_cast<size_t>(r.n_rows)));
++        if (r.n_rows) std::memcpy(p, r.b[c].data(), static_cast<size_t>(r.n_rows));
++        out->cols[c].data = p;
++      }
++    }
++    return 0;
++  } catch (...) {
++    return -1;
++  }
++}
+diff --git a/sql/native-cpp/src/jni_bridge.cpp b/sql/native-cpp/src/jni_bridge.cpp
+new file mode 100644
+index 00000000000..7ace6eb9daa
+--- /dev/null
++++ b/sql/native-cpp/src/jni_bridge.cpp
+@@ -0,0 +1,140 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "nativesql.h"
++
++#include <jni.h>
++#include <cstdlib>
++#include <vector>
++
++static NsType java_array_type(JNIEnv *env, jobject arr) {
++  if (arr == nullptr) return NS_I64;
++  jclass cls = env->GetObjectClass(arr);
++  if (env->IsInstanceOf(arr, env->FindClass("[I"))) return NS_I32;
++  if (env->IsInstanceOf(arr, env->FindClass("[J"))) return NS_I64;
++  if (env->IsInstanceOf(arr, env->FindClass("[D"))) return NS_F64;
++  if (env->IsInstanceOf(arr, env->FindClass("[Z"))) return NS_BOOL;
++  (void)cls;
++  return NS_I64;
++}
++
++extern "C" JNIEXPORT jobjectArray JNICALL
++Java_org_apache_spark_sql_execution_nativesql_NativeSqlJni_execute(
++    JNIEnv *env, jclass, jstring planIr, jobjectArray columns, jintArray numRows) {
++  const char *ir = env->GetStringUTFChars(planIr, nullptr);
++  const jsize n_in = columns ? env->GetArrayLength(columns) : 0;
++  jint *nrow = numRows ? env->GetIntArrayElements(numRows, nullptr) : nullptr;
++
++  std::vector<NsBatch> batches(static_cast<size_t>(n_in));
++  std::vector<std::vector<NsCol>> colstore(static_cast<size_t>(n_in));
++
++  for (jsize i = 0; i < n_in; ++i) {
++    jobjectArray batch = reinterpret_cast<jobjectArray>(env->GetObjectArrayElement(columns, i));
++    const int rows = nrow ? nrow[i] : 0;
++    const jsize ncols = batch ? env->GetArrayLength(batch) : 0;
++    colstore[i].resize(static_cast<size_t>(ncols));
++    batches[i].n_cols = static_cast<int32_t>(ncols);
++    batches[i].n_rows = rows;
++    batches[i].cols = ncols ? colstore[i].data() : nullptr;
++    for (jsize c = 0; c < ncols; ++c) {
++      jobject arr = env->GetObjectArrayElement(batch, c);
++      NsCol &col = colstore[i][c];
++      col.n_rows = rows;
++      col.type = java_array_type(env, arr);
++      col.data = nullptr;
++      if (arr == nullptr) continue;
++      if (col.type == NS_I32) {
++        col.data = env->GetIntArrayElements(reinterpret_cast<jintArray>(arr), nullptr);
++      } else if (col.type == NS_I64) {
++        col.data = env->GetLongArrayElements(reinterpret_cast<jlongArray>(arr), nullptr);
++      } else if (col.type == NS_F64) {
++        col.data = env->GetDoubleArrayElements(reinterpret_cast<jdoubleArray>(arr), nullptr);
++      } else {
++        col.data = env->GetBooleanArrayElements(reinterpret_cast<jbooleanArray>(arr), nullptr);
++      }
++    }
++  }
++
++  NsBatch out{};
++  const int rc = ns_execute(ir, batches.data(), static_cast<int>(n_in), &out);
++  env->ReleaseStringUTFChars(planIr, ir);
++
++  /* release input pins */
++  for (jsize i = 0; i < n_in; ++i) {
++    jobjectArray batch = reinterpret_cast<jobjectArray>(env->GetObjectArrayElement(columns, i));
++    const jsize ncols = batch ? env->GetArrayLength(batch) : 0;
++    for (jsize c = 0; c < ncols; ++c) {
++      jobject arr = env->GetObjectArrayElement(batch, c);
++      if (arr == nullptr) continue;
++      NsCol &col = colstore[i][c];
++      if (col.type == NS_I32) {
++        env->ReleaseIntArrayElements(reinterpret_cast<jintArray>(arr),
++                                     static_cast<jint *>(col.data), JNI_ABORT);
++      } else if (col.type == NS_I64) {
++        env->ReleaseLongArrayElements(reinterpret_cast<jlongArray>(arr),
++                                      static_cast<jlong *>(col.data), JNI_ABORT);
++      } else if (col.type == NS_F64) {
++        env->ReleaseDoubleArrayElements(reinterpret_cast<jdoubleArray>(arr),
++                                        static_cast<jdouble *>(col.data), JNI_ABORT);
++      } else {
++        env->ReleaseBooleanArrayElements(reinterpret_cast<jbooleanArray>(arr),
++                                         static_cast<jboolean *>(col.data), JNI_ABORT);
++      }
++    }
++  }
++  if (nrow) env->ReleaseIntArrayElements(numRows, nrow, JNI_ABORT);
++
++  if (rc != 0) {
++    jclass ex = env->FindClass("java/lang/RuntimeException");
++    env->ThrowNew(ex, "Native SQL execute failed");
++    return nullptr;
++  }
++
++  jobjectArray result = env->NewObjectArray(2, env->FindClass("java/lang/Object"), nullptr);
++  jobject nobj = env->NewObject(env->FindClass("java/lang/Integer"),
++                                env->GetMethodID(env->FindClass("java/lang/Integer"),
++                                                 "<init>", "(I)V"),
++                                out.n_rows);
++  env->SetObjectArrayElement(result, 0, nobj);
++
++  jobjectArray cols = env->NewObjectArray(out.n_cols, env->FindClass("java/lang/Object"), nullptr);
++  for (int c = 0; c < out.n_cols; ++c) {
++    const NsCol &col = out.cols[c];
++    if (col.type == NS_I32 || col.type == NS_I64) {
++      jlongArray a = env->NewLongArray(out.n_rows);
++      if (out.n_rows) {
++        env->SetLongArrayRegion(a, 0, out.n_rows, static_cast<const jlong *>(col.data));
++      }
++      env->SetObjectArrayElement(cols, c, a);
++    } else if (col.type == NS_F64) {
++      jdoubleArray a = env->NewDoubleArray(out.n_rows);
++      if (out.n_rows) {
++        env->SetDoubleArrayRegion(a, 0, out.n_rows, static_cast<const jdouble *>(col.data));
++      }
++      env->SetObjectArrayElement(cols, c, a);
++    } else {
++      jbooleanArray a = env->NewBooleanArray(out.n_rows);
++      if (out.n_rows) {
++        env->SetBooleanArrayRegion(a, 0, out.n_rows, static_cast<const jboolean *>(col.data));
++      }
++      env->SetObjectArrayElement(cols, c, a);
++    }
++  }
++  env->SetObjectArrayElement(result, 1, cols);
++  ns_batch_free(&out);
++  return result;
++}
+diff --git a/sql/native-cpp/tests/nativesql_bench.cpp b/sql/native-cpp/tests/nativesql_bench.cpp
+new file mode 100644
+index 00000000000..5e94e0048d1
+--- /dev/null
++++ b/sql/native-cpp/tests/nativesql_bench.cpp
+@@ -0,0 +1,56 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "nativesql.h"
++
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <vector>
++
++int main() {
++  const int n = 1 << 20;
++  std::vector<int64_t> k(n), v(n);
++  for (int i = 0; i < n; ++i) {
++    k[i] = i % 1024;
++    v[i] = i;
++  }
++  NsCol cols[2];
++  cols[0].type = NS_I64;
++  cols[0].n_rows = n;
++  cols[0].data = k.data();
++  cols[1].type = NS_I64;
++  cols[1].n_rows = n;
++  cols[1].data = v.data();
++  NsBatch in{2, n, cols};
++
++  const char *ir =
++      "(hashagg (list c0) (list (sum c1)) (filter (gt c1 16i64) (project (list c0 c1) (scan 0))))";
++
++  auto t0 = std::chrono::steady_clock::now();
++  NsBatch out{};
++  if (ns_execute(ir, &in, 1, &out) != 0) {
++    std::fprintf(stderr, "bench execute failed\n");
++    return 1;
++  }
++  auto t1 = std::chrono::steady_clock::now();
++  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
++  std::printf("nativesql_bench: %d rows -> %d groups in %lld ms\n", n, out.n_rows,
++              static_cast<long long>(ms));
++  ns_batch_free(&out);
++  return 0;
++}
+diff --git a/sql/native-cpp/tests/nativesql_test.cpp b/sql/native-cpp/tests/nativesql_test.cpp
+new file mode 100644
+index 00000000000..f48baa709c3
+--- /dev/null
++++ b/sql/native-cpp/tests/nativesql_test.cpp
+@@ -0,0 +1,85 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "nativesql.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++static void fail(const char *msg) {
++  std::fprintf(stderr, "FAIL: %s\n", msg);
++  std::exit(1);
++}
++
++int main() {
++  int64_t ids[8] = {1, 2, 3, 4, 5, 6, 7, 8};
++  int64_t vals[8] = {10, 20, 30, 40, 50, 60, 70, 80};
++  NsCol cols[2];
++  cols[0].type = NS_I64;
++  cols[0].n_rows = 8;
++  cols[0].data = ids;
++  cols[1].type = NS_I64;
++  cols[1].n_rows = 8;
++  cols[1].data = vals;
++  NsBatch in;
++  in.n_cols = 2;
++  in.n_rows = 8;
++  in.cols = cols;
++
++  NsBatch out{};
++  if (ns_execute("(filter (gt c0 4i64) (scan 0))", &in, 1, &out) != 0) fail("filter");
++  if (out.n_rows != 4) fail("filter row count");
++  ns_batch_free(&out);
++
++  if (ns_execute("(project (list c0 (add c0 c1)) (scan 0))", &in, 1, &out) != 0) fail("project");
++  if (out.n_rows != 8 || out.n_cols != 2) fail("project shape");
++  const int64_t *p1 = static_cast<const int64_t *>(out.cols[1].data);
++  if (p1[0] != 11) fail("project add");
++  ns_batch_free(&out);
++
++  if (ns_execute("(hashagg (list c0) (list (sum c1)) (project (list c0 c1) (scan 0)))", &in, 1, &out) != 0) {
++    fail("agg");
++  }
++  if (out.n_rows != 8) fail("agg groups");
++  ns_batch_free(&out);
++
++  int64_t rids[3] = {1, 3, 9};
++  int64_t rvals[3] = {100, 300, 900};
++  NsCol rcols[2];
++  rcols[0].type = NS_I64;
++  rcols[0].n_rows = 3;
++  rcols[0].data = rids;
++  rcols[1].type = NS_I64;
++  rcols[1].n_rows = 3;
++  rcols[1].data = rvals;
++  NsBatch ins[2];
++  ins[0] = in;
++  ins[1].n_cols = 2;
++  ins[1].n_rows = 3;
++  ins[1].cols = rcols;
++  if (ns_execute("(hashjoin c0 c0 (scan 0) (scan 1))", ins, 2, &out) != 0) fail("join");
++  if (out.n_rows != 2) fail("join rows");
++  ns_batch_free(&out);
++
++  if (ns_execute("(filter (gt c0 5i64) (range 0 10 1))", nullptr, 0, &out) != 0) fail("range");
++  if (out.n_rows != 4) fail("range filter"); /* 6,7,8,9 */
++  ns_batch_free(&out);
++
++  std::printf("nativesql_test: ok\n");
++  return 0;
++}

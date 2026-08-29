@@ -26,6 +26,7 @@ import org.apache.spark.sql.execution.adaptive.LogicalQueryStageStrategy
 import org.apache.spark.sql.execution.command.v2.V2CommandStrategy
 import org.apache.spark.sql.execution.datasources.{DataSourceStrategy, FileSourceStrategy}
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Strategy
+import org.apache.spark.sql.execution.nativesql.NativeSqlStrategy
 import org.apache.spark.sql.internal.SQLConf
 
 class SparkPlanner(val session: SparkSession, val experimentalMethods: ExperimentalMethods)
@@ -60,7 +61,7 @@ class SparkPlanner(val session: SparkSession, val experimentalMethods: Experimen
    * Override to add extra planning strategies to the planner. These strategies are tried after
    * the strategies defined in [[ExperimentalMethods]], and before the regular strategies.
    */
-  def extraPlanningStrategies: Seq[Strategy] = Nil
+  def extraPlanningStrategies: Seq[Strategy] = NativeSqlStrategy :: Nil
 
   override protected def collectPlaceholders(plan: SparkPlan): Seq[(SparkPlan, LogicalPlan)] = {
     plan.collect {
