@@ -52,9 +52,15 @@ object NativeSqlPlan {
   /**
    * True when `plan` is a v1 file-scan leaf. Used by tests and hybrid dispatch.
    */
-  def isFileScanLeaf(plan: LogicalPlan): Boolean = plan match {
+  def isFileScanLeaf(plan: LogicalPlan): Boolean = unwrapAlias(plan) match {
     case LogicalRelation(_: HadoopFsRelation, _, _, _, _) => true
     case _ => false
+  }
+
+  @scala.annotation.tailrec
+  private def unwrapAlias(plan: LogicalPlan): LogicalPlan = plan match {
+    case SubqueryAlias(_, child) => unwrapAlias(child)
+    case other => other
   }
 
   def compile(plan: LogicalPlan): Option[Compiled] = compile0(plan)
@@ -83,13 +89,21 @@ object NativeSqlPlan {
         r.output))
 
     case p if isFileScanLeaf(p) && p.output.forall(a => isFilePayloadType(a.dataType)) =>
-      Some(Compiled(s"(scan 0)", Seq(FileLeaf(p)), p.output))
+      Some(Compiled(s"(scan 0)", Seq(FileLeaf(unwrapAlias(p))), p.output))
+
+    case s: SubqueryAlias => compile0(s.child)
 
     case Filter(cond, child) =>
-      for {
-        c <- compile0(child)
-        pred <- compilePred(cond, c.output)
-      } yield c.copy(ir = s"(filter $pred ${c.ir})", output = c.output)
+      compile0(child).flatMap { c =>
+        val parts = splitAnd(cond)
+        val preds = parts.flatMap(p => compilePred(p, c.output)).filter(_ != "true")
+        if (preds.isEmpty) {
+          None
+        } else {
+          val pred = preds.reduce((a, b) => s"(and $a $b)")
+          Some(c.copy(ir = s"(filter $pred ${c.ir})", output = c.output))
+        }
+      }
 
     case Project(projectList, child) =>
       compile0(child).flatMap { c =>
@@ -157,6 +171,11 @@ object NativeSqlPlan {
   private def shiftScans(ir: String, delta: Int): String = {
     if (delta == 0) ir
     else """\(scan (\d+)\)""".r.replaceAllIn(ir, m => s"(scan ${m.group(1).toInt + delta})")
+  }
+
+  private def splitAnd(e: Expression): Seq[Expression] = e match {
+    case And(l, r) => splitAnd(l) ++ splitAnd(r)
+    case other => Seq(other)
   }
 
   private def compilePred(e: Expression, schema: Seq[Attribute]): Option[String] = e match {

@@ -55,9 +55,6 @@ object NativeSqlStrategy extends SparkStrategy {
           val scans = FileSourceStrategy(rel)
           if (scans.isEmpty) {
             Nil
-          } else if (scans.head.output.map(_.exprId) != rel.output.map(_.exprId)) {
-            // Column order must match IR c0..cN from the logical scan.
-            Nil
           } else {
             NativeSqlExec(compiled, scans) :: Nil
           }
