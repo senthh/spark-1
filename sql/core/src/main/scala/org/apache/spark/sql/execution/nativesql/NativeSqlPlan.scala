@@ -71,7 +71,7 @@ object NativeSqlPlan {
         } else None
       }
 
-    case Aggregate(grouping, agg, child) if grouping.size <= 2 =>
+    case Aggregate(grouping, agg, child, _) if grouping.size <= 2 =>
       compile0(child).flatMap { c =>
         val keys = grouping.map(compileExpr(_, c.output))
         val aggs = agg.map(compileNamed(_, c.output))

@@ -25,6 +25,8 @@ import org.apache.spark.sql.test.SharedSparkSession
 
 class NativeSqlSuite extends SharedSparkSession {
 
+  import testImplicits._
+
   private def nativeLib: Option[String] = {
     val root = new File("sql/native-cpp/build")
     val candidates = Seq(
