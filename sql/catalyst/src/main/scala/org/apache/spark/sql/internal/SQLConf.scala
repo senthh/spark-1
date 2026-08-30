@@ -1076,7 +1076,8 @@ object SQLConf {
   val NATIVE_SQL_ENABLED = buildConf("spark.sql.nativesql.enabled")
     .doc("When true, Spark may offload supported SQL subtrees (scan, filter, project, " +
       "hash aggregate, hash join over primitive int/long/double/boolean) to the experimental " +
-      "Native SQL C++ engine via JNI. Unsupported plans fall back to the JVM engine.")
+      "Native SQL C++ engine via JNI. Unsupported plans fall back to the JVM engine. " +
+      "Hybrid dispatch may choose a backend; long join chains fall back to JVM WholeStageCodegen.")
     .version("4.2.0")
     .booleanConf
     .createWithDefault(false)
@@ -1088,6 +1089,35 @@ object SQLConf {
     .version("4.2.0")
     .stringConf
     .createOptional
+
+  val NATIVE_SQL_WSCG_JOIN_DEPTH = buildConf("spark.sql.nativesql.wscgJoinDepth")
+    .doc("Minimum consecutive join depth on the longest path that triggers fallback " +
+      "from the Native SQL engine to JVM WholeStageCodegen (long join pipelines).")
+    .version("4.2.0")
+    .intConf
+    .createWithDefault(3)
+
+  val NATIVE_SQL_PAGE_INDEX_MIN_SKIP_RATIO =
+    buildConf("spark.sql.nativesql.scan.pageIndexMinSkipRatio")
+      .doc("Minimum estimated skip ratio required to enable page-index pruning on hybrid scans.")
+      .version("4.2.0")
+      .doubleConf
+      .createWithDefault(0.5)
+
+  val NATIVE_SQL_JOIN_GRACE_THRESHOLD =
+    buildConf("spark.sql.nativesql.join.graceThreshold")
+      .doc("Estimated right-side size in bytes above which the native join chooser picks " +
+        "grace hash join instead of partitioned hash join.")
+      .version("4.2.0")
+      .longConf
+      .createWithDefault(1073741824L)
+
+  val NATIVE_SQL_DISPATCH_ENABLED = buildConf("spark.sql.nativesql.dispatch.enabled")
+    .doc("When true, Native SQL planning applies hybrid backend dispatch and the WSCG " +
+      "fallback gate for long join chains.")
+    .version("4.2.0")
+    .booleanConf
+    .createWithDefault(true)
 
   val ADAPTIVE_EXECUTION_APPLY_FINAL_STAGE_SHUFFLE_OPTIMIZATIONS =
     buildConf("spark.sql.adaptive.applyFinalStageShuffleOptimizations")
@@ -7829,6 +7859,14 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
   def nativeSqlEnabled: Boolean = getConf(NATIVE_SQL_ENABLED)
 
   def nativeSqlLib: Option[String] = getConf(NATIVE_SQL_LIB)
+
+  def nativeSqlWscgJoinDepth: Int = getConf(NATIVE_SQL_WSCG_JOIN_DEPTH)
+
+  def nativeSqlPageIndexMinSkipRatio: Double = getConf(NATIVE_SQL_PAGE_INDEX_MIN_SKIP_RATIO)
+
+  def nativeSqlJoinGraceThreshold: Long = getConf(NATIVE_SQL_JOIN_GRACE_THRESHOLD)
+
+  def nativeSqlDispatchEnabled: Boolean = getConf(NATIVE_SQL_DISPATCH_ENABLED)
 
   def adaptiveExecutionEnabled: Boolean = getConf(ADAPTIVE_EXECUTION_ENABLED)
 

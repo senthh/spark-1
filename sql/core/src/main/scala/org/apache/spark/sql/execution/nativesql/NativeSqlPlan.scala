@@ -21,13 +21,19 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.catalyst.plans.logical._
+import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.types._
 
 /**
  * Compact S-expression IR consumed by the Native SQL C++ engine.
  *
  * Supported subtree (primitive int / long / double / boolean):
- *   scan → Filter col cmp literal → Project col±col → hash agg / hash join
+ *   scan -> Filter col cmp literal -> Project col+/-col -> hash agg / hash join / sort
+ *
+ * File scans (LogicalRelation + HadoopFsRelation) are never compiled. The hybrid
+ * engine must let FileSourceStrategy plan the scan; later a partition-level native
+ * op will wrap it. Swallowing FileScan as NativeSqlExec (LeafExecNode) would pull
+ * data to the driver.
  */
 object NativeSqlPlan {
 
@@ -35,6 +41,18 @@ object NativeSqlPlan {
     Set(IntegerType, LongType, DoubleType, BooleanType, ByteType, ShortType, FloatType)
 
   def isSupportedType(dt: DataType): Boolean = supportedAtomic.contains(dt)
+
+  /**
+   * True when `plan` is a v1 file-scan leaf. Used by tests and hybrid dispatch.
+   *
+   * The hybrid engine must let FileSourceStrategy plan the scan; later a
+   * partition-level native op will wrap it. Swallowing FileScan as
+   * NativeSqlExec (LeafExecNode) would pull data to the driver.
+   */
+  def isFileScanLeaf(plan: LogicalPlan): Boolean = plan match {
+    case LogicalRelation(_: HadoopFsRelation, _, _, _, _) => true
+    case _ => false
+  }
 
   def compile(plan: LogicalPlan): Option[Compiled] = compile0(plan)
 
@@ -55,6 +73,9 @@ object NativeSqlPlan {
         Seq(RangeLeaf(r.start, r.end, r.step)),
         r.output))
 
+    // Do not load Parquet (or any HadoopFsRelation) in C++ / on the driver.
+    case p if isFileScanLeaf(p) => None
+
     case Filter(cond, child) =>
       for {
         c <- compile0(child)
@@ -68,6 +89,18 @@ object NativeSqlPlan {
           Some(c.copy(
             ir = s"(project (list ${exprs.map(_.get).mkString(" ")}) ${c.ir})",
             output = projectList.map(_.toAttribute)))
+        } else None
+      }
+
+    case Sort(order, _, child, _)
+        if order.nonEmpty &&
+          order.forall(o => o.direction == Ascending && isSupportedType(o.dataType)) =>
+      compile0(child).flatMap { c =>
+        val keys = order.map(o => compileExpr(o.child, c.output))
+        if (keys.forall(_.isDefined)) {
+          Some(c.copy(
+            ir = s"(sort (list ${keys.map(_.get).mkString(" ")}) ${c.ir})",
+            output = c.output))
         } else None
       }
 

@@ -37,6 +37,7 @@ CXX="${CXX:-c++}"
   -I"$JAVA_HOME/include" \
   -I"$JAVA_HOME/include/$JNI_OS" \
   "$ROOT/src/engine.cpp" \
+  "$ROOT/src/sort.cpp" \
   "$ROOT/src/jni_bridge.cpp" \
   -o "$LIB"
 
@@ -45,12 +46,14 @@ echo "Built $LIB"
 # Native unit test + microbench (no JNI)
 "$CXX" -std=c++17 -O3 -I"$ROOT/include" \
   "$ROOT/src/engine.cpp" \
+  "$ROOT/src/sort.cpp" \
   "$ROOT/tests/nativesql_test.cpp" \
   -o "$BUILD/nativesql_test"
 "$BUILD/nativesql_test"
 
 "$CXX" -std=c++17 -O3 -I"$ROOT/include" \
   "$ROOT/src/engine.cpp" \
+  "$ROOT/src/sort.cpp" \
   "$ROOT/tests/nativesql_bench.cpp" \
   -o "$BUILD/nativesql_bench"
 echo "C++ tests passed. Run $BUILD/nativesql_bench for a microbench."

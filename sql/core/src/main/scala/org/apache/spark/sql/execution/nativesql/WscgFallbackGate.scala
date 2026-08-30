@@ -17,27 +17,28 @@
 
 package org.apache.spark.sql.execution.nativesql
 
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
-import org.apache.spark.sql.execution.{SparkPlan, SparkStrategy}
+import org.apache.spark.sql.catalyst.plans.logical.{Join, LogicalPlan}
 import org.apache.spark.sql.internal.SQLConf
 
 /**
- * Planner hook: when `spark.sql.nativesql.enabled` is true, rewrite the logical
- * subtree and replace a supported plan with [[NativeSqlExec]]. Long join chains
- * fall back to Spark WSCG / JoinSelection. Otherwise return Nil.
+ * Q72/Q95 gate: vector engines lose to WholeStageCodegen on long join pipelines.
+ * Counts consecutive [[Join]] nodes on the longest path of a [[LogicalPlan]].
  */
-object NativeSqlStrategy extends SparkStrategy {
-  override def apply(plan: LogicalPlan): Seq[SparkPlan] = {
-    if (!SQLConf.get.nativeSqlEnabled) {
-      Nil
-    } else if (SQLConf.get.nativeSqlDispatchEnabled && WscgFallbackGate.shouldFallback(plan)) {
-      Nil
-    } else {
-      val rewritten = NativePhysicalRewrites.rewrite(plan)
-      NativeSqlPlan.compile(rewritten) match {
-        case Some(compiled) => NativeSqlExec(compiled) :: Nil
-        case None => Nil
-      }
-    }
+object WscgFallbackGate {
+
+  /**
+   * Longest run of consecutive Join nodes. A non-Join operator breaks the chain
+   * and the search continues in that subtree.
+   */
+  def consecutiveJoinDepth(plan: LogicalPlan): Int = plan match {
+    case j: Join =>
+      1 + math.max(consecutiveJoinDepth(j.left), consecutiveJoinDepth(j.right))
+    case other =>
+      other.children.map(consecutiveJoinDepth).foldLeft(0)(math.max)
+  }
+
+  /** True when consecutive join depth is at least `spark.sql.nativesql.wscgJoinDepth`. */
+  def shouldFallback(plan: LogicalPlan): Boolean = {
+    consecutiveJoinDepth(plan) >= SQLConf.get.nativeSqlWscgJoinDepth
   }
 }

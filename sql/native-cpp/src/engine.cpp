@@ -16,6 +16,7 @@
  */
 
 #include "nativesql.h"
+#include "sort.h"
 
 #include <cctype>
 #include <cmath>
@@ -513,6 +514,52 @@ Batch do_join(const Batch &left, const Batch &right, const Val &lk, const Val &r
   return out;
 }
 
+Batch apply_perm(const Batch &in, const std::vector<uint32_t> &perm) {
+  Batch out;
+  out.n_rows = in.n_rows;
+  for (int c = 0; c < in.n_cols(); ++c) {
+    out.add_col(in.types[c], in.n_rows);
+    for (int i = 0; i < in.n_rows; ++i) {
+      const int r = static_cast<int>(perm[static_cast<size_t>(i)]);
+      if (in.types[c] == NS_F64) out.f64[c][i] = in.f64[c][r];
+      else if (in.types[c] == NS_BOOL) out.b[c][i] = in.b[c][r];
+      else out.i64[c][i] = in.i64[c][r];
+    }
+  }
+  return out;
+}
+
+Batch do_sort(const Batch &in, const std::vector<Val> &keys) {
+  if (in.n_rows <= 1 || keys.empty()) return in;
+  std::vector<NsCol> keycols;
+  keycols.reserve(keys.size());
+  for (const auto &k : keys) {
+    if (k.kind != ValKind::COL) throw std::runtime_error("sort keys must be column refs");
+    const int c = static_cast<int>(k.i);
+    if (c < 0 || c >= in.n_cols()) throw std::runtime_error("sort key oob");
+    NsCol col{};
+    col.n_rows = in.n_rows;
+    /* Batch stores i32/i64 in i64 vectors; expose as NS_I64. */
+    if (in.types[c] == NS_F64) {
+      col.type = NS_F64;
+      col.data = const_cast<double *>(in.f64[c].data());
+    } else if (in.types[c] == NS_BOOL) {
+      col.type = NS_BOOL;
+      col.data = const_cast<uint8_t *>(in.b[c].data());
+    } else {
+      col.type = NS_I64;
+      col.data = const_cast<int64_t *>(in.i64[c].data());
+    }
+    keycols.push_back(col);
+  }
+  std::vector<uint32_t> perm(static_cast<size_t>(in.n_rows));
+  if (ns_sort_permutation(keycols.data(), static_cast<int>(keycols.size()), in.n_rows,
+                          perm.data()) != 0) {
+    throw std::runtime_error("sort failed");
+  }
+  return apply_perm(in, perm);
+}
+
 Batch make_range(int64_t start, int64_t end, int64_t step) {
   if (step == 0) throw std::runtime_error("range step 0");
   int64_t n = 0;
@@ -561,6 +608,17 @@ Batch eval_plan(const Val &node, const NsBatch *inputs, int n_inputs) {
     Batch left = eval_plan(node.args[2], inputs, n_inputs);
     Batch right = eval_plan(node.args[3], inputs, n_inputs);
     return do_join(left, right, node.args[0], node.args[1]);
+  }
+  if (n == "sort") {
+    if (node.args.empty()) throw std::runtime_error("sort missing child");
+    std::vector<Val> keys;
+    if (node.args[0].kind == ValKind::CALL && node.args[0].name == "list") {
+      keys = node.args[0].args;
+    } else {
+      for (size_t i = 0; i + 1 < node.args.size(); ++i) keys.push_back(node.args[i]);
+    }
+    Batch child = eval_plan(node.args.back(), inputs, n_inputs);
+    return do_sort(child, keys);
   }
   throw std::runtime_error("unknown op " + n);
 }

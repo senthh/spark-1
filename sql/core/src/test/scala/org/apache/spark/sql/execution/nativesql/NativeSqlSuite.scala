@@ -92,4 +92,45 @@ class NativeSqlSuite extends SharedSparkSession {
       checkAnswer(df, Seq(org.apache.spark.sql.Row("a")))
     }
   }
+
+  test("sort compiles to IR") {
+    val df = Seq((3, 30), (1, 10), (2, 20)).toDF("id", "v").orderBy($"id")
+    val compiled = NativeSqlPlan.compile(df.queryExecution.optimizedPlan)
+    assert(compiled.isDefined)
+    // Example: (sort (list c0) (scan 0))
+    assert(compiled.get.ir.startsWith("(sort (list c0)"))
+    assert(!df.queryExecution.optimizedPlan.exists(NativeSqlPlan.isFileScanLeaf))
+  }
+
+  test("sort offload") {
+    withNative {
+      val df = Seq((3, 30), (1, 10), (2, 20)).toDF("id", "v").orderBy($"id")
+      val compiled = NativeSqlPlan.compile(df.queryExecution.optimizedPlan)
+      assert(compiled.isDefined)
+      assert(compiled.get.ir.startsWith("(sort (list c0)"))
+      assert(df.queryExecution.executedPlan.exists(_.isInstanceOf[NativeSqlExec]))
+      checkAnswer(
+        df,
+        Seq(
+          org.apache.spark.sql.Row(1, 10),
+          org.apache.spark.sql.Row(2, 20),
+          org.apache.spark.sql.Row(3, 30)))
+    }
+  }
+
+  test("parquet file scan is not swallowed as leaf native exec") {
+    withSQLConf(
+        SQLConf.NATIVE_SQL_ENABLED.key -> "true",
+        SQLConf.USE_V1_SOURCE_LIST.key -> "parquet",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+      withTempPath { dir =>
+        Seq((1, 10), (2, 20), (3, 30)).toDF("id", "v").write.parquet(dir.getCanonicalPath)
+        val df = spark.read.parquet(dir.getCanonicalPath).filter($"id" > 1)
+        assert(df.queryExecution.optimizedPlan.exists(NativeSqlPlan.isFileScanLeaf))
+        assert(NativeSqlPlan.compile(df.queryExecution.optimizedPlan).isEmpty)
+        val native = df.queryExecution.executedPlan.collect { case n: NativeSqlExec => n }
+        assert(native.isEmpty, "FileScan must not be compiled as NativeSqlExec")
+      }
+    }
+  }
 }

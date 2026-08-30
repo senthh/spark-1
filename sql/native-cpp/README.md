@@ -45,6 +45,25 @@ git apply --index sql/native-cpp/tuning_spark-nativesql.patch
 sql/native-cpp/apply_tuning_spark.sh /path/to/spark
 ```
 
+## Column sort
+
+Full `ORDER BY` uses an IColumn-style index permutation: sort row ids, not
+packed rows. Integer keys with `n >= 256` use LSD radix sort on `(key, index)`
+pairs (8-bit passes, sign bit flipped). Smaller `n` and float/bool keys use
+`std::sort` on the permutation. Multi-column sorts process key 0 first, then
+`updatePermutation` re-sorts only equal ranges for keys 1, 2, ... `trySort`
+skips the full sort when a range is already ordered or has a single adjacent
+inversion. LIMIT / TopN is not implemented here.
+
+IR:
+
+```
+(sort (list c0 c1) CHILD)
+```
+
+Ascending only. Keys are column refs. The permutation is applied to every
+column (keys and payload).
+
 ## Tests
 
 - C++: `sql/native-cpp/build/nativesql_test` (invoked by `build.sh`)
