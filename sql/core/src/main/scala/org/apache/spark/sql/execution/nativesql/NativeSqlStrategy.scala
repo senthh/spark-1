@@ -17,8 +17,8 @@
 
 package org.apache.spark.sql.execution.nativesql
 
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
-import org.apache.spark.sql.execution.{SparkPlan, SparkStrategy}
+import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project}
+import org.apache.spark.sql.execution.{ProjectExec, SparkPlan, SparkStrategy}
 import org.apache.spark.sql.execution.datasources.FileSourceStrategy
 import org.apache.spark.sql.internal.SQLConf
 
@@ -41,7 +41,19 @@ object NativeSqlStrategy extends SparkStrategy {
         case Some(compiled) =>
           NativeSqlExec(compiled, Nil) :: Nil
         case None =>
-          Nil
+          // FileSourceStrategy matches Project(Filter(scan)) as one unit.
+          // Compile the Filter child and keep Project on the JVM.
+          rewritten match {
+            case Project(plist, child) =>
+              NativeSqlPlan.compile(child) match {
+                case Some(compiled) if compiled.hasFileLeaf =>
+                  planFileBacked(compiled).map(n => ProjectExec(plist, n))
+                case _ =>
+                  Nil
+              }
+            case _ =>
+              Nil
+          }
       }
     }
   }
