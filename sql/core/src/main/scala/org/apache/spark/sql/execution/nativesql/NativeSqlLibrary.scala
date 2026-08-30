@@ -47,6 +47,18 @@ object NativeSqlLibrary extends Logging {
     NativeSqlJni.execute(planIr, columns, numRows)
   }
 
+  def executeScan(
+      planIr: String,
+      columns: Array[Array[AnyRef]],
+      numRows: Array[Int],
+      scans: Array[AnyRef]): Array[AnyRef] = {
+    ensureLoaded()
+    if (!loaded) {
+      throw loadError.getOrElse(new IllegalStateException("Native SQL library is not loaded"))
+    }
+    NativeSqlJni.executeScan(planIr, columns, numRows, scans)
+  }
+
   private def ensureLoaded(): Unit = synchronized {
     if (loaded) return
     val explicit = SQLConf.get.nativeSqlLib.filter(_.nonEmpty)

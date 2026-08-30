@@ -12,7 +12,22 @@ fall back to the JVM engine.
 
 ## Build the JNI library
 
+Requires Apache Arrow C++ and parquet-cpp (the same stack Velox uses for
+Parquet decode). `build.sh` links them via `pkg-config` and, on Linux, copies
+`libarrow` / `libparquet` next to the JNI `.so` so YARN `--files` can ship
+them with `$ORIGIN` rpath.
+
 ```bash
+# Rocky / RHEL 8 (pin 15.x to match GCC 8)
+sudo yum install -y https://apache.jfrog.io/artifactory/arrow/almalinux/8/apache-arrow-release-latest.rpm
+sudo yum install -y arrow-devel-15.0.2 parquet-devel-15.0.2
+
+# macOS
+brew install apache-arrow
+
+# or build Arrow 15 from source into third_party/arrow-prefix
+sql/native-cpp/third_party/bootstrap-arrow.sh
+
 sql/native-cpp/build.sh
 ```
 

@@ -18,20 +18,26 @@
 package org.apache.spark.sql.execution.nativesql
 
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project}
-import org.apache.spark.sql.execution.{ProjectExec, SparkPlan, SparkStrategy}
-import org.apache.spark.sql.execution.datasources.FileSourceStrategy
+import org.apache.spark.sql.catalyst.plans.physical.IdentityBroadcastMode
+import org.apache.spark.sql.execution.{FileSourceScanExec, ProjectExec, SparkPlan, SparkStrategy}
+import org.apache.spark.sql.execution.datasources.{FileSourceStrategy, HadoopFsRelation, LogicalRelation}
+import org.apache.spark.sql.execution.exchange.BroadcastExchangeExec
 import org.apache.spark.sql.internal.SQLConf
 
 /**
  * Planner hook: rewrite, then offload a supported subtree to [[NativeSqlExec]].
- * File-backed plans keep [[FileSourceStrategy]] as the scan child and run C++
- * per partition. Identity file scans are not wrapped.
+ *
+ * Filter-only file plans stay on Spark so FileSourceStrategy keeps Parquet
+ * dataFilters. Join / hashagg / union trees take every file leaf as a child;
+ * the largest scan is the probe, the rest are broadcast.
  */
 object NativeSqlStrategy extends SparkStrategy {
   override def apply(plan: LogicalPlan): Seq[SparkPlan] = {
     if (!SQLConf.get.nativeSqlEnabled) {
       Nil
-    } else if (SQLConf.get.nativeSqlDispatchEnabled && WscgFallbackGate.shouldFallback(plan)) {
+    } else if (SQLConf.get.nativeSqlDispatchEnabled &&
+        WscgFallbackGate.shouldFallback(plan) &&
+        !plan.exists(NativeSqlPlan.isFileScanLeaf)) {
       Nil
     } else {
       val rewritten = NativePhysicalRewrites.rewrite(plan)
@@ -41,13 +47,13 @@ object NativeSqlStrategy extends SparkStrategy {
         case Some(compiled) =>
           NativeSqlExec(compiled, Nil) :: Nil
         case None =>
-          // FileSourceStrategy matches Project(Filter(scan)) as one unit.
-          // Compile the Filter child and keep Project on the JVM.
           rewritten match {
             case Project(plist, child) =>
               NativeSqlPlan.compile(child) match {
                 case Some(compiled) if compiled.hasFileLeaf =>
                   planFileBacked(compiled).map(n => ProjectExec(plist, n))
+                case Some(compiled) =>
+                  ProjectExec(plist, NativeSqlExec(compiled, Nil)) :: Nil
                 case _ =>
                   Nil
               }
@@ -59,20 +65,67 @@ object NativeSqlStrategy extends SparkStrategy {
   }
 
   private def planFileBacked(compiled: NativeSqlPlan.Compiled): Seq[SparkPlan] = {
-    if (compiled.isPassthroughScan) {
+    val nativeScan = SQLConf.get.nativeSqlScanEnabled
+    if (compiled.isPassthroughScan && !nativeScan) {
+      Nil
+    } else if (!compiled.isHeavy && !nativeScan) {
       Nil
     } else {
-      compiled.fileRels match {
-        case Seq(rel) =>
-          val scans = FileSourceStrategy(rel)
-          if (scans.isEmpty) {
-            Nil
-          } else {
-            NativeSqlExec(compiled, scans) :: Nil
-          }
-        case _ =>
-          Nil
+      val rels = compiled.fileRels
+      val scans = rels.map(r => extractScan(FileSourceStrategy(r)))
+      if (scans.exists(_.isEmpty)) {
+        Nil
+      } else {
+        attachBroadcasts(rels, scans.map(_.get)) match {
+          case Some(kids) => NativeSqlExec(compiled, kids) :: Nil
+          case None => Nil
+        }
       }
+    }
+  }
+
+  /**
+   * Largest leaf is the probe (fact). Every other leaf must be broadcastable
+   * (size cap or few files). Star-schema TPC-DS fits; fact-fact joins do not.
+   */
+  private def attachBroadcasts(
+      rels: Seq[LogicalPlan],
+      scans: Seq[FileSourceScanExec]): Option[Seq[SparkPlan]] = {
+    if (rels.size <= 1) {
+      Some(scans)
+    } else {
+      val cap = math.max(SQLConf.get.autoBroadcastJoinThreshold, 64L * 1024 * 1024)
+      val scored = rels.zipWithIndex.map { case (r, i) =>
+        (i, r.stats.sizeInBytes.toLong, fileCount(r))
+      }
+      val probeIdx = scored.maxBy(s => (s._2, s._3))._1
+      val tooBig = scored.exists { case (i, bytes, files) =>
+        i != probeIdx && bytes > cap && files > 4
+      }
+      if (tooBig) {
+        None
+      } else {
+        Some(scans.zipWithIndex.map { case (s, i) =>
+          if (i == probeIdx) s else BroadcastExchangeExec(IdentityBroadcastMode, s)
+        })
+      }
+    }
+  }
+
+  private def fileCount(p: LogicalPlan): Int = {
+    p.collectFirst {
+      case LogicalRelation(fs: HadoopFsRelation, _, _, _, _) =>
+        try {
+          fs.location.inputFiles.length
+        } catch {
+          case _: Throwable => Int.MaxValue
+        }
+    }.getOrElse(Int.MaxValue)
+  }
+
+  private def extractScan(planned: Seq[SparkPlan]): Option[FileSourceScanExec] = {
+    planned.headOption.flatMap { root =>
+      root.collectFirst { case s: FileSourceScanExec => s }
     }
   }
 }

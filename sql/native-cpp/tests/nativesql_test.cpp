@@ -16,10 +16,16 @@
  */
 
 #include "nativesql.h"
+#include "parquet_scan.h"
 #include "sort.h"
+
+#include <arrow/api.h>
+#include <arrow/io/file.h>
+#include <parquet/arrow/writer.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -46,6 +52,16 @@ int main() {
   in.cols = cols;
 
   NsBatch out{};
+  NsBatch empty{};
+  empty.n_cols = 0;
+  empty.n_rows = 0;
+  empty.cols = nullptr;
+  if (ns_execute("(project (list c0) (scan 0))", &empty, 1, &out) != 0) {
+    fail("empty project");
+  }
+  if (out.n_rows != 0) fail("empty project rows");
+  ns_batch_free(&out);
+
   if (ns_execute("(filter (gt c0 4i64) (scan 0))", &in, 1, &out) != 0) fail("filter");
   if (out.n_rows != 4) fail("filter row count");
   ns_batch_free(&out);
@@ -85,6 +101,380 @@ int main() {
   if (ns_execute("(hashjoin c0 c0 (scan 0) (scan 1))", ins, 2, &out) != 0) fail("join");
   if (out.n_rows != 2) fail("join rows");
   ns_batch_free(&out);
+  if (ns_execute("(hashjoinidx c0 c0 (scan 0) (scan 1))", ins, 2, &out) != 0) fail("joinidx");
+  if (out.n_rows != 2) fail("joinidx rows");
+  ns_batch_free(&out);
+
+  /* key-only i32 batches (Spark hashjoinidx path) */
+  {
+    int32_t lk[3] = {1, 2, 3};
+    int32_t rk[2] = {2, 3};
+    NsCol lc{};
+    lc.type = NS_I32;
+    lc.n_rows = 3;
+    lc.data = lk;
+    NsCol rc{};
+    rc.type = NS_I32;
+    rc.n_rows = 2;
+    rc.data = rk;
+    NsBatch lb{1, 3, &lc};
+    NsBatch rb{1, 2, &rc};
+    NsBatch pair[2] = {lb, rb};
+    if (ns_execute("(hashjoinidx c0 c0 (scan 0) (scan 1))", pair, 2, &out) != 0) {
+      fail("joinidx i32");
+    }
+    if (out.n_rows != 2) fail("joinidx i32 rows");
+    ns_batch_free(&out);
+    NsBatch empty{0, 0, nullptr};
+    NsBatch zpair[2] = {lb, empty};
+    if (ns_execute("(hashjoinidx c0 c0 (scan 0) (scan 1))", zpair, 2, &out) != 0) {
+      fail("joinidx empty");
+    }
+    if (out.n_rows != 0) fail("joinidx empty rows");
+    ns_batch_free(&out);
+  }
+
+  if (ns_execute("(hashsemi c0 c0 (scan 0) (scan 1))", ins, 2, &out) != 0) fail("semi");
+  if (out.n_rows != 2) fail("semi rows");
+  ns_batch_free(&out);
+
+  if (ns_execute("(union (scan 0) (scan 1))", ins, 2, &out) != 0) fail("union");
+  if (out.n_rows != 11) fail("union rows"); /* 8 + 3 */
+  ns_batch_free(&out);
+
+  if (ns_execute("(project (list (if (gt c0 4i64) c0 0i64)) (scan 0))", &in, 1, &out) != 0) {
+    fail("if");
+  }
+  if (out.n_rows != 8) fail("if rows");
+  ns_batch_free(&out);
+
+  if (ns_execute(
+          "(hashagg (list c0) (list (sum c1)) (hashjoin c0 c0 (scan 0) (scan 1)))",
+          ins, 2, &out) != 0) {
+    fail("joinagg");
+  }
+  if (out.n_rows != 2) fail("joinagg rows");
+  ns_batch_free(&out);
+  if (ns_execute(
+          "(hashagg (list c0) (list (sum c1)) (filter (gt c1 0i64) (hashjoin c0 c0 (scan 0) (scan 1))))",
+          ins, 2, &out) != 0) {
+    fail("joinagg filter");
+  }
+  if (out.n_rows != 2) fail("joinagg filter rows");
+  ns_batch_free(&out);
+
+  {
+    std::shared_ptr<arrow::Array> a0, a1;
+    arrow::Int32Builder b0;
+    arrow::Int64Builder b1;
+    if (!b0.AppendValues({1, 2, 3, 4}).ok() || !b0.Finish(&a0).ok()) fail("pq build0");
+    if (!b1.AppendValues({10, 20, 30, 40}).ok() || !b1.Finish(&a1).ok()) fail("pq build1");
+    auto schema = arrow::schema({arrow::field("id", arrow::int32()),
+                                 arrow::field("v", arrow::int64())});
+    auto table = arrow::Table::Make(schema, {a0, a1});
+    const char *pqpath = "/tmp/nativesql_scan_test.parquet";
+    auto outf = arrow::io::FileOutputStream::Open(pqpath);
+    if (!outf.ok()) fail("pq open");
+    if (!parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *outf, 1024).ok()) {
+      fail("pq write");
+    }
+    if (!(*outf)->Close().ok()) fail("pq close");
+    NsFileSplit sp{};
+    sp.path = pqpath;
+    sp.start = 0;
+    sp.length = 0;
+    const char *nms[2] = {"id", "v"};
+    int32_t tps[2] = {NS_I32, NS_I64};
+    NsFileScan sc{};
+    sc.splits = &sp;
+    sc.n_splits = 1;
+    sc.col_names = nms;
+    sc.col_types = tps;
+    sc.n_cols = 2;
+    if (ns_execute_scan("(filter (gt c0 2i64) (scan 0))", nullptr, &sc, 1, &out) != 0) {
+      fail("pq scan");
+    }
+    if (out.n_rows != 2) fail("pq scan rows");
+    ns_batch_free(&out);
+    /* Missing / extra names must not abort (partition cols, case fold). */
+    const char *nms2[3] = {"ID", "missing_part", "v"};
+    int32_t tps2[3] = {NS_I32, NS_I64, NS_I64};
+    sc.col_names = nms2;
+    sc.col_types = tps2;
+    sc.n_cols = 3;
+    if (ns_execute_scan("(scan 0)", nullptr, &sc, 1, &out) != 0) fail("pq miss");
+    if (out.n_rows != 4) fail("pq miss rows");
+    const int64_t *miss = static_cast<const int64_t *>(out.cols[1].data);
+    for (int i = 0; i < 4; ++i) {
+      if (miss[i] != 0) fail("pq miss zeros");
+    }
+    ns_batch_free(&out);
+    /* Split range that hits no row group must return 0 rows, not abort. */
+    sp.start = 1LL << 40;
+    sp.length = 1;
+    sc.col_names = nms;
+    sc.col_types = tps;
+    sc.n_cols = 2;
+    if (ns_execute_scan("(scan 0)", nullptr, &sc, 1, &out) != 0) fail("pq empty split");
+    if (out.n_rows != 0) fail("pq empty split rows");
+    ns_batch_free(&out);
+    sp.start = 0;
+    sp.length = 0;
+  }
+
+  /* Two probe parquet files as two splits: join/agg must not concat first. */
+  {
+    auto write_kv = [](const char *path, const std::vector<int32_t> &k,
+                       const std::vector<int64_t> &v) {
+      arrow::Int32Builder b0;
+      arrow::Int64Builder b1;
+      std::shared_ptr<arrow::Array> a0, a1;
+      if (!b0.AppendValues(k).ok() || !b0.Finish(&a0).ok()) fail("fat kv0");
+      if (!b1.AppendValues(v).ok() || !b1.Finish(&a1).ok()) fail("fat kv1");
+      auto schema = arrow::schema(
+          {arrow::field("id", arrow::int32()), arrow::field("v", arrow::int64())});
+      auto table = arrow::Table::Make(schema, {a0, a1});
+      auto outf = arrow::io::FileOutputStream::Open(path);
+      if (!outf.ok()) fail("fat open");
+      if (!parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *outf, 1024)
+               .ok()) {
+        fail("fat write");
+      }
+      if (!(*outf)->Close().ok()) fail("fat close");
+    };
+    auto write_k = [](const char *path, const std::vector<int32_t> &k) {
+      arrow::Int32Builder b0;
+      std::shared_ptr<arrow::Array> a0;
+      if (!b0.AppendValues(k).ok() || !b0.Finish(&a0).ok()) fail("fat dim0");
+      auto schema = arrow::schema({arrow::field("id", arrow::int32())});
+      auto table = arrow::Table::Make(schema, {a0});
+      auto outf = arrow::io::FileOutputStream::Open(path);
+      if (!outf.ok()) fail("fat dim open");
+      if (!parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *outf, 1024)
+               .ok()) {
+        fail("fat dim write");
+      }
+      if (!(*outf)->Close().ok()) fail("fat dim close");
+    };
+    const char *p0 = "/tmp/nativesql_fat_probe0.parquet";
+    const char *p1 = "/tmp/nativesql_fat_probe1.parquet";
+    const char *pd = "/tmp/nativesql_fat_dim.parquet";
+    write_kv(p0, {1, 2}, {10, 20});
+    write_kv(p1, {1, 3}, {30, 40});
+    write_k(pd, {1, 3});
+    NsFileSplit psp[2]{};
+    psp[0].path = p0;
+    psp[0].start = 0;
+    psp[0].length = 0;
+    psp[1].path = p1;
+    psp[1].start = 0;
+    psp[1].length = 0;
+    NsFileSplit dsp{};
+    dsp.path = pd;
+    dsp.start = 0;
+    dsp.length = 0;
+    const char *pn[2] = {"id", "v"};
+    int32_t pt[2] = {NS_I32, NS_I64};
+    const char *dn[1] = {"id"};
+    int32_t dt[1] = {NS_I32};
+    NsFileScan scans[2]{};
+    scans[0].splits = psp;
+    scans[0].n_splits = 2;
+    scans[0].col_names = pn;
+    scans[0].col_types = pt;
+    scans[0].n_cols = 2;
+    scans[1].splits = &dsp;
+    scans[1].n_splits = 1;
+    scans[1].col_names = dn;
+    scans[1].col_types = dt;
+    scans[1].n_cols = 1;
+    if (ns_execute_scan("(project (list c1) (hashjoin c0 c0 (scan 0) (scan 1)))", nullptr,
+                        scans, 2, &out) != 0) {
+      fail("fat join");
+    }
+    if (out.n_rows != 3) fail("fat join rows");
+    const int64_t *pv = static_cast<const int64_t *>(out.cols[0].data);
+    if (pv[0] != 10 || pv[1] != 30 || pv[2] != 40) fail("fat join vals");
+    ns_batch_free(&out);
+    if (ns_execute_scan(
+            "(hashagg (list c0) (list c0 (sum c1)) (hashjoin c0 c0 (scan 0) (scan 1)))",
+            nullptr, scans, 2, &out) != 0) {
+      fail("fat hashagg");
+    }
+    if (out.n_rows != 2) fail("fat hashagg rows");
+    const int64_t *gk = static_cast<const int64_t *>(out.cols[0].data);
+    const int64_t *gs = static_cast<const int64_t *>(out.cols[1].data);
+    int64_t s1 = 0, s3 = 0;
+    for (int i = 0; i < out.n_rows; ++i) {
+      if (gk[i] == 1) s1 = gs[i];
+      else if (gk[i] == 3) s3 = gs[i];
+      else fail("fat hashagg key");
+    }
+    if (s1 != 40 || s3 != 40) fail("fat hashagg sum");
+    ns_batch_free(&out);
+  }
+
+  /* Empty name must not read that leaf (column prune). */
+  {
+    arrow::Int32Builder b0;
+    arrow::StringBuilder bs;
+    arrow::Int64Builder b2;
+    std::shared_ptr<arrow::Array> a0, as, a2;
+    if (!b0.AppendValues({1, 2, 3}).ok() || !b0.Finish(&a0).ok()) fail("prune0");
+    if (!bs.Append("aaa").ok() || !bs.Append("bbb").ok() || !bs.Append("ccc").ok() ||
+        !bs.Finish(&as).ok()) {
+      fail("prune s");
+    }
+    if (!b2.AppendValues({10, 20, 30}).ok() || !b2.Finish(&a2).ok()) fail("prune2");
+    auto schema = arrow::schema({arrow::field("id", arrow::int32()),
+                                 arrow::field("payload", arrow::utf8()),
+                                 arrow::field("v", arrow::int64())});
+    auto table = arrow::Table::Make(schema, {a0, as, a2});
+    const char *pqpath = "/tmp/nativesql_prune.parquet";
+    auto outf = arrow::io::FileOutputStream::Open(pqpath);
+    if (!outf.ok()) fail("prune open");
+    if (!parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *outf, 1024)
+             .ok()) {
+      fail("prune write");
+    }
+    if (!(*outf)->Close().ok()) fail("prune close");
+    NsFileSplit sp{};
+    sp.path = pqpath;
+    sp.start = 0;
+    sp.length = 0;
+    const char *nms[3] = {"id", "", "v"};
+    int32_t tps[3] = {NS_I32, NS_I64, NS_I64};
+    NsFileScan sc{};
+    sc.splits = &sp;
+    sc.n_splits = 1;
+    sc.col_names = nms;
+    sc.col_types = tps;
+    sc.n_cols = 3;
+    if (ns_execute_scan("(project (list c0 c2) (scan 0))", nullptr, &sc, 1, &out) != 0) {
+      fail("prune scan");
+    }
+    if (out.n_rows != 3 || out.n_cols != 2) fail("prune shape");
+    const int64_t *ids = static_cast<const int64_t *>(out.cols[0].data);
+    const int64_t *vs = static_cast<const int64_t *>(out.cols[1].data);
+    if (ids[0] != 1 || ids[2] != 3 || vs[1] != 20) fail("prune vals");
+    ns_batch_free(&out);
+    if (ns_execute_scan("(scan 0)", nullptr, &sc, 1, &out) != 0) fail("prune raw");
+    const int64_t *mid = static_cast<const int64_t *>(out.cols[1].data);
+    for (int i = 0; i < out.n_rows; ++i) {
+      if (mid[i] != 0) fail("prune skipped col");
+    }
+    ns_batch_free(&out);
+  }
+
+  /* STRING / BINARY (invalid UTF-8) / DECIMAL / TIMESTAMP must not abort. */
+  {
+    std::shared_ptr<arrow::Array> as, ab, ad, at;
+    arrow::StringBuilder sb;
+    arrow::BinaryBuilder bb;
+    arrow::Decimal128Builder db(arrow::decimal128(10, 2));
+    arrow::TimestampBuilder tb(arrow::timestamp(arrow::TimeUnit::MICRO),
+                               arrow::default_memory_pool());
+    if (!sb.Append("ok").ok() || !sb.Append("xy").ok() || !sb.Finish(&as).ok()) {
+      fail("pq str");
+    }
+    const uint8_t bad[] = {0xff, 0xfe, 0x80, 0x00};
+    if (!bb.Append(bad, 4).ok() || !bb.Append("z", 1).ok() || !bb.Finish(&ab).ok()) {
+      fail("pq bin");
+    }
+    if (!db.Append(arrow::Decimal128(12345)).ok() ||
+        !db.Append(arrow::Decimal128(7)).ok() || !db.Finish(&ad).ok()) {
+      fail("pq dec");
+    }
+    if (!tb.Append(1000).ok() || !tb.Append(2000).ok() || !tb.Finish(&at).ok()) {
+      fail("pq ts");
+    }
+    auto schema = arrow::schema(
+        {arrow::field("s", arrow::utf8()), arrow::field("b", arrow::binary()),
+         arrow::field("d", arrow::decimal128(10, 2)),
+         arrow::field("t", arrow::timestamp(arrow::TimeUnit::MICRO))});
+    auto table = arrow::Table::Make(schema, {as, ab, ad, at});
+    const char *pqpath = "/tmp/nativesql_scan_types.parquet";
+    auto outf = arrow::io::FileOutputStream::Open(pqpath);
+    if (!outf.ok()) fail("pq types open");
+    if (!parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *outf, 1024).ok()) {
+      fail("pq types write");
+    }
+    if (!(*outf)->Close().ok()) fail("pq types close");
+    NsFileSplit sp{};
+    sp.path = pqpath;
+    const char *nms[4] = {"s", "b", "d", "t"};
+    int32_t tps[4] = {NS_I64, NS_I64, NS_I64, NS_I64};
+    NsFileScan sc{};
+    sc.splits = &sp;
+    sc.n_splits = 1;
+    sc.col_names = nms;
+    sc.col_types = tps;
+    sc.n_cols = 4;
+    ns_strdict_clear();
+    if (ns_execute_scan("(scan 0)", nullptr, &sc, 1, &out) != 0) fail("pq types");
+    if (out.n_rows != 2) fail("pq types rows");
+    const int64_t *dec = static_cast<const int64_t *>(out.cols[2].data);
+    const int64_t *ts = static_cast<const int64_t *>(out.cols[3].data);
+    if (dec[0] != 12345 || dec[1] != 7) fail("pq dec val");
+    if (ts[0] != 1000 || ts[1] != 2000) fail("pq ts val");
+    if (ns_strdict_size() < 2) fail("pq strdict");
+    ns_batch_free(&out);
+    ns_strdict_clear();
+  }
+
+  /* Row-group stats skip: year=2000 must drop the 1999 groups. */
+  {
+    arrow::Int32Builder by;
+    arrow::Int64Builder bv;
+    for (int i = 0; i < 2000; ++i) {
+      if (!by.Append(1999).ok() || !bv.Append(i).ok()) fail("skip append");
+    }
+    for (int i = 0; i < 50; ++i) {
+      if (!by.Append(2000).ok() || !bv.Append(10000 + i).ok()) fail("skip append2");
+    }
+    std::shared_ptr<arrow::Array> ay, av;
+    if (!by.Finish(&ay).ok() || !bv.Finish(&av).ok()) fail("skip finish");
+    auto schema = arrow::schema({arrow::field("year", arrow::int32()),
+                                 arrow::field("v", arrow::int64())});
+    auto table = arrow::Table::Make(schema, {ay, av});
+    const char *pqpath = "/tmp/nativesql_skip.parquet";
+    auto outf = arrow::io::FileOutputStream::Open(pqpath);
+    if (!outf.ok()) fail("skip open");
+    if (!parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *outf, 1000)
+             .ok()) {
+      fail("skip write");
+    }
+    if (!(*outf)->Close().ok()) fail("skip close");
+    NsFileSplit sp{};
+    sp.path = pqpath;
+    const char *nms[2] = {"year", "v"};
+    int32_t tps[2] = {NS_I32, NS_I64};
+    NsFileScan sc{};
+    sc.splits = &sp;
+    sc.n_splits = 1;
+    sc.col_names = nms;
+    sc.col_types = tps;
+    sc.n_cols = 2;
+    if (ns_execute_scan("(filter (eq c0 2000i32) (scan 0))", nullptr, &sc, 1, &out) !=
+        0) {
+      fail("skip scan");
+    }
+    if (out.n_rows != 50) fail("skip rows");
+    ns_batch_free(&out);
+    NsColPred pred{};
+    pred.col = 0;
+    pred.op = 1;
+    pred.value = 1999;
+    sc.preds = &pred;
+    sc.n_preds = 1;
+    if (ns_execute_scan("(scan 0)", nullptr, &sc, 1, &out) != 0) fail("skip pred");
+    if (out.n_rows != 2000) fail("skip pred rows");
+    ns_batch_free(&out);
+    pred.value = 2001;
+    if (ns_execute_scan("(scan 0)", nullptr, &sc, 1, &out) != 0) fail("skip none");
+    if (out.n_rows != 0) fail("skip none rows");
+    ns_batch_free(&out);
+  }
 
   if (ns_execute("(filter (gt c0 5i64) (range 0 10 1))", nullptr, 0, &out) != 0) fail("range");
   if (out.n_rows != 4) fail("range filter"); /* 6,7,8,9 */

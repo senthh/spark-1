@@ -19,19 +19,18 @@ package org.apache.spark.sql.execution.nativesql
 
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
-import org.apache.spark.sql.catalyst.plans.Inner
+import org.apache.spark.sql.catalyst.plans.{Inner, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.types.UTF8String
 
 /**
  * Compact S-expression IR consumed by the Native SQL C++ engine.
  *
- * Supported subtree (primitive int / long / double / boolean / date):
- *   scan -> Filter col cmp literal -> Project col+/-col -> hash agg / hash join / sort
- *
- * File scans compile to FileLeaf. FileSourceStrategy plans the scan; NativeSqlExec
- * runs Filter/Project in C++ per partition. Agg/join/sort over files stay on the JVM.
+ * File star-schema: Filter/Project stay on FileLeaf (Parquet pushdown).
+ * Join / hashagg / semi / union / CASE run in C++. Strings are i64 hashes;
+ * decimals are unscaled i64. File-backed hashagg is partial; NativeSqlExec merges.
  */
 object NativeSqlPlan {
 
@@ -40,13 +39,27 @@ object NativeSqlPlan {
 
   def isSupportedType(dt: DataType): Boolean = dt match {
     case DateType => true
+    case d: DecimalType if d.precision <= 18 => true
     case _ => supportedAtomic.contains(dt)
   }
 
-  /** Columns we can encode into a C++ batch (or dummy-and-gather). */
+  /** Columns we can encode into a C++ batch (hash strings, unscaled decimals). */
   def isFilePayloadType(dt: DataType): Boolean = dt match {
+    case StringType => true
+    case d: DecimalType if d.precision <= 18 => true
     case _: AtomicType => true
     case _ => false
+  }
+
+  sealed trait NativeAggKind
+  object NativeAggKind {
+    case object Pass extends NativeAggKind
+    case object Sum extends NativeAggKind
+    case object Count extends NativeAggKind
+    case object Min extends NativeAggKind
+    case object Max extends NativeAggKind
+    case object AvgSum extends NativeAggKind
+    case object AvgCnt extends NativeAggKind
   }
 
   /**
@@ -65,10 +78,24 @@ object NativeSqlPlan {
 
   def compile(plan: LogicalPlan): Option[Compiled] = compile0(plan)
 
-  case class Compiled(ir: String, leaves: Seq[LeafData], output: Seq[Attribute]) {
+  case class Compiled(
+      ir: String,
+      leaves: Seq[LeafData],
+      output: Seq[Attribute],
+      joinKeyCols: Option[(Int, Int)] = None,
+      joinKeyNames: Option[(String, String)] = None,
+      leafOutputs: Seq[Seq[Attribute]] = Nil,
+      aggKinds: Seq[NativeAggKind] = Nil) {
     def hasFileLeaf: Boolean = leaves.exists(_.isInstanceOf[FileLeaf])
     def fileRels: Seq[LogicalPlan] = leaves.collect { case FileLeaf(p) => p }
     def isPassthroughScan: Boolean = ir.matches("""\(scan \d+\)""") || ir.startsWith("(range ")
+    def isHeavy: Boolean =
+      ir.contains("hashjoin") || ir.contains("hashagg") || ir.contains("hashsemi") ||
+        ir.contains("(union ") || fileRels.size >= 2
+    def withLeafOutputs: Compiled = {
+      if (leafOutputs.nonEmpty) this
+      else copy(leafOutputs = leaves.collect { case FileLeaf(p) => p.output })
+    }
   }
 
   sealed trait LeafData
@@ -94,38 +121,49 @@ object NativeSqlPlan {
     case s: SubqueryAlias => compile0(s.child)
 
     case Filter(cond, child) =>
-      compile0(child).flatMap { c =>
+      compile0(child).flatMap { c0 =>
+        val c = c0.withLeafOutputs
         val parts = splitAnd(cond)
-        val preds = parts.flatMap(p => compilePred(p, c.output)).filter(_ != "true")
-        if (preds.isEmpty) {
+        val (pushed, residual) = parts.partition(p => predOnOneFileLeaf(p, c))
+        val newLeaves = attachPredsToLeaves(c, pushed)
+        val ignorable = residual.forall(isIgnorablePred)
+        val residualCompiled = residual.flatMap(p => compilePred(p, c.output)).filter(_ != "true")
+        if (!ignorable && residualCompiled.size != residual.count(p => !isIgnorablePred(p))) {
           None
         } else {
-          val pred = preds.reduce((a, b) => s"(and $a $b)")
-          Some(c.copy(ir = s"(filter $pred ${c.ir})", output = c.output))
+          val leafPreds = pushed.flatMap(p => compilePred(p, c.output)).filter(_ != "true")
+          val preds = residualCompiled ++ leafPreds
+          if (preds.isEmpty) {
+            Some(c.copy(leaves = newLeaves))
+          } else {
+            val pred = preds.reduce((a, b) => s"(and $a $b)")
+            Some(c.copy(ir = s"(filter $pred ${c.ir})", leaves = newLeaves, output = c.output))
+          }
         }
       }
 
     case Project(projectList, child) =>
       compile0(child).flatMap { c =>
-        // File-backed Project would change the C++ schema; keep it on the JVM
-        // so NativeSqlExec can gather original scan rows after Filter.
-        if (c.hasFileLeaf) {
-          None
+        val exprs = projectList.map(compileNamed(_, c.output))
+        val outTypesOk = projectList.forall(e =>
+          isSupportedType(e.dataType) || e.dataType == StringType ||
+            e.dataType.isInstanceOf[DecimalType])
+        if (exprs.forall(_.isDefined) && (!c.hasFileLeaf || outTypesOk)) {
+          Some(c.copy(
+            ir = s"(project (list ${exprs.map(_.get).mkString(" ")}) ${c.ir})",
+            output = projectList.map(_.toAttribute)))
         } else {
-          val exprs = projectList.map(compileNamed(_, c.output))
-          if (exprs.forall(_.isDefined)) {
-            Some(c.copy(
-              ir = s"(project (list ${exprs.map(_.get).mkString(" ")}) ${c.ir})",
-              output = projectList.map(_.toAttribute)))
-          } else None
+          None
         }
       }
 
     case Sort(order, _, child, _)
         if order.nonEmpty &&
-          order.forall(o => o.direction == Ascending && isSupportedType(o.dataType)) =>
+          order.forall(o => o.direction == Ascending &&
+            (isSupportedType(o.dataType) || o.dataType == StringType)) =>
       compile0(child).flatMap { c =>
         if (c.hasFileLeaf) {
+          // Global order is Spark's job (TakeOrdered / SortExec on small agg output).
           None
         } else {
           val keys = order.map(o => compileExpr(o.child, c.output))
@@ -137,12 +175,24 @@ object NativeSqlPlan {
         }
       }
 
-    case Aggregate(grouping, agg, child, _) if grouping.size <= 2 =>
+    case Aggregate(grouping, agg, child, _) if grouping.size <= 16 =>
       compile0(child).flatMap { c =>
+        val keys = grouping.map(compileExpr(_, c.output))
+        val groupOk = grouping.forall(e =>
+          isSupportedType(e.dataType) || e.dataType == StringType ||
+            e.dataType.isInstanceOf[DecimalType])
         if (c.hasFileLeaf) {
-          None
+          val compiledAggs = agg.map(compileAggNamed(_, c.output))
+          if (keys.forall(_.isDefined) && compiledAggs.forall(_.isDefined) && groupOk) {
+            val parts = compiledAggs.map(_.get)
+            val irList = parts.flatMap(_._1)
+            val kinds = parts.flatMap(_._2)
+            Some(c.copy(
+              ir = s"(hashagg (list ${keys.map(_.get).mkString(" ")}) (list ${irList.mkString(" ")}) ${c.ir})",
+              output = agg.map(_.toAttribute),
+              aggKinds = kinds))
+          } else None
         } else {
-          val keys = grouping.map(compileExpr(_, c.output))
           val aggs = agg.map(compileNamed(_, c.output))
           if (keys.forall(_.isDefined) && aggs.forall(_.isDefined) &&
               grouping.forall(e => isSupportedType(e.dataType))) {
@@ -157,13 +207,51 @@ object NativeSqlPlan {
       for {
         l <- compile0(left)
         r <- compile0(right)
-        if !l.hasFileLeaf && !r.hasFileLeaf
         (lk, rk) <- compileJoinKeys(cond, l.output, r.output)
         rIr = shiftScans(r.ir, l.leaves.size)
-      } yield Compiled(
-        s"(hashjoin $lk $rk ${l.ir} $rIr)",
-        l.leaves ++ r.leaves,
-        left.output ++ right.output)
+      } yield {
+        Compiled(
+          s"(hashjoin $lk $rk ${l.ir} $rIr)",
+          l.leaves ++ r.leaves,
+          left.output ++ right.output,
+          joinKeyCols = Some((colIndex(lk), colIndex(rk))),
+          joinKeyNames = Some((
+            l.output.lift(colIndex(lk)).map(_.name).getOrElse(""),
+            r.output.lift(colIndex(rk)).map(_.name).getOrElse(""))),
+          leafOutputs = l.withLeafOutputs.leafOutputs ++ r.withLeafOutputs.leafOutputs)
+      }
+
+    case Join(left, right, LeftSemi, Some(cond), _) =>
+      for {
+        l <- compile0(left)
+        r <- compile0(right)
+        (lk, rk) <- compileJoinKeys(cond, l.output, r.output)
+        rIr = shiftScans(r.ir, l.leaves.size)
+      } yield {
+        Compiled(
+          s"(hashsemi $lk $rk ${l.ir} $rIr)",
+          l.leaves ++ r.leaves,
+          left.output,
+          leafOutputs = l.withLeafOutputs.leafOutputs ++ r.withLeafOutputs.leafOutputs)
+      }
+
+    case u: Union if u.children.size >= 2 && u.children.forall(ch => compile0(ch).isDefined) =>
+      val compiled = u.children.flatMap(compile0)
+      if (compiled.isEmpty || compiled.exists(_.output.size != compiled.head.output.size)) {
+        None
+      } else {
+        var offset = 0
+        val ir = compiled.map { c =>
+          val s = shiftScans(c.ir, offset)
+          offset += c.leaves.size
+          s
+        }.reduce((a, b) => s"(union $a $b)")
+        Some(Compiled(
+          ir,
+          compiled.flatMap(_.leaves),
+          compiled.head.output,
+          leafOutputs = compiled.flatMap(_.withLeafOutputs.leafOutputs)))
+      }
 
     case _ => None
   }
@@ -228,6 +316,14 @@ object NativeSqlPlan {
     case Literal(v, ByteType) => Some(s"${v}i32")
     case Literal(v, ShortType) => Some(s"${v}i32")
     case Literal(v, DateType) => Some(s"${v}i32")
+    case Literal(v: UTF8String, StringType) => Some(s"${hash64(v)}i64")
+    case Literal(v: String, StringType) => Some(s"${hash64(UTF8String.fromString(v))}i64")
+    case Literal(v: Decimal, _: DecimalType) => Some(s"${v.toUnscaledLong}i64")
+    case If(pred, t, f) =>
+      for (p <- compilePred(pred, schema); a <- compileExpr(t, schema); b <- compileExpr(f, schema))
+        yield s"(if $p $a $b)"
+    case CaseWhen(branches, elseValue) =>
+      compileCase(branches, elseValue, schema)
     case Add(l, r, _) => bin("add", l, r, schema)
     case Subtract(l, r, _) => bin("sub", l, r, schema)
     case Multiply(l, r, _) => bin("mul", l, r, schema)
@@ -250,8 +346,107 @@ object NativeSqlPlan {
     case _ => None
   }
 
+  /**
+   * File-backed Average is compiled as sum+count so partitions can merge.
+   * In-memory (no file leaf) still uses `(avg)` for a complete result.
+   */
+  private def compileAggNamed(
+      e: NamedExpression,
+      schema: Seq[Attribute]): Option[(Seq[String], Seq[NativeAggKind])] = {
+    val child = e match {
+      case Alias(c, _) => c
+      case other => other
+    }
+    child match {
+      case AggregateExpression(af, _, _, _, _) => compileAggFn(af, schema)
+      case af: AggregateFunction => compileAggFn(af, schema)
+      case other =>
+        compileExpr(other, schema).map(s => (Seq(s), Seq(NativeAggKind.Pass)))
+    }
+  }
+
+  private def compileAggFn(
+      af: AggregateFunction,
+      schema: Seq[Attribute]): Option[(Seq[String], Seq[NativeAggKind])] = af match {
+    case Sum(c, _) =>
+      compileExpr(c, schema).map(x => (Seq(s"(sum $x)"), Seq(NativeAggKind.Sum)))
+    case Count(Nil) =>
+      Some((Seq("(count)"), Seq(NativeAggKind.Count)))
+    case Count(Seq(Literal(1, _))) =>
+      Some((Seq("(count)"), Seq(NativeAggKind.Count)))
+    case Count(Seq(c)) =>
+      compileExpr(c, schema).map(x => (Seq(s"(count $x)"), Seq(NativeAggKind.Count)))
+    case Min(c) =>
+      compileExpr(c, schema).map(x => (Seq(s"(min $x)"), Seq(NativeAggKind.Min)))
+    case Max(c) =>
+      compileExpr(c, schema).map(x => (Seq(s"(max $x)"), Seq(NativeAggKind.Max)))
+    case Average(c, _) =>
+      compileExpr(c, schema).map { x =>
+        (Seq(s"(sum $x)", s"(count $x)"), Seq(NativeAggKind.AvgSum, NativeAggKind.AvgCnt))
+      }
+    case _ => None
+  }
+
+  private def compileCase(
+      branches: Seq[(Expression, Expression)],
+      elseValue: Option[Expression],
+      schema: Seq[Attribute]): Option[String] = {
+    val elseIr = elseValue.flatMap(compileExpr(_, schema)).getOrElse("0i64")
+    branches.foldRight(Option(elseIr)) { case ((p, t), acc) =>
+      for {
+        a <- acc
+        pred <- compilePred(p, schema)
+        thn <- compileExpr(t, schema)
+      } yield s"(if $pred $thn $a)"
+    }
+  }
+
+  private def isIgnorablePred(e: Expression): Boolean = e match {
+    case IsNotNull(_) => true
+    case And(l, r) => isIgnorablePred(l) && isIgnorablePred(r)
+    case _ => false
+  }
+
+  private def predOnOneFileLeaf(e: Expression, c: Compiled): Boolean = {
+    val refs = e.references
+    if (refs.isEmpty) {
+      false
+    } else {
+      val outs = if (c.leafOutputs.nonEmpty) c.leafOutputs
+      else c.leaves.collect { case FileLeaf(p) => p.output }
+      outs.count(o => refs.subsetOf(AttributeSet(o))) == 1
+    }
+  }
+
+  private def attachPredsToLeaves(c: Compiled, preds: Seq[Expression]): Seq[LeafData] = {
+    if (preds.isEmpty) {
+      c.leaves
+    } else {
+      val outs = if (c.leafOutputs.nonEmpty) c.leafOutputs
+      else c.leaves.collect { case FileLeaf(p) => p.output }
+      c.leaves.zipWithIndex.map {
+        case (FileLeaf(p), i) =>
+          val mine = preds.filter(pr => pr.references.subsetOf(AttributeSet(outs(i))))
+          if (mine.isEmpty) FileLeaf(p) else FileLeaf(Filter(mine.reduce(And), p))
+        case (other, _) => other
+      }
+    }
+  }
+
+  def hash64(s: UTF8String): Long = {
+    if (s == null) {
+      0L
+    } else {
+      val h = (s.hashCode.toLong << 32) ^
+        java.lang.Long.rotateLeft(s.numBytes().toLong + 1L, 17) ^ s.getPrefix
+      if (h == 0L) 1L else h
+    }
+  }
+
   private def bin(op: String, l: Expression, r: Expression, schema: Seq[Attribute]): Option[String] =
     for (a <- compileExpr(l, schema); b <- compileExpr(r, schema)) yield s"($op $a $b)"
+
+  private def colIndex(ref: String): Int = ref.drop(1).toInt
 
   private def compileJoinKeys(
       cond: Expression,

@@ -147,13 +147,102 @@ class NativeSqlSuite extends SharedSparkSession {
         withTempPath { dir =>
           Seq((1, 10), (2, 20), (3, 30)).toDF("id", "v").write.parquet(dir.getCanonicalPath)
           val df = spark.read.parquet(dir.getCanonicalPath).filter($"id" > 1)
+          // Native parquet scan: C++ reads the files (Velox-style). Spark
+          // still plans splits and keeps dataFilters for listing / skip.
           assert(df.queryExecution.executedPlan.exists(_.isInstanceOf[NativeSqlExec]))
-          assert(df.queryExecution.executedPlan.collect {
-            case n: NativeSqlExec => n
-          }.head.children.nonEmpty)
+          val scans = df.queryExecution.executedPlan.collect {
+            case s: org.apache.spark.sql.execution.FileSourceScanExec => s
+          }
+          assert(scans.nonEmpty && scans.head.dataFilters.nonEmpty)
           checkAnswer(
             df.select($"id", $"v"),
             Seq(org.apache.spark.sql.Row(2, 20), org.apache.spark.sql.Row(3, 30)))
+        }
+      }
+    }
+  }
+
+  test("parquet filter keeps FileSource dataFilters") {
+    withNative {
+      withSQLConf(SQLConf.USE_V1_SOURCE_LIST.key -> "parquet") {
+        withTempPath { dir =>
+          Seq((1, 10), (2, 20), (3, 30)).toDF("id", "v").write.parquet(dir.getCanonicalPath)
+          val df = spark.read.parquet(dir.getCanonicalPath).filter($"id" > 1)
+          val scans = df.queryExecution.executedPlan.collect {
+            case s: org.apache.spark.sql.execution.FileSourceScanExec => s
+          }
+          assert(scans.nonEmpty)
+          assert(scans.head.dataFilters.nonEmpty,
+            s"expected Parquet pushdown, dataFilters=${scans.head.dataFilters}")
+        }
+      }
+    }
+  }
+
+  test("parquet inner join offload") {
+    withNative {
+      withSQLConf(SQLConf.USE_V1_SOURCE_LIST.key -> "parquet") {
+        withTempPath { dir =>
+          val aPath = new File(dir, "a").getCanonicalPath
+          val bPath = new File(dir, "b").getCanonicalPath
+          Seq((1, 10), (2, 20), (3, 30)).toDF("id", "av").write.parquet(aPath)
+          Seq((2, 200), (3, 300)).toDF("id", "bv").write.parquet(bPath)
+          val a = spark.read.parquet(aPath)
+          val b = spark.read.parquet(bPath)
+          val df = a.join(b, a("id") === b("id"))
+          assert(df.queryExecution.sparkPlan.exists(_.isInstanceOf[NativeSqlExec]))
+          checkAnswer(
+            df.select(a("id"), $"av", $"bv"),
+            Seq(org.apache.spark.sql.Row(2, 20, 200), org.apache.spark.sql.Row(3, 30, 300)))
+        }
+      }
+    }
+  }
+
+  test("parquet 3-way join plus hash agg offload") {
+    withNative {
+      withSQLConf(SQLConf.USE_V1_SOURCE_LIST.key -> "parquet") {
+        withTempPath { dir =>
+          val fact = new File(dir, "fact").getCanonicalPath
+          val d = new File(dir, "d").getCanonicalPath
+          val i = new File(dir, "i").getCanonicalPath
+          Seq((10, 1, 100L), (11, 1, 50L), (10, 2, 7L)).toDF("dk", "ik", "amt")
+            .write.parquet(fact)
+          Seq((10, 2000), (11, 2001)).toDF("dk", "yr").write.parquet(d)
+          Seq((1, "A"), (2, "B")).toDF("ik", "brand").write.parquet(i)
+          val f = spark.read.parquet(fact)
+          val dd = spark.read.parquet(d)
+          val ii = spark.read.parquet(i)
+          val df = f.join(dd, f("dk") === dd("dk"))
+            .join(ii, f("ik") === ii("ik"))
+            .groupBy($"yr", $"brand")
+            .agg(sum($"amt").as("s"))
+          assert(df.queryExecution.sparkPlan.exists(_.isInstanceOf[NativeSqlExec]),
+            df.queryExecution.sparkPlan.toString)
+          checkAnswer(
+            df,
+            Seq(
+              org.apache.spark.sql.Row(2000, "A", 100L),
+              org.apache.spark.sql.Row(2001, "A", 50L),
+              org.apache.spark.sql.Row(2000, "B", 7L)))
+        }
+      }
+    }
+  }
+
+  test("parquet join gathers string payload") {
+    withNative {
+      withSQLConf(SQLConf.USE_V1_SOURCE_LIST.key -> "parquet") {
+        withTempPath { dir =>
+          val aPath = new File(dir, "a").getCanonicalPath
+          val bPath = new File(dir, "b").getCanonicalPath
+          Seq((1, "x"), (2, "y")).toDF("id", "name").write.parquet(aPath)
+          Seq((2, 200), (3, 300)).toDF("id", "bv").write.parquet(bPath)
+          val a = spark.read.parquet(aPath)
+          val b = spark.read.parquet(bPath)
+          val df = a.join(b, a("id") === b("id"))
+          assert(df.queryExecution.sparkPlan.exists(_.isInstanceOf[NativeSqlExec]))
+          checkAnswer(df.select($"name", $"bv"), Seq(org.apache.spark.sql.Row("y", 200)))
         }
       }
     }

@@ -1119,6 +1119,13 @@ object SQLConf {
     .booleanConf
     .createWithDefault(true)
 
+  val NATIVE_SQL_SCAN_ENABLED = buildConf("spark.sql.nativesql.scan.enabled")
+    .doc("When true, file leaves are decoded by the Native SQL C++ parquet reader " +
+      "(Velox/ClickHouse-style). Spark only plans splits; C++ reads the files.")
+    .version("4.2.0")
+    .booleanConf
+    .createWithDefault(true)
+
   val ADAPTIVE_EXECUTION_APPLY_FINAL_STAGE_SHUFFLE_OPTIMIZATIONS =
     buildConf("spark.sql.adaptive.applyFinalStageShuffleOptimizations")
       .internal()
@@ -7867,6 +7874,8 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
   def nativeSqlJoinGraceThreshold: Long = getConf(NATIVE_SQL_JOIN_GRACE_THRESHOLD)
 
   def nativeSqlDispatchEnabled: Boolean = getConf(NATIVE_SQL_DISPATCH_ENABLED)
+
+  def nativeSqlScanEnabled: Boolean = getConf(NATIVE_SQL_SCAN_ENABLED)
 
   def adaptiveExecutionEnabled: Boolean = getConf(ADAPTIVE_EXECUTION_ENABLED)
 
