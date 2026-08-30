@@ -28,11 +28,12 @@ class NativeSqlSuite extends SharedSparkSession {
   import testImplicits._
 
   private def nativeLib: Option[String] = {
-    val root = new File("sql/native-cpp/build")
-    val candidates = Seq(
-      new File(root, "libspark_nativesql_jni.dylib"),
-      new File(root, "libspark_nativesql_jni.so"))
-    candidates.find(_.isFile).map(_.getAbsolutePath)
+    val roots = Seq(
+      new File("sql/native-cpp/build"),
+      new File("../native-cpp/build"),
+      new File("../../sql/native-cpp/build"))
+    val names = Seq("libspark_nativesql_jni.dylib", "libspark_nativesql_jni.so")
+    roots.flatMap(r => names.map(n => new File(r, n))).find(_.isFile).map(_.getAbsolutePath)
   }
 
   private def withNative[T](f: => T): T = {
@@ -118,18 +119,42 @@ class NativeSqlSuite extends SharedSparkSession {
     }
   }
 
-  test("parquet file scan is not swallowed as leaf native exec") {
-    withSQLConf(
-        SQLConf.NATIVE_SQL_ENABLED.key -> "true",
-        SQLConf.USE_V1_SOURCE_LIST.key -> "parquet",
-        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
-      withTempPath { dir =>
-        Seq((1, 10), (2, 20), (3, 30)).toDF("id", "v").write.parquet(dir.getCanonicalPath)
+  test("parquet int filter compiles to file-backed IR") {
+    withTempPath { dir =>
+      Seq((1, 10), (2, 20), (3, 30)).toDF("id", "v").write.parquet(dir.getCanonicalPath)
+      withSQLConf(
+          SQLConf.NATIVE_SQL_ENABLED.key -> "true",
+          SQLConf.USE_V1_SOURCE_LIST.key -> "parquet",
+          SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
         val df = spark.read.parquet(dir.getCanonicalPath).filter($"id" > 1)
         assert(df.queryExecution.optimizedPlan.exists(NativeSqlPlan.isFileScanLeaf))
-        assert(NativeSqlPlan.compile(df.queryExecution.optimizedPlan).isEmpty)
-        val native = df.queryExecution.executedPlan.collect { case n: NativeSqlExec => n }
-        assert(native.isEmpty, "FileScan must not be compiled as NativeSqlExec")
+        val compiled = NativeSqlPlan.compile(df.queryExecution.optimizedPlan)
+        assert(compiled.isDefined)
+        assert(compiled.get.hasFileLeaf)
+        assert(compiled.get.ir.contains("(filter"))
+        val withNull = spark.read.parquet(dir.getCanonicalPath)
+          .filter($"id".isNotNull && $"id" > 1)
+        val compiledNull = NativeSqlPlan.compile(withNull.queryExecution.optimizedPlan)
+        assert(compiledNull.isDefined)
+        assert(compiledNull.get.ir.contains("true") || compiledNull.get.ir.contains("(gt"))
+      }
+    }
+  }
+
+  test("parquet int filter offload") {
+    withNative {
+      withSQLConf(SQLConf.USE_V1_SOURCE_LIST.key -> "parquet") {
+        withTempPath { dir =>
+          Seq((1, 10), (2, 20), (3, 30)).toDF("id", "v").write.parquet(dir.getCanonicalPath)
+          val df = spark.read.parquet(dir.getCanonicalPath).filter($"id" > 1)
+          assert(df.queryExecution.executedPlan.exists(_.isInstanceOf[NativeSqlExec]))
+          assert(df.queryExecution.executedPlan.collect {
+            case n: NativeSqlExec => n
+          }.head.children.nonEmpty)
+          checkAnswer(
+            df.select($"id", $"v"),
+            Seq(org.apache.spark.sql.Row(2, 20), org.apache.spark.sql.Row(3, 30)))
+        }
       }
     }
   }

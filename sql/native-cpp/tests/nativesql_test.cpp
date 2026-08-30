@@ -50,6 +50,12 @@ int main() {
   if (out.n_rows != 4) fail("filter row count");
   ns_batch_free(&out);
 
+  if (ns_execute("(filter (or (eq c0 1i64) (eq c0 2i64)) (scan 0))", &in, 1, &out) != 0) {
+    fail("or");
+  }
+  if (out.n_rows != 2) fail("or row count");
+  ns_batch_free(&out);
+
   if (ns_execute("(project (list c0 (add c0 c1)) (scan 0))", &in, 1, &out) != 0) fail("project");
   if (out.n_rows != 8 || out.n_cols != 2) fail("project shape");
   const int64_t *p1 = static_cast<const int64_t *>(out.cols[1].data);

@@ -19,6 +19,7 @@ package org.apache.spark.sql.execution.nativesql
 
 import java.io.File
 
+import org.apache.spark.SparkFiles
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.internal.SQLConf
 
@@ -47,16 +48,25 @@ object NativeSqlLibrary extends Logging {
   }
 
   private def ensureLoaded(): Unit = synchronized {
-    if (loaded || loadError.isDefined) return
+    if (loaded) return
+    val explicit = SQLConf.get.nativeSqlLib.filter(_.nonEmpty)
+    // Retry after a failed default loadLibrary if an explicit path is set later.
+    if (loadError.isDefined && explicit.isEmpty) return
+    loadError = None
     try {
-      val explicit = SQLConf.get.nativeSqlLib.filter(_.nonEmpty)
       explicit match {
         case Some(path) =>
-          val f = new File(path)
-          if (!f.isFile) {
+          val name = new File(path).getName
+          val sparkFile = try {
+            Some(new File(SparkFiles.get(name)))
+          } catch {
+            case _: Throwable => None
+          }
+          val candidates = Seq(new File(path), new File(name)) ++ sparkFile.toSeq
+          val resolved = candidates.find(_.isFile).getOrElse {
             throw new IllegalArgumentException(s"spark.sql.nativesql.lib does not exist: $path")
           }
-          System.load(f.getAbsolutePath)
+          System.load(resolved.getAbsolutePath)
         case None =>
           System.loadLibrary("spark_nativesql_jni")
       }

@@ -27,27 +27,30 @@ import org.apache.spark.sql.types._
 /**
  * Compact S-expression IR consumed by the Native SQL C++ engine.
  *
- * Supported subtree (primitive int / long / double / boolean):
+ * Supported subtree (primitive int / long / double / boolean / date):
  *   scan -> Filter col cmp literal -> Project col+/-col -> hash agg / hash join / sort
  *
- * File scans (LogicalRelation + HadoopFsRelation) are never compiled. The hybrid
- * engine must let FileSourceStrategy plan the scan; later a partition-level native
- * op will wrap it. Swallowing FileScan as NativeSqlExec (LeafExecNode) would pull
- * data to the driver.
+ * File scans compile to FileLeaf. FileSourceStrategy plans the scan; NativeSqlExec
+ * runs Filter/Project in C++ per partition. Agg/join/sort over files stay on the JVM.
  */
 object NativeSqlPlan {
 
   val supportedAtomic: Set[DataType] =
-    Set(IntegerType, LongType, DoubleType, BooleanType, ByteType, ShortType, FloatType)
+    Set(IntegerType, LongType, DoubleType, BooleanType, ByteType, ShortType, FloatType, DateType)
 
-  def isSupportedType(dt: DataType): Boolean = supportedAtomic.contains(dt)
+  def isSupportedType(dt: DataType): Boolean = dt match {
+    case DateType => true
+    case _ => supportedAtomic.contains(dt)
+  }
+
+  /** Columns we can encode into a C++ batch (or dummy-and-gather). */
+  def isFilePayloadType(dt: DataType): Boolean = dt match {
+    case _: AtomicType => true
+    case _ => false
+  }
 
   /**
    * True when `plan` is a v1 file-scan leaf. Used by tests and hybrid dispatch.
-   *
-   * The hybrid engine must let FileSourceStrategy plan the scan; later a
-   * partition-level native op will wrap it. Swallowing FileScan as
-   * NativeSqlExec (LeafExecNode) would pull data to the driver.
    */
   def isFileScanLeaf(plan: LogicalPlan): Boolean = plan match {
     case LogicalRelation(_: HadoopFsRelation, _, _, _, _) => true
@@ -56,12 +59,18 @@ object NativeSqlPlan {
 
   def compile(plan: LogicalPlan): Option[Compiled] = compile0(plan)
 
-  case class Compiled(ir: String, leaves: Seq[LeafData], output: Seq[Attribute])
+  case class Compiled(ir: String, leaves: Seq[LeafData], output: Seq[Attribute]) {
+    def hasFileLeaf: Boolean = leaves.exists(_.isInstanceOf[FileLeaf])
+    def fileRels: Seq[LogicalPlan] = leaves.collect { case FileLeaf(p) => p }
+    def isPassthroughScan: Boolean = ir.matches("""\(scan \d+\)""") || ir.startsWith("(range ")
+  }
 
   sealed trait LeafData
   case class LocalLeaf(output: Seq[Attribute], rows: Seq[org.apache.spark.sql.catalyst.InternalRow])
     extends LeafData
   case class RangeLeaf(start: Long, end: Long, step: Long) extends LeafData
+  /** File scan planned by FileSourceStrategy; executed per partition, not on the driver. */
+  case class FileLeaf(@transient plan: LogicalPlan) extends LeafData
 
   private def compile0(plan: LogicalPlan): Option[Compiled] = plan match {
     case l: LocalRelation if l.output.forall(a => isSupportedType(a.dataType)) =>
@@ -73,55 +82,69 @@ object NativeSqlPlan {
         Seq(RangeLeaf(r.start, r.end, r.step)),
         r.output))
 
-    // Do not load Parquet (or any HadoopFsRelation) in C++ / on the driver.
-    case p if isFileScanLeaf(p) => None
+    case p if isFileScanLeaf(p) && p.output.forall(a => isFilePayloadType(a.dataType)) =>
+      Some(Compiled(s"(scan 0)", Seq(FileLeaf(p)), p.output))
 
     case Filter(cond, child) =>
       for {
         c <- compile0(child)
         pred <- compilePred(cond, c.output)
-      } yield c.copy(ir = s"(filter $pred ${c.ir})", output = child.output)
+      } yield c.copy(ir = s"(filter $pred ${c.ir})", output = c.output)
 
     case Project(projectList, child) =>
       compile0(child).flatMap { c =>
-        val exprs = projectList.map(compileNamed(_, c.output))
-        if (exprs.forall(_.isDefined)) {
-          Some(c.copy(
-            ir = s"(project (list ${exprs.map(_.get).mkString(" ")}) ${c.ir})",
-            output = projectList.map(_.toAttribute)))
-        } else None
+        // File-backed Project would change the C++ schema; keep it on the JVM
+        // so NativeSqlExec can gather original scan rows after Filter.
+        if (c.hasFileLeaf) {
+          None
+        } else {
+          val exprs = projectList.map(compileNamed(_, c.output))
+          if (exprs.forall(_.isDefined)) {
+            Some(c.copy(
+              ir = s"(project (list ${exprs.map(_.get).mkString(" ")}) ${c.ir})",
+              output = projectList.map(_.toAttribute)))
+          } else None
+        }
       }
 
     case Sort(order, _, child, _)
         if order.nonEmpty &&
           order.forall(o => o.direction == Ascending && isSupportedType(o.dataType)) =>
       compile0(child).flatMap { c =>
-        val keys = order.map(o => compileExpr(o.child, c.output))
-        if (keys.forall(_.isDefined)) {
-          Some(c.copy(
-            ir = s"(sort (list ${keys.map(_.get).mkString(" ")}) ${c.ir})",
-            output = c.output))
-        } else None
+        if (c.hasFileLeaf) {
+          None
+        } else {
+          val keys = order.map(o => compileExpr(o.child, c.output))
+          if (keys.forall(_.isDefined)) {
+            Some(c.copy(
+              ir = s"(sort (list ${keys.map(_.get).mkString(" ")}) ${c.ir})",
+              output = c.output))
+          } else None
+        }
       }
 
     case Aggregate(grouping, agg, child, _) if grouping.size <= 2 =>
       compile0(child).flatMap { c =>
-        val keys = grouping.map(compileExpr(_, c.output))
-        val aggs = agg.map(compileNamed(_, c.output))
-        if (keys.forall(_.isDefined) && aggs.forall(_.isDefined) &&
-            grouping.forall(e => isSupportedType(e.dataType))) {
-          Some(c.copy(
-            ir = s"(hashagg (list ${keys.map(_.get).mkString(" ")}) (list ${aggs.map(_.get).mkString(" ")}) ${c.ir})",
-            output = agg.map(_.toAttribute)))
-        } else None
+        if (c.hasFileLeaf) {
+          None
+        } else {
+          val keys = grouping.map(compileExpr(_, c.output))
+          val aggs = agg.map(compileNamed(_, c.output))
+          if (keys.forall(_.isDefined) && aggs.forall(_.isDefined) &&
+              grouping.forall(e => isSupportedType(e.dataType))) {
+            Some(c.copy(
+              ir = s"(hashagg (list ${keys.map(_.get).mkString(" ")}) (list ${aggs.map(_.get).mkString(" ")}) ${c.ir})",
+              output = agg.map(_.toAttribute)))
+          } else None
+        }
       }
 
     case Join(left, right, Inner, Some(cond), _) =>
       for {
         l <- compile0(left)
         r <- compile0(right)
+        if !l.hasFileLeaf && !r.hasFileLeaf
         (lk, rk) <- compileJoinKeys(cond, l.output, r.output)
-        // shift right-side scan indices
         rIr = shiftScans(r.ir, l.leaves.size)
       } yield Compiled(
         s"(hashjoin $lk $rk ${l.ir} $rIr)",
@@ -139,6 +162,18 @@ object NativeSqlPlan {
   private def compilePred(e: Expression, schema: Seq[Attribute]): Option[String] = e match {
     case And(l, r) =>
       for (a <- compilePred(l, schema); b <- compilePred(r, schema)) yield s"(and $a $b)"
+    case Or(l, r) =>
+      for (a <- compilePred(l, schema); b <- compilePred(r, schema)) yield s"(or $a $b)"
+    // Spark injects IsNotNull next to comparisons; C++ has no null bitmap yet.
+    case IsNotNull(_) => Some("true")
+    case In(value, list) if list.nonEmpty && list.forall(_.foldable) =>
+      val eqs = list.map(lit => cmp("eq", value, lit, schema))
+      if (eqs.forall(_.isDefined)) Some(eqs.map(_.get).reduce((a, b) => s"(or $a $b)"))
+      else None
+    case InSet(value, hset) if hset.nonEmpty =>
+      val eqs = hset.toSeq.map(v => cmp("eq", value, Literal(v, value.dataType), schema))
+      if (eqs.forall(_.isDefined)) Some(eqs.map(_.get).reduce((a, b) => s"(or $a $b)"))
+      else None
     case EqualTo(l, r) => cmp("eq", l, r, schema)
     case EqualNullSafe(l, r) => cmp("eq", l, r, schema)
     case GreaterThan(l, r) => cmp("gt", l, r, schema)
@@ -173,6 +208,7 @@ object NativeSqlPlan {
     case Literal(v, BooleanType) => Some(if (v == true) "true" else "false")
     case Literal(v, ByteType) => Some(s"${v}i32")
     case Literal(v, ShortType) => Some(s"${v}i32")
+    case Literal(v, DateType) => Some(s"${v}i32")
     case Add(l, r, _) => bin("add", l, r, schema)
     case Subtract(l, r, _) => bin("sub", l, r, schema)
     case Multiply(l, r, _) => bin("mul", l, r, schema)

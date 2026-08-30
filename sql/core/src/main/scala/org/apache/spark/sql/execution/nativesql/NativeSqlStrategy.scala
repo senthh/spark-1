@@ -19,12 +19,13 @@ package org.apache.spark.sql.execution.nativesql
 
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.execution.{SparkPlan, SparkStrategy}
+import org.apache.spark.sql.execution.datasources.FileSourceStrategy
 import org.apache.spark.sql.internal.SQLConf
 
 /**
- * Planner hook: when `spark.sql.nativesql.enabled` is true, rewrite the logical
- * subtree and replace a supported plan with [[NativeSqlExec]]. Long join chains
- * fall back to Spark WSCG / JoinSelection. Otherwise return Nil.
+ * Planner hook: rewrite, then offload a supported subtree to [[NativeSqlExec]].
+ * File-backed plans keep [[FileSourceStrategy]] as the scan child and run C++
+ * per partition. Identity file scans are not wrapped.
  */
 object NativeSqlStrategy extends SparkStrategy {
   override def apply(plan: LogicalPlan): Seq[SparkPlan] = {
@@ -35,8 +36,33 @@ object NativeSqlStrategy extends SparkStrategy {
     } else {
       val rewritten = NativePhysicalRewrites.rewrite(plan)
       NativeSqlPlan.compile(rewritten) match {
-        case Some(compiled) => NativeSqlExec(compiled) :: Nil
-        case None => Nil
+        case Some(compiled) if compiled.hasFileLeaf =>
+          planFileBacked(compiled)
+        case Some(compiled) =>
+          NativeSqlExec(compiled, Nil) :: Nil
+        case None =>
+          Nil
+      }
+    }
+  }
+
+  private def planFileBacked(compiled: NativeSqlPlan.Compiled): Seq[SparkPlan] = {
+    if (compiled.isPassthroughScan) {
+      Nil
+    } else {
+      compiled.fileRels match {
+        case Seq(rel) =>
+          val scans = FileSourceStrategy(rel)
+          if (scans.isEmpty) {
+            Nil
+          } else if (scans.head.output.map(_.exprId) != rel.output.map(_.exprId)) {
+            // Column order must match IR c0..cN from the logical scan.
+            Nil
+          } else {
+            NativeSqlExec(compiled, scans) :: Nil
+          }
+        case _ =>
+          Nil
       }
     }
   }

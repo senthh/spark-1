@@ -238,6 +238,7 @@ bool eval_pred(const Val &v, const Batch &b, int row) {
   if (v.kind != ValKind::CALL) return eval_num(v, b, row).as_i() != 0;
   const auto &n = v.name;
   if (n == "and") return eval_pred(v.args[0], b, row) && eval_pred(v.args[1], b, row);
+  if (n == "or") return eval_pred(v.args[0], b, row) || eval_pred(v.args[1], b, row);
   EvalNum l = eval_num(v.args[0], b, row);
   EvalNum r = eval_num(v.args[1], b, row);
   const bool f = l.is_f || r.is_f;
