@@ -69,7 +69,10 @@ else
   PARQUET_LIBS="$PARQUET_LIBS -ldl"
 fi
 
-"$CXX" -std=c++17 -O3 -fPIC -shared \
+# Velox-style optimization flags: native arch, vectorization, fast math
+OPTFLAGS="-O3 -march=native -mtune=native -mavx2 -mfma -ffast-math -funroll-loops"
+
+"$CXX" -std=c++17 $OPTFLAGS -fPIC -shared \
   -I"$ROOT/include" \
   -I"$JAVA_HOME/include" \
   -I"$JAVA_HOME/include/$JNI_OS" \
@@ -77,6 +80,7 @@ fi
   "$ROOT/src/engine.cpp" \
   "$ROOT/src/sort.cpp" \
   "$ROOT/src/parquet_scan.cpp" \
+  "$ROOT/src/vectorized_ops.cpp" \
   "$ROOT/src/jni_bridge.cpp" \
   $PARQUET_LIBS \
   "${RPATH_FLAGS[@]}" \
@@ -129,22 +133,24 @@ bundle_runtime_libs() {
 bundle_runtime_libs
 
 # Native unit test + microbench (no JNI)
-"$CXX" -std=c++17 -O3 -I"$ROOT/include" \
+"$CXX" -std=c++17 $OPTFLAGS -I"$ROOT/include" \
   $PARQUET_CFLAGS \
   "$ROOT/src/engine.cpp" \
   "$ROOT/src/sort.cpp" \
   "$ROOT/src/parquet_scan.cpp" \
+  "$ROOT/src/vectorized_ops.cpp" \
   "$ROOT/tests/nativesql_test.cpp" \
   $PARQUET_LIBS \
   "${RPATH_FLAGS[@]}" \
   -o "$BUILD/nativesql_test"
 "$BUILD/nativesql_test"
 
-"$CXX" -std=c++17 -O3 -I"$ROOT/include" \
+"$CXX" -std=c++17 $OPTFLAGS -I"$ROOT/include" \
   $PARQUET_CFLAGS \
   "$ROOT/src/engine.cpp" \
   "$ROOT/src/sort.cpp" \
   "$ROOT/src/parquet_scan.cpp" \
+  "$ROOT/src/vectorized_ops.cpp" \
   "$ROOT/tests/nativesql_bench.cpp" \
   $PARQUET_LIBS \
   "${RPATH_FLAGS[@]}" \
