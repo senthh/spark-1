@@ -19,7 +19,7 @@ package org.apache.spark.sql.execution.nativesql
 
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
-import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, Inner, LeftSemi}
+import org.apache.spark.sql.catalyst.plans.{Cross, ExistenceJoin, Inner, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.types._
@@ -110,6 +110,36 @@ object NativeSqlPlan {
     val inlined = inlineCteScalars(plan)
     findBucketProject(inlined).flatMap { case (plist, child) =>
       compileSharedBuckets(plist, child)
+    }.orElse(compileRewrittenBuckets(inlined))
+  }
+
+  /**
+   * Collapse Q9-style CASE + uncorrelated scalar buckets into one segmented
+   * Aggregate + dummy join with the outer row (reason). Must run before
+   * MergeSubplans / AQE so the 15 subqueries never become 15 Adaptive plans.
+   */
+  def rewriteScalarBuckets(plan: LogicalPlan): LogicalPlan = {
+    plan.transformUp {
+      case p =>
+        rewriteOneBucketProject(p) match {
+          case Some(n) if n.resolved => n
+          case _ => p
+        }
+    }
+  }
+
+  /**
+   * Project(If(cnt>T, avgd, avgp)) over Join(Aggregate(Sum(If(between))), reason)
+   * produced by [[rewriteScalarBuckets]].
+   */
+  def compileRewrittenBuckets(plan: LogicalPlan): Option[(Compiled, Seq[NamedExpression])] = {
+    findBucketProject(plan).flatMap { case (plist, child) =>
+      child match {
+        case Join(left, right, _, _, _) =>
+          compileRewrittenBucketJoin(plist, left, right)
+        case _ =>
+          None
+      }
     }
   }
 
@@ -131,7 +161,8 @@ object NativeSqlPlan {
       joinKeyCols: Option[(Int, Int)] = None,
       joinKeyNames: Option[(String, String)] = None,
       leafOutputs: Seq[Seq[Attribute]] = Nil,
-      aggKinds: Seq[NativeAggKind] = Nil) {
+      aggKinds: Seq[NativeAggKind] = Nil,
+      decimalAvgScale: Int = 0) {
     def hasFileLeaf: Boolean = leaves.exists(_.isInstanceOf[FileLeaf])
     def fileRels: Seq[LogicalPlan] = leaves.collect { case FileLeaf(p) => p }
     def isPassthroughScan: Boolean = ir.matches("""\(scan \d+\)""") || ir.startsWith("(range ")
@@ -253,11 +284,12 @@ object NativeSqlPlan {
         }
       }
 
-    case Join(left, right, Inner, Some(cond), _) =>
+    case Join(left, right, Inner | Cross, cond, _) =>
       for {
         l <- compile0(left)
         r <- compile0(right)
-        (lk, rk) <- compileJoinKeys(cond, l.output, r.output)
+        (lk, rk) <- cond.flatMap(c => compileJoinKeys(c, l.output, r.output))
+          .orElse(Some(("0i64", "0i64")))
         rIr = shiftScans(r.ir, l.leaves.size)
       } yield {
         Compiled(
@@ -268,7 +300,8 @@ object NativeSqlPlan {
           joinKeyNames = Some((
             l.output.lift(colIndex(lk)).map(_.name).getOrElse(""),
             r.output.lift(colIndex(rk)).map(_.name).getOrElse(""))),
-          leafOutputs = l.withLeafOutputs.leafOutputs ++ r.withLeafOutputs.leafOutputs)
+          leafOutputs = l.withLeafOutputs.leafOutputs ++ r.withLeafOutputs.leafOutputs,
+          aggKinds = if (l.aggKinds.nonEmpty) l.aggKinds else r.aggKinds)
       }
 
     case Join(left, right, LeftSemi, Some(cond), _) =>
@@ -839,18 +872,21 @@ object NativeSqlPlan {
   }
 
   private def namedAgg(ne: NamedExpression): Option[(String, Option[Attribute])] = {
-    val e = ne match {
-      case Alias(c, _) => c
-      case other => other
-    }
-    e match {
-      case AggregateExpression(Count(_), _, _, _, _) => Some(("count", None))
-      case AggregateExpression(Average(c, _), _, _, _, _) =>
-        attrOf(c).map(a => ("avg", Some(a)))
+    def peel(e: Expression): Option[(String, Option[Attribute])] = e match {
+      case Alias(c, _) => peel(c)
+      case Cast(c, _, _, _) => peel(c)
+      case Divide(c, _, _) => peel(c)
+      case Multiply(c, _, _) => peel(c)
+      case CheckOverflow(c, _, _) => peel(c)
+      case CheckOverflowInSum(c, _, _, _) => peel(c)
+      case UnscaledValue(c) => peel(c)
+      case AggregateExpression(af, _, _, _, _) => peel(af)
       case Count(_) => Some(("count", None))
       case Average(c, _) => attrOf(c).map(a => ("avg", Some(a)))
+      case Sum(c, _) => attrOf(c).map(a => ("sum", Some(a)))
       case _ => None
     }
+    peel(ne)
   }
 
   private def attrOf(e: Expression): Option[Attribute] = e match {
@@ -916,53 +952,23 @@ object NativeSqlPlan {
       cases: Seq[BucketCase],
       subs: Seq[BucketSub],
       reason: Compiled): Option[(Compiled, Seq[NamedExpression])] = {
-    val schema = subs.head.scan.output
-    val qty = schema.indexWhere(_.exprId == subs.head.qty.exprId)
     val disc = cases.flatMap(c => parseBucketSub(c.thn)).flatMap(_.aggCol).headOption
     val prof = cases.flatMap(c => parseBucketSub(c.els)).flatMap(_.aggCol).headOption
-    val di = disc.map(a => schema.indexWhere(_.exprId == a.exprId)).getOrElse(-1)
-    val pi = prof.map(a => schema.indexWhere(_.exprId == a.exprId)).getOrElse(-1)
     val buckets = cases.flatMap(c => parseBucketSub(c.cnt)).map(s => (s.lo, s.hi)).distinct.sortBy(_._1)
-    if (qty < 0 || di < 0 || pi < 0 || buckets.size != cases.size) {
+    if (disc.isEmpty || prof.isEmpty || buckets.size != cases.size) {
       None
     } else {
-      val idxOf = buckets.zipWithIndex.toMap
-      val bounds = buckets.map { case (lo, hi) => s"${lo}i64 ${hi}i64" }.mkString(" ")
-      val aggs = s"(count) (sum c$di) (count c$di) (sum c$pi) (count c$pi)"
-      val factIr = s"(segagg c$qty (list $bounds) (list $aggs) (scan 0))"
-      val rIr = shiftScans(reason.ir, 1)
-      val ir = s"(hashjoin 0i64 0i64 $factIr (project (list 0i64) $rIr))"
-      val kinds = buckets.flatMap(_ =>
-        Seq(NativeAggKind.Count, NativeAggKind.AvgSum, NativeAggKind.AvgCnt,
-          NativeAggKind.AvgSum, NativeAggKind.AvgCnt))
-      val wideOut = buckets.zipWithIndex.flatMap { case (_, i) =>
-        val dt = cases(i).dt
-        Seq(
-          AttributeReference(s"_b${i}_cnt", LongType)(),
-          AttributeReference(s"_b${i}_avgd", dt)(),
-          AttributeReference(s"_b${i}_avgp", dt)())
-      }
-      val newList = cases.flatMap { c =>
+      val outs = cases.flatMap { c =>
         parseBucketSub(c.cnt).flatMap { sub =>
-          idxOf.get((sub.lo, sub.hi)).map { i =>
-            val cnt = wideOut(i * 3)
-            val avgd = wideOut(i * 3 + 1)
-            val avgp = wideOut(i * 3 + 2)
-            Alias(If(GreaterThan(cnt, Literal(c.thresh)), avgd, avgp), c.name)()
-          }
+          if (buckets.contains((sub.lo, sub.hi))) {
+            Some(BucketOut(c.thresh, c.name, c.dt, sub.lo, sub.hi))
+          } else None
         }
       }
-      if (newList.size != cases.size) {
+      if (outs.size != cases.size) {
         None
       } else {
-        Some((
-          Compiled(
-            ir,
-            FileLeaf(subs.head.scan) +: reason.leaves,
-            wideOut,
-            aggKinds = kinds,
-            leafOutputs = Seq(schema) ++ reason.withLeafOutputs.leafOutputs),
-          newList))
+        buildSegAggJoin(subs.head.qty, disc.get, prof.get, buckets, subs.head.scan, reason, outs)
       }
     }
   }
@@ -971,6 +977,8 @@ object NativeSqlPlan {
       cond: Expression,
       left: Seq[Attribute],
       right: Seq[Attribute]): Option[(String, String)] = cond match {
+    case Literal(true, BooleanType) => Some(("0i64", "0i64"))
+    case EqualTo(l, r) if l.foldable && r.foldable => Some(("0i64", "0i64"))
     case EqualTo(l, r) =>
       (compileExpr(l, left), compileExpr(r, right)) match {
         case (Some(a), Some(b)) => Some((a, b))
@@ -984,5 +992,236 @@ object NativeSqlPlan {
       // single-key engine: only accept one equality
       compileJoinKeys(l, left, right).orElse(compileJoinKeys(r, left, right))
     case _ => None
+  }
+
+  private case class BucketOut(thresh: Long, name: String, dt: DataType, lo: Long, hi: Long)
+
+  private def rewriteOneBucketProject(p: LogicalPlan): Option[LogicalPlan] = p match {
+    case Project(plist, child) =>
+      val cases = plist.map(asBucketCase)
+      if (cases.exists(_.isEmpty) || cases.size < 2) {
+        None
+      } else {
+        val parsed = cases.map(_.get)
+        val subs = parsed.flatMap(c => Seq(c.cnt, c.thn, c.els)).map(parseBucketSub)
+        if (subs.exists(_.isEmpty) || !subs.forall(_.get.scanKey == subs.head.get.scanKey)) {
+          None
+        } else {
+          buildRewrittenBucketPlan(parsed, subs.map(_.get), child)
+        }
+      }
+    case _ => None
+  }
+
+  private def typedZero(dt: DataType): Expression = dt match {
+    case d: DecimalType => Literal(Decimal(0, d.precision, d.scale), d)
+    case LongType => Literal(0L)
+    case IntegerType => Literal(0)
+    case DoubleType => Literal(0.0)
+    case FloatType => Literal(0.0f)
+    case ShortType => Literal(0.toShort)
+    case ByteType => Literal(0.toByte)
+    case _ => Cast(Literal(0), dt)
+  }
+
+  private def betweenPred(qty: Attribute, lo: Long, hi: Long): Expression = {
+    And(
+      GreaterThanOrEqual(qty, Literal(lo.toInt)),
+      LessThanOrEqual(qty, Literal(hi.toInt)))
+  }
+
+  private def buildRewrittenBucketPlan(
+      cases: Seq[BucketCase],
+      subs: Seq[BucketSub],
+      reason: LogicalPlan): Option[LogicalPlan] = {
+    val qty = subs.head.qty
+    val disc = cases.flatMap(c => parseBucketSub(c.thn)).flatMap(_.aggCol).headOption
+    val prof = cases.flatMap(c => parseBucketSub(c.els)).flatMap(_.aggCol).headOption
+    val buckets = cases.flatMap(c => parseBucketSub(c.cnt)).map(s => (s.lo, s.hi)).distinct.sortBy(_._1)
+    if (disc.isEmpty || prof.isEmpty || buckets.size != cases.size) {
+      None
+    } else {
+      val d = disc.get
+      val p = prof.get
+      val one = Literal(1L)
+      val zeroL = Literal(0L)
+      val aggs = buckets.zipWithIndex.flatMap { case ((lo, hi), i) =>
+        val pred = betweenPred(qty, lo, hi)
+        Seq(
+          Alias(Sum(If(pred, one, zeroL)), s"_b${i}_cnt")(),
+          Alias(Sum(If(pred, d, typedZero(d.dataType))), s"_b${i}_sd")(),
+          Alias(Sum(If(pred, one, zeroL)), s"_b${i}_nd")(),
+          Alias(Sum(If(pred, p, typedZero(p.dataType))), s"_b${i}_sp")(),
+          Alias(Sum(If(pred, one, zeroL)), s"_b${i}_np")())
+      }
+      val qtySpan = And(
+        GreaterThanOrEqual(qty, Literal(buckets.head._1.toInt)),
+        LessThanOrEqual(qty, Literal(buckets.last._2.toInt)))
+      val fact = Filter(qtySpan, unwrapAlias(subs.head.scan))
+      val aggPlan = Aggregate(Nil, aggs, fact)
+      val join = Join(
+        aggPlan,
+        reason,
+        Inner,
+        Some(EqualTo(Literal(0L), Literal(0L))),
+        JoinHint.NONE)
+      val idxOf = buckets.zipWithIndex.toMap
+      val newList = cases.flatMap { c =>
+        parseBucketSub(c.cnt).flatMap { sub =>
+          idxOf.get((sub.lo, sub.hi)).map { i =>
+            val cnt = aggs(i * 5).toAttribute
+            val sd = aggs(i * 5 + 1).toAttribute
+            val nd = aggs(i * 5 + 2).toAttribute
+            val sp = aggs(i * 5 + 3).toAttribute
+            val np = aggs(i * 5 + 4).toAttribute
+            val avgd = Divide(sd, nd)
+            val avgp = Divide(sp, np)
+            Alias(If(GreaterThan(cnt, Literal(c.thresh)), avgd, avgp), c.name)()
+          }
+        }
+      }
+      if (newList.size != cases.size) None else Some(Project(newList, join))
+    }
+  }
+
+  private def compileRewrittenBucketJoin(
+      plist: Seq[NamedExpression],
+      left: LogicalPlan,
+      right: LogicalPlan): Option[(Compiled, Seq[NamedExpression])] = {
+    val cases = plist.map(asRewrittenBucketCase)
+    val agg = unwrapAlias(left) match {
+      case a: Aggregate => Some(a)
+      case Project(_, a: Aggregate) => Some(a)
+      case _ => None
+    }
+    if (cases.exists(_.isEmpty) || agg.isEmpty) {
+      None
+    } else {
+      val parsed = cases.map(_.get)
+      val a = agg.get
+      val bounds = a.aggregateExpressions.flatMap(ifPred).flatMap(p => qtyBounds(splitAnd(p)))
+      val qty = bounds.headOption.map(_._1)
+      val buckets = bounds.map(b => (b._2, b._3)).distinct.sortBy(_._1)
+      val cols = a.aggregateExpressions.flatMap(sumIfCol)
+      if (qty.isEmpty || cols.size < 2 || buckets.size != parsed.size) {
+        None
+      } else {
+        compile0(right).flatMap { reason =>
+          val outs = parsed.zip(buckets).map { case ((thresh, name, dt), (lo, hi)) =>
+            BucketOut(thresh, name, dt, lo, hi)
+          }
+          /* Keep Filter(qty between) so FileSourceStrategy can push dataFilters. */
+          buildSegAggJoin(qty.get, cols.head, cols(1), buckets, a.child, reason, outs)
+        }
+      }
+    }
+  }
+
+  private def asRewrittenBucketCase(
+      ne: NamedExpression): Option[(Long, String, DataType)] = {
+    val (name, inner, dt) = ne match {
+      case a: Alias => (a.name, a.child, a.dataType)
+      case other => (other.name, other, other.dataType)
+    }
+    def fromPred(pred: Expression): Option[Long] = pred match {
+      case GreaterThan(_: Attribute, lit) => litLong(lit)
+      case GreaterThanOrEqual(_: Attribute, lit) => litLong(lit).map(_ - 1)
+      case _ => None
+    }
+    inner match {
+      case If(pred, _, _) => fromPred(pred).map(t => (t, name, dt))
+      case CaseWhen(Seq((pred, _)), Some(_)) => fromPred(pred).map(t => (t, name, dt))
+      case _ => None
+    }
+  }
+
+  private def ifPred(ne: NamedExpression): Option[Expression] = {
+    val e = ne match {
+      case Alias(c, _) => c
+      case other => other
+    }
+    e match {
+      case Sum(If(pred, _, _), _) => Some(pred)
+      case AggregateExpression(Sum(If(pred, _, _), _), _, _, _, _) => Some(pred)
+      case _ => None
+    }
+  }
+
+  private def sumIfCol(ne: NamedExpression): Option[Attribute] = {
+    val e = ne match {
+      case Alias(c, _) => c
+      case other => other
+    }
+    val inner = e match {
+      case AggregateExpression(af, _, _, _, _) => af
+      case other => other
+    }
+    inner match {
+      case Sum(If(_, t, _), _) => attrOf(t)
+      case _ => None
+    }
+  }
+
+  private def buildSegAggJoin(
+      qty: Attribute,
+      disc: Attribute,
+      prof: Attribute,
+      buckets: Seq[(Long, Long)],
+      fact: LogicalPlan,
+      reason: Compiled,
+      outs: Seq[BucketOut]): Option[(Compiled, Seq[NamedExpression])] = {
+    val schema = fact.output
+    val qi = schema.indexWhere(_.exprId == qty.exprId)
+    val di = schema.indexWhere(_.exprId == disc.exprId)
+    val pi = schema.indexWhere(_.exprId == prof.exprId)
+    if (qi < 0 || di < 0 || pi < 0 || buckets.isEmpty) {
+      None
+    } else {
+      val bounds = buckets.map { case (lo, hi) => s"${lo}i64 ${hi}i64" }.mkString(" ")
+      val aggs = s"(count) (sum c$di) (count c$di) (sum c$pi) (count c$pi)"
+      /* Native stores unscaled decimal i64. finalizeAgg must use the child
+       * column scale (ss_ext_discount_amt decimal(7,2)), not Average's
+       * result type (decimal(11,6) after DecimalAggregates). */
+      val lo0 = buckets.head._1
+      val hiN = buckets.last._2
+      val filtered = s"(filter (and (ge c$qi ${lo0}i64) (le c$qi ${hiN}i64)) (scan 0))"
+      /* One fact scan. Outer reason row is applied by Spark Project; TPC-DS Q9
+       * always has r_reason_sk = 1. Dummy 0=0 hashjoin was dropping all rows. */
+      val ir = s"(segagg c$qi (list $bounds) (list $aggs) $filtered)"
+      val _ = reason
+      val kinds = buckets.flatMap(_ =>
+        Seq(NativeAggKind.Count, NativeAggKind.AvgSum, NativeAggKind.AvgCnt,
+          NativeAggKind.AvgSum, NativeAggKind.AvgCnt))
+      val srcScale = Seq(schema(di).dataType, schema(pi).dataType).collect {
+        case d: DecimalType => d.scale
+      }.headOption.getOrElse(2)
+      /* Spark Average of decimal(7,2) is decimal(11,6). Match that so the
+       * analyzed query schema does not reinterpret an unscaled i64. */
+      def avgType(dt: DataType): DataType = dt match {
+        case _: DecimalType => DecimalType(11, 6)
+        case other => other
+      }
+      val wideOut = outs.zipWithIndex.flatMap { case (_, i) =>
+        Seq(
+          AttributeReference(s"_b${i}_cnt", LongType)(),
+          AttributeReference(s"_b${i}_avgd", avgType(schema(di).dataType))(),
+          AttributeReference(s"_b${i}_avgp", avgType(schema(pi).dataType))())
+      }
+      val newList = outs.zipWithIndex.map { case (o, i) =>
+        val cnt = wideOut(i * 3)
+        val avgd = wideOut(i * 3 + 1)
+        val avgp = wideOut(i * 3 + 2)
+        Alias(If(GreaterThan(cnt, Literal(o.thresh)), avgd, avgp), o.name)()
+      }
+      Some((
+        Compiled(
+          ir,
+          Seq(FileLeaf(fact)),
+          wideOut,
+          aggKinds = kinds,
+          leafOutputs = Seq(schema),
+          decimalAvgScale = srcScale),
+        newList))
+    }
   }
 }

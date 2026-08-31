@@ -157,7 +157,8 @@ object NativeSqlStrategy extends SparkStrategy {
 
   /**
    * Largest leaf is the probe (fact). Every other leaf must be broadcastable
-   * (size cap or few files). Star-schema TPC-DS fits; fact-fact joins do not.
+   * (size cap or few files). Two large facts (Q5 sales+returns) stay as
+   * separate NativeSqlExecs until empty-sibling union is proven on YARN.
    */
   private def attachBroadcasts(
       rels: Seq[LogicalPlan],

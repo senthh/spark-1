@@ -37,7 +37,8 @@ object NativePhysicalRewrites {
       val step1 = plan.transformUp(convertOuterJoinToInner)
       val step2 = step1.transformUp(mergeFilterIntoJoin)
       val step3 = step2.transformUp(dropUnusedProject)
-      step3.transformUp(datePreimageYearEq)
+      val step4 = step3.transformUp(datePreimageYearEq)
+      NativeSqlPlan.rewriteScalarBuckets(step4)
     } catch {
       case NonFatal(_) => plan
     }

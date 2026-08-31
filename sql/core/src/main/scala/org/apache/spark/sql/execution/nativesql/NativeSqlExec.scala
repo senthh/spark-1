@@ -140,47 +140,17 @@ case class NativeSqlExec(
       }
   }
 
-  /* Column indexes referenced on the path from (scan N) up through project/filter. */
-  private def usedColsForScan(ir: String, scanIdx: Int): Set[Int] = {
-    val needle = s"(scan $scanIdx)"
-    val cols = scala.collection.mutable.Set[Int]()
+  /**
+   * File columns referenced in IR. Drop indexes past this leaf's width so
+   * join-output cN (dim attrs) do not force decoding unused fact columns.
+   * Empty set means "all columns" (NativeParquet convention).
+   */
+  private def usedColsForScan(ir: String, scanIdx: Int, schemaLen: Int): Set[Int] = {
     val colRe = """c(\d+)""".r
-    var from = 0
-    while (from < ir.length) {
-      val p = ir.indexOf(needle, from)
-      if (p < 0) {
-        return cols.toSet
-      }
-      var depth = 0
-      var s = p
-      var seen = 0
-      while (s > 0 && seen < 8) {
-        s -= 1
-        if (ir.charAt(s) == ')') {
-          depth += 1
-        } else if (ir.charAt(s) == '(') {
-          if (depth == 0) {
-            val slice = ir.substring(s, p)
-            if (slice.startsWith("(project") || slice.startsWith("(filter") ||
-                slice.startsWith("(scan") || slice.startsWith("(hashagg") ||
-                slice.startsWith("(segagg") ||
-                slice.startsWith("(hashjoin") || slice.startsWith("(hashsemi") ||
-                slice.startsWith("(sort") || slice.startsWith("(union")) {
-              colRe.findAllMatchIn(slice).foreach { m =>
-                cols += m.group(1).toInt
-              }
-              seen += 1
-            } else {
-              seen = 99
-            }
-          } else {
-            depth -= 1
-          }
-        }
-      }
-      from = p + needle.length
-    }
-    cols.toSet
+    val cols = colRe.findAllMatchIn(ir).map(_.group(1).toInt)
+      .filter(i => i >= 0 && i < schemaLen).toSet
+    val _ = scanIdx
+    cols
   }
 
   private def executeFilePipeline(): RDD[InternalRow] = {
@@ -188,11 +158,17 @@ case class NativeSqlExec(
     val probeIdx = children.indexWhere(c => !isBroadcastDim(c))
     val probe = if (probeIdx >= 0) children(probeIdx) else children.head
     val ir = compiled.ir
-    val kinds = compiled.aggKinds
+    val kinds =
+      if (compiled.aggKinds.nonEmpty) {
+        compiled.aggKinds
+      } else if (ir.contains("segagg")) {
+        NativeSqlExec.segaggKinds(ir)
+      } else {
+        compiled.aggKinds
+      }
     val out = compiled.output
     val metric = longMetric("numOutputRows")
     val nativeScan = SQLConf.get.nativeSqlScanEnabled
-    val probeScan = fileScanOf(probe)
     val leafOuts = compiled.withLeafOutputs.leafOutputs
     def schemaFor(idx: Int, fallback: Seq[Attribute]): Seq[Attribute] = {
       if (idx >= 0 && idx < leafOuts.length && leafOuts(idx).nonEmpty) leafOuts(idx) else fallback
@@ -220,7 +196,7 @@ case class NativeSqlExec(
             System.err.println(
               s"nativesql: dim $i files=${files.length} cols=${schema.length} " +
                 s"preds=${dimFilters(i).length} " +
-                s"used=${usedColsForScan(ir, i).toSeq.sorted.mkString(",")}")
+                s"used=${usedColsForScan(ir, i, schema.length).toSeq.sorted.mkString(",")}")
           } else {
             val rows = b.executeBroadcast[Array[InternalRow]]().value
             val encSchema = if (rows.nonEmpty && rows.head.numFields == schema.length) {
@@ -238,56 +214,72 @@ case class NativeSqlExec(
       i += 1
     }
     val pIdx = if (probeIdx >= 0) probeIdx else 0
-    val rdd = if (nativeScan && probeScan.isDefined) {
-      val parts = NativeParquet.filePartitions(probeScan.get)
-      val schema = schemaFor(pIdx, probe.output)
-      System.err.println(
-        s"nativesql: probe $pIdx parts=${parts.length} cols=${schema.length} " +
-          s"used=${usedColsForScan(ir, pIdx).toSeq.sorted.mkString(",")}")
+    val probeIdxs = children.indices.filter(i => !isBroadcastDim(children(i)))
+    val rdd = if (nativeScan && probeIdxs.nonEmpty &&
+        probeIdxs.forall(i => fileScanOf(children(i)).isDefined)) {
+      val probeMeta = probeIdxs.map { i =>
+        val scan = fileScanOf(children(i)).get
+        val schema = schemaFor(i, scan.output)
+        System.err.println(
+          s"nativesql: probe $i parts=${NativeParquet.filePartitions(scan).length} " +
+            s"cols=${schema.length} " +
+            s"used=${usedColsForScan(ir, i, schema.length).toSeq.sorted.mkString(",")}")
+        (i, scan, schema)
+      }
+      val packed = probeMeta.flatMap { case (i, scan, schema) =>
+        NativeParquet.filePartitions(scan).map(fp => (i, fp.files, schema, scan.dataFilters))
+      }
       new RDD[InternalRow](sparkContext, Nil) {
-        override def getPartitions: Array[Partition] = parts.asInstanceOf[Array[Partition]]
+        override def getPartitions: Array[Partition] = {
+          packed.iterator.zipWithIndex.map { case ((leaf, files, _, _), idx) =>
+            NativeSqlExec.MultiProbePartition(idx, leaf, files): Partition
+          }.toArray
+        }
         override def compute(split: Partition, ctx: TaskContext): Iterator[InternalRow] = {
-          val fp = split.asInstanceOf[FilePartition]
+          val mp = split.asInstanceOf[NativeSqlExec.MultiProbePartition]
+          val (leaf, files, schema, filters) = packed(mp.index)
           val conf = SparkHadoopUtil.get.conf
           val prepared = new Array[NativeParquet.PreparedScan](n)
           val specs = new Array[AnyRef](n)
           var j = 0
           while (j < n) {
-            if (j != pIdx && dimFiles(j) != null) {
+            if (j != leaf && dimFiles(j) != null) {
               prepared(j) = NativeParquet.scanSpec(
                 dimFiles(j).value, dimOut(j), conf, reuseRemote = true,
-                usedCols = usedColsForScan(ir, j),
+                usedCols = usedColsForScan(ir, j, dimOut(j).length),
                 filters = Option(dimFilters(j)).getOrElse(Nil))
+              specs(j) = prepared(j).spec
+            } else if (j != leaf && probeIdxs.contains(j)) {
+              val other = probeMeta.find(_._1 == j).get
+              prepared(j) = NativeParquet.scanSpec(
+                Array.empty[PartitionedFile], other._3, conf,
+                usedCols = usedColsForScan(ir, j, other._3.length))
               specs(j) = prepared(j).spec
             }
             j += 1
           }
-          def runProbe(files: Array[PartitionedFile]): Iterator[InternalRow] = {
-            val probeFilters =
-              if (probeScan.isDefined) probeScan.get.dataFilters else Nil
-            prepared(pIdx) = NativeParquet.scanSpec(
-              files, schema, conf, usedCols = usedColsForScan(ir, pIdx),
-              filters = probeFilters)
-            specs(pIdx) = prepared(pIdx).spec
+          def runProbe(fs: Array[PartitionedFile]): Iterator[InternalRow] = {
+            prepared(leaf) = NativeParquet.scanSpec(
+              fs, schema, conf, usedCols = usedColsForScan(ir, leaf, schema.length),
+              filters = filters)
+            specs(leaf) = prepared(leaf).spec
             try {
-              NativeSqlExec.runNative(ir, kinds, out, pIdx, n, build, specs, metric)
+              NativeSqlExec.runNative(ir, kinds, out, leaf, n, build, specs, metric)
             } finally {
-              if (prepared(pIdx) != null) {
-                prepared(pIdx).cleanup()
-                prepared(pIdx) = null
+              if (prepared(leaf) != null) {
+                prepared(leaf).cleanup()
+                prepared(leaf) = null
               }
             }
           }
           try {
-            if (fp.files.length <= 1) {
-              runProbe(fp.files)
-            } else {
-              fp.files.iterator.flatMap(f => runProbe(Array(f)))
-            }
+            /* One JNI call per Spark partition. Splitting per file doubled
+             * Q10/Q14 time (rebuild dim scans + hash tables each file). */
+            runProbe(files)
           } finally {
             var k = 0
             while (k < n) {
-              if (k != pIdx && prepared(k) != null) prepared(k).cleanup()
+              if (k != leaf && prepared(k) != null) prepared(k).cleanup()
               k += 1
             }
           }
@@ -306,7 +298,7 @@ case class NativeSqlExec(
     if (kinds.isEmpty) {
       rdd
     } else {
-      NativeSqlExec.mergePartials(rdd, kinds, out)
+      NativeSqlExec.mergePartials(rdd, kinds, out, compiled.decimalAvgScale)
     }
   }
 
@@ -343,6 +335,20 @@ case class NativeSqlExec(
 }
 
 object NativeSqlExec {
+
+  /** Recover Q9-style wide kinds if Compiled.aggKinds was dropped. */
+  private[nativesql] def segaggKinds(ir: String): Seq[NativeAggKind] = {
+    val n = """(\d+)i64 (\d+)i64""".r.findAllMatchIn(ir).length
+    val one = Seq(
+      NativeAggKind.Count, NativeAggKind.AvgSum, NativeAggKind.AvgCnt,
+      NativeAggKind.AvgSum, NativeAggKind.AvgCnt)
+    Seq.fill(math.max(n, 1))(one).flatten
+  }
+
+  private[nativesql] case class MultiProbePartition(
+      index: Int,
+      leafIdx: Int,
+      files: Array[PartitionedFile]) extends Partition
 
   private[nativesql] type BuildSide =
     (Broadcast[Array[AnyRef]], Broadcast[java.util.HashMap[java.lang.Long, UTF8String]], Int)
@@ -470,7 +476,8 @@ object NativeSqlExec {
   private[nativesql] def mergePartials(
       rdd: RDD[InternalRow],
       kinds: Seq[NativeAggKind],
-      out: Seq[Attribute]): RDD[InternalRow] = {
+      out: Seq[Attribute],
+      decimalAvgScale: Int = 0): RDD[InternalRow] = {
     val keyIdx = kinds.zipWithIndex.collect { case (NativeAggKind.Pass, i) => i }
     rdd.map { row =>
       val key = keyIdx.map { i =>
@@ -479,7 +486,7 @@ object NativeSqlExec {
       (key.toSeq, row.copy())
     }.reduceByKey((a, b) => mergeWide(a, b, kinds), math.max(rdd.getNumPartitions, 1))
       .map { case (_, wide) =>
-        finalizeAgg(wide, kinds, out)
+        finalizeAgg(wide, kinds, out, decimalAvgScale)
       }
   }
 
@@ -565,7 +572,8 @@ object NativeSqlExec {
   private def finalizeAgg(
       wide: InternalRow,
       kinds: Seq[NativeAggKind],
-      out: Seq[Attribute]): InternalRow = {
+      out: Seq[Attribute],
+      decimalAvgScale: Int = 0): InternalRow = {
     val proj = UnsafeProjection.create(out, out)
     val g = new GenericInternalRow(out.length)
     var wi = 0
@@ -580,9 +588,19 @@ object NativeSqlExec {
           else dt match {
             case DoubleType | FloatType => g.setDouble(oi, sum / cnt)
             case d: DecimalType =>
-              val dec = Decimal(sum / cnt)
-              g.update(oi, dec)
-              val _ = d
+              /* Native stores unscaled i64 at the parquet column scale
+               * (TPC-DS money is 2). Output may be Spark's avg decimal(11,6). */
+              val srcScale =
+                if (decimalAvgScale > 0) decimalAvgScale
+                else if (d.scale > 2) 2
+                else d.scale
+              val unscaled = math.round(sum / cnt).toLong
+              val adj = if (d.scale > srcScale) {
+                unscaled * math.pow(10.0, (d.scale - srcScale).toDouble).toLong
+              } else {
+                unscaled
+              }
+              g.update(oi, Decimal(adj, d.precision, d.scale))
             case _ => g.setLong(oi, (sum / cnt).toLong)
           }
           wi += 2

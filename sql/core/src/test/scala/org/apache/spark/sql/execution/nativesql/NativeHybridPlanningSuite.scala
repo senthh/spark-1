@@ -21,6 +21,7 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.{Average, Count}
 import org.apache.spark.sql.catalyst.plans.{Cross, ExistenceJoin, Inner, LeftOuter, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.logical._
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.IntegerType
 
@@ -209,9 +210,44 @@ class NativeHybridPlanningSuite extends SharedSparkSession {
     assert(got.isDefined)
     val (compiled, cases) = got.get
     assert(compiled.ir.contains("segagg"))
-    assert(compiled.ir.contains("hashjoin"))
-    assert(compiled.leaves.size === 2)
+    assert(compiled.leaves.size === 1)
     assert(cases.size === 2)
     assert(!compiled.ir.contains("scan 2"))
+  }
+
+  test("Q9-style buckets rewrite drops scalar subqueries") {
+    val qty = AttributeReference("ss_quantity", IntegerType)()
+    val disc = AttributeReference("ss_ext_discount_amt", IntegerType)()
+    val prof = AttributeReference("ss_net_profit", IntegerType)()
+    val fact = LocalRelation(qty, disc, prof)
+    val reasonCol = AttributeReference("r_reason_sk", IntegerType)()
+    val reason = Filter(EqualTo(reasonCol, Literal(1)), LocalRelation(reasonCol))
+    def bucket(lo: Int, hi: Int, thresh: Long, name: String): NamedExpression = {
+      def qtyF = And(GreaterThanOrEqual(qty, Literal(lo)), LessThanOrEqual(qty, Literal(hi)))
+      def cnt = ScalarSubquery(Aggregate(Nil, Seq(Alias(Count(Literal(1)), "c")()), Filter(qtyF, fact)))
+      def avg(a: Attribute) =
+        ScalarSubquery(Aggregate(Nil, Seq(Alias(Average(a), "a")()), Filter(qtyF, fact)))
+      Alias(
+        CaseWhen(Seq((GreaterThan(cnt, Literal(thresh)), avg(disc))), Some(avg(prof))),
+        name)()
+    }
+    val orig = Project(Seq(bucket(1, 20, 100L, "bucket1"), bucket(21, 40, 200L, "bucket2")), reason)
+    val rewritten = NativeSqlPlan.rewriteScalarBuckets(orig)
+    assert(!rewritten.exists(_.expressions.exists(_.isInstanceOf[ScalarSubquery])))
+    assert(rewritten.exists(_.isInstanceOf[Aggregate]))
+    val got = NativeSqlPlan.compileRewrittenBuckets(rewritten)
+    assert(got.isDefined)
+    assert(got.get._1.ir.contains("segagg"))
+    assert(got.get._1.ir.contains("(ge c"))
+    assert(got.get._2.size === 2)
+  }
+
+  test("LiftCommonScans is a no-op without repeated file scans") {
+    withSQLConf(SQLConf.NATIVE_SQL_ENABLED.key -> "true") {
+      val a = rel("a")
+      val b = rel("b")
+      val u = Union(Seq(a, b))
+      assert(LiftCommonScans(u) === u)
+    }
   }
 }

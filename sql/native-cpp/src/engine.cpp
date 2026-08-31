@@ -1552,30 +1552,109 @@ void acc_update(Acc &ac, const Val &fn, const std::vector<Val> *proj, const Join
   }
 }
 
-bool try_fused_scan_hashagg(const Val &child, const std::vector<Val> &keys,
-                            const std::vector<Val> &aggs, const NsBatch *inputs, int n_inputs,
-                            Batch *out) {
-  (void)inputs;
-  (void)n_inputs;
-  std::vector<Val> preds;
+bool peel_scan_filters(const Val &child, int *idx, std::vector<Val> *preds) {
+  preds->clear();
   const Val *cur = &child;
   while (cur->kind == ValKind::CALL && cur->name == "filter" && cur->args.size() >= 2) {
-    preds.push_back(cur->args[0]);
+    preds->push_back(cur->args[0]);
     cur = &cur->args[1];
   }
   if (cur->kind != ValKind::CALL || cur->name != "scan" || cur->args.empty()) {
     return false;
   }
-  const int idx = static_cast<int>(cur->args[0].i);
-  const int ns = file_n_splits(idx);
-  if (idx < 0 || ns != 1) return false;
-  Batch b = read_file_split(idx, 0);
+  *idx = static_cast<int>(cur->args[0].i);
+  return *idx >= 0;
+}
+
+Batch apply_preds(Batch b, const std::vector<Val> &preds) {
   for (int i = static_cast<int>(preds.size()) - 1; i >= 0; --i) {
     b = do_filter(std::move(b), preds[static_cast<size_t>(i)]);
   }
-  *out = do_hashagg(b, keys, aggs);
-  std::fprintf(stderr, "nativesql: fused scan-hashagg scan=%d rows=%d groups=%d\n",
-               idx, b.n_rows, out->n_rows);
+  return b;
+}
+
+void merge_one_row_aggs(Batch *acc, const Batch &part) {
+  if (acc->n_rows != 1 || part.n_rows != 1 || acc->n_cols() != part.n_cols()) {
+    throw std::runtime_error("merge one-row agg");
+  }
+  for (int c = 0; c < acc->n_cols(); ++c) {
+    if (acc->types[c] == NS_F64) {
+      acc->f64[c][0] += part.f64[c][0];
+    } else if (acc->types[c] == NS_BOOL) {
+      acc->b[c][0] = acc->b[c][0] || part.b[c][0];
+    } else {
+      acc->i64[c][0] += part.i64[c][0];
+    }
+  }
+}
+
+bool try_fused_scan_hashagg(const Val &child, const std::vector<Val> &keys,
+                            const std::vector<Val> &aggs, const NsBatch *inputs, int n_inputs,
+                            Batch *out) {
+  (void)inputs;
+  (void)n_inputs;
+  int idx = -1;
+  std::vector<Val> preds;
+  if (!peel_scan_filters(child, &idx, &preds)) return false;
+  const int ns = file_n_splits(idx);
+  if (ns <= 0) return false;
+  int total_rows = 0;
+  if (ns == 1) {
+    Batch b = apply_preds(read_file_split(idx, 0), preds);
+    total_rows = b.n_rows;
+    *out = do_hashagg(b, keys, aggs);
+  } else if (keys.empty()) {
+    Batch acc;
+    bool have = false;
+    for (int s = 0; s < ns; ++s) {
+      Batch b = apply_preds(read_file_split(idx, s), preds);
+      total_rows += b.n_rows;
+      Batch part = do_hashagg(b, keys, aggs);
+      if (!have) {
+        acc = std::move(part);
+        have = true;
+      } else {
+        merge_one_row_aggs(&acc, part);
+      }
+    }
+    if (!have) return false;
+    *out = std::move(acc);
+  } else {
+    /* Keyed multi-split: do not concat raw rows (memory blowup). Fall
+     * through so parquet_read + one hashagg streams the partition. */
+    return false;
+  }
+  std::fprintf(stderr, "nativesql: fused scan-hashagg scan=%d splits=%d rows=%d groups=%d\n",
+               idx, ns, total_rows, out->n_rows);
+  std::fflush(stderr);
+  return true;
+}
+
+bool try_fused_scan_segagg(const Val &child, const Val &key, const std::vector<Val> &bounds,
+                           const std::vector<Val> &aggs, Batch *out) {
+  int idx = -1;
+  std::vector<Val> preds;
+  if (!peel_scan_filters(child, &idx, &preds)) return false;
+  const int ns = file_n_splits(idx);
+  if (ns <= 0) return false;
+  int total_rows = 0;
+  Batch acc;
+  bool have = false;
+  for (int s = 0; s < ns; ++s) {
+    Batch b = apply_preds(read_file_split(idx, s), preds);
+    total_rows += b.n_rows;
+    Batch part = do_segagg(b, key, bounds, aggs);
+    if (!have) {
+      acc = std::move(part);
+      have = true;
+    } else {
+      merge_one_row_aggs(&acc, part);
+    }
+  }
+  if (!have) return false;
+  *out = std::move(acc);
+  std::fprintf(stderr, "nativesql: fused scan-segagg scan=%d splits=%d rows=%d\n",
+               idx, ns, total_rows);
   std::fflush(stderr);
   return true;
 }
@@ -1766,7 +1845,8 @@ Batch eval_plan(const Val &node, const NsBatch *inputs, int n_inputs) {
   if (n == "scan") {
     const int idx = static_cast<int>(node.args[0].i);
     if (idx < 0 || idx >= n_inputs) throw std::runtime_error("scan oob");
-    if (g_file_scans && g_file_scans[idx].n_splits > 0) {
+    if (g_file_scans && g_file_scans[idx].n_cols > 0) {
+      /* n_splits==0 is a typed empty batch (other probe in a shared union). */
       NsFileScan sc = attach_preds(idx);
       NsBatch raw{};
       if (ns_parquet_read(&sc, &raw) != 0) {
@@ -1815,6 +1895,11 @@ Batch eval_plan(const Val &node, const NsBatch *inputs, int n_inputs) {
   }
   if (n == "segagg") {
     if (node.args.size() < 4) throw std::runtime_error("segagg arity");
+    Batch fused;
+    if (try_fused_scan_segagg(node.args[3], node.args[0], node.args[1].args, node.args[2].args,
+                              &fused)) {
+      return fused;
+    }
     Batch child = eval_plan(node.args[3], inputs, n_inputs);
     return do_segagg(child, node.args[0], node.args[1].args, node.args[2].args);
   }

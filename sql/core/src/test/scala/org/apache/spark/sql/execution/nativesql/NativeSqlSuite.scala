@@ -247,4 +247,30 @@ class NativeSqlSuite extends SharedSparkSession {
       }
     }
   }
+
+  test("Q9-style buckets rewrite before AQE") {
+    withNative {
+      withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true") {
+        Seq((5, 10, 1), (15, 20, 2), (25, 30, 3), (35, 40, 4))
+          .toDF("qty", "disc", "prof").createOrReplaceTempView("fact")
+        Seq(1).toDF("r_reason_sk").createOrReplaceTempView("reason")
+        val df = spark.sql(
+          """
+            |select
+            |  case when (select count(*) from fact where qty between 1 and 20) > 1
+            |       then (select avg(disc) from fact where qty between 1 and 20)
+            |       else (select avg(prof) from fact where qty between 1 and 20) end as b1,
+            |  case when (select count(*) from fact where qty between 21 and 40) > 0
+            |       then (select avg(disc) from fact where qty between 21 and 40)
+            |       else (select avg(prof) from fact where qty between 21 and 40) end as b2
+            |from reason
+            |where r_reason_sk = 1
+          """.stripMargin)
+        val opt = df.queryExecution.optimizedPlan
+        assert(!opt.exists(_.expressions.exists(_.isInstanceOf[
+          org.apache.spark.sql.catalyst.expressions.ScalarSubquery])))
+        checkAnswer(df, Seq(org.apache.spark.sql.Row(15.0, 35.0)))
+      }
+    }
+  }
 }

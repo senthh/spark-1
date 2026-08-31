@@ -26,6 +26,7 @@ import org.apache.spark.sql.connector.catalog.CatalogManager
 import org.apache.spark.sql.execution.datasources.{PruneFileSourcePartitions, PushVariantIntoScan, SchemaPruning, V1Writes}
 import org.apache.spark.sql.execution.datasources.v2.{GroupBasedRowLevelOperationScanPlanning, OptimizeMetadataOnlyDeleteFromTable, V2ScanPartitioningAndOrdering, V2ScanRelationPushDown, V2Writes}
 import org.apache.spark.sql.execution.dynamicpruning.{CleanupDynamicPruningFilters, PartitionPruning, RowLevelOperationRuntimeGroupFiltering}
+import org.apache.spark.sql.execution.nativesql.RewriteScalarBucketAggs
 import org.apache.spark.sql.execution.python.{ExtractGroupingPythonUDFFromAggregate, ExtractPythonUDFFromAggregate, ExtractPythonUDFs, ExtractPythonUDTFs}
 
 class SparkOptimizer(
@@ -61,6 +62,8 @@ class SparkOptimizer(
       new RowLevelOperationRuntimeGroupFiltering(OptimizeSubqueries)),
     Batch("InjectRuntimeFilter", FixedPoint(1),
       InjectRuntimeFilter),
+    Batch("Native SQL bucket rewrite", Once,
+      RewriteScalarBucketAggs),
     Batch("MergeSubplans", Once,
       MergeSubplans,
       RewriteDistinctAggregates),

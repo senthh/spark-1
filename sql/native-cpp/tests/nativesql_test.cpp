@@ -331,6 +331,17 @@ int main() {
     const int64_t *pv = static_cast<const int64_t *>(out.cols[0].data);
     if (pv[0] != 10 || pv[1] != 30 || pv[2] != 40) fail("fat join vals");
     ns_batch_free(&out);
+    /* Empty sibling scan must stay typed so union(probe, empty) keeps rows. */
+    {
+      NsFileScan empty_scans[2] = {scans[0], scans[0]};
+      empty_scans[1].n_splits = 0;
+      empty_scans[1].splits = nullptr;
+      if (ns_execute_scan("(union (scan 0) (scan 1))", nullptr, empty_scans, 2, &out) != 0) {
+        fail("empty sibling union");
+      }
+      if (out.n_rows != 4) fail("empty sibling union rows");
+      ns_batch_free(&out);
+    }
     if (ns_execute_scan(
             "(hashagg (list c0) (list c0 (sum c1)) (hashjoin c0 c0 (scan 0) (scan 1)))",
             nullptr, scans, 2, &out) != 0) {
