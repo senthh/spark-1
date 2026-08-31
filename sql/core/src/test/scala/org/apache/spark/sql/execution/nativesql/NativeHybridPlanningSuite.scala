@@ -18,7 +18,8 @@
 package org.apache.spark.sql.execution.nativesql
 
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.{Cross, Inner, LeftOuter}
+import org.apache.spark.sql.catalyst.expressions.aggregate.{Average, Count}
+import org.apache.spark.sql.catalyst.plans.{Cross, ExistenceJoin, Inner, LeftOuter, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.IntegerType
@@ -100,5 +101,117 @@ class NativeHybridPlanningSuite extends SharedSparkSession {
   test("pageIndexEnabled uses min skip ratio") {
     assert(!NativeOperatorDispatch.pageIndexEnabled(0.2))
     assert(NativeOperatorDispatch.pageIndexEnabled(0.8))
+  }
+
+  test("INTERSECT compiles to hashsemi") {
+    val left = rel("z")
+    val right = rel("z")
+    val compiled = NativeSqlPlan.compile(Intersect(left, right, isAll = false))
+    assert(compiled.isDefined)
+    assert(compiled.get.ir.contains("hashsemi"))
+  }
+
+  test("multi-column INTERSECT is not compiled") {
+    val left = LocalRelation(
+      AttributeReference("a", IntegerType)(),
+      AttributeReference("b", IntegerType)())
+    val right = LocalRelation(
+      AttributeReference("a", IntegerType)(),
+      AttributeReference("b", IntegerType)())
+    assert(NativeSqlPlan.compile(Intersect(left, right, isAll = false)).isEmpty)
+  }
+
+  test("Distinct compiles to hashagg") {
+    val compiled = NativeSqlPlan.compile(Distinct(rel("id")))
+    assert(compiled.isDefined)
+    assert(compiled.get.ir.contains("hashagg"))
+  }
+
+  test("Exists filter compiles to hashsemi") {
+    val left = rel("id")
+    val right = rel("id")
+    val exists = Exists(
+      right,
+      joinCond = Seq(EqualTo(left.output.head, right.output.head)))
+    val compiled = NativeSqlPlan.compile(Filter(exists, left))
+    assert(compiled.isDefined)
+    assert(compiled.get.ir.contains("hashsemi"))
+  }
+
+  test("OR of Exists compiles to union + hashsemi") {
+    val left = rel("id")
+    val r1 = rel("id")
+    val r2 = rel("id")
+    val e1 = Exists(r1, joinCond = Seq(EqualTo(left.output.head, r1.output.head)))
+    val e2 = Exists(r2, joinCond = Seq(EqualTo(left.output.head, r2.output.head)))
+    val compiled = NativeSqlPlan.compile(Filter(Or(e1, e2), left))
+    assert(compiled.isDefined)
+    assert(compiled.get.ir.contains("hashsemi"))
+    assert(compiled.get.ir.contains("union"))
+  }
+
+  test("ExistenceJoin compiles to hashsemi") {
+    val left = rel("id")
+    val right = rel("id")
+    val existsAttr = AttributeReference("exists", org.apache.spark.sql.types.BooleanType)()
+    val join = Join(
+      left,
+      right,
+      ExistenceJoin(existsAttr),
+      Some(EqualTo(left.output.head, right.output.head)),
+      JoinHint.NONE)
+    val compiled = NativeSqlPlan.compile(join)
+    assert(compiled.isDefined)
+    assert(compiled.get.ir.contains("hashsemi"))
+  }
+
+  test("LeftSemi compiles to hashsemi") {
+    val left = rel("id")
+    val right = rel("id")
+    val join = Join(
+      left,
+      right,
+      LeftSemi,
+      Some(EqualTo(left.output.head, right.output.head)),
+      JoinHint.NONE)
+    val compiled = NativeSqlPlan.compile(join)
+    assert(compiled.isDefined)
+    assert(compiled.get.ir.contains("hashsemi"))
+  }
+
+  test("uncorrelated scalar IN-equality compiles to hashsemi") {
+    val left = rel("id")
+    val sub = rel("id")
+    val pred = EqualTo(left.output.head, ScalarSubquery(sub))
+    val compiled = NativeSqlPlan.compile(Filter(pred, left))
+    assert(compiled.isDefined)
+    assert(compiled.get.ir.contains("hashsemi"))
+  }
+
+  test("Q9-style scalar buckets compile to one segagg") {
+    val qty = AttributeReference("ss_quantity", IntegerType)()
+    val disc = AttributeReference("ss_ext_discount_amt", IntegerType)()
+    val prof = AttributeReference("ss_net_profit", IntegerType)()
+    val fact = LocalRelation(qty, disc, prof)
+    val reasonCol = AttributeReference("r_reason_sk", IntegerType)()
+    val reason = Filter(EqualTo(reasonCol, Literal(1)), LocalRelation(reasonCol))
+    def bucket(lo: Int, hi: Int, thresh: Long, name: String): NamedExpression = {
+      def qtyF = And(GreaterThanOrEqual(qty, Literal(lo)), LessThanOrEqual(qty, Literal(hi)))
+      def cnt = ScalarSubquery(Aggregate(Nil, Seq(Alias(Count(Literal(1)), "c")()), Filter(qtyF, fact)))
+      def avg(a: Attribute) =
+        ScalarSubquery(Aggregate(Nil, Seq(Alias(Average(a), "a")()), Filter(qtyF, fact)))
+      Alias(
+        CaseWhen(Seq((GreaterThan(cnt, Literal(thresh)), avg(disc))), Some(avg(prof))),
+        name)()
+    }
+    val plist = Seq(bucket(1, 20, 100L, "bucket1"), bucket(21, 40, 200L, "bucket2"))
+    val got = NativeSqlPlan.compileSharedBuckets(plist, reason)
+    assert(got.isDefined)
+    val (compiled, cases) = got.get
+    assert(compiled.ir.contains("segagg"))
+    assert(compiled.ir.contains("hashjoin"))
+    assert(compiled.leaves.size === 2)
+    assert(cases.size === 2)
+    assert(!compiled.ir.contains("scan 2"))
   }
 }

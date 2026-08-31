@@ -21,18 +21,17 @@
 
 #include <cctype>
 #include <cmath>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 #include <stdexcept>
-
-std::mutex g_exec_mu;
 
 static thread_local const NsFileScan *g_file_scans = nullptr;
 
@@ -200,18 +199,16 @@ Batch from_c(const NsBatch &in) {
       continue;
     }
     const int n = in.n_rows < col.n_rows ? in.n_rows : col.n_rows;
+    if (n <= 0) continue;
     if (col.type == NS_I32) {
       const int32_t *p = static_cast<const int32_t *>(col.data);
       for (int r = 0; r < n; ++r) b.i64[c][r] = p[r];
     } else if (col.type == NS_I64) {
-      const int64_t *p = static_cast<const int64_t *>(col.data);
-      for (int r = 0; r < n; ++r) b.i64[c][r] = p[r];
+      std::memcpy(b.i64[c].data(), col.data, sizeof(int64_t) * static_cast<size_t>(n));
     } else if (col.type == NS_F64) {
-      const double *p = static_cast<const double *>(col.data);
-      for (int r = 0; r < n; ++r) b.f64[c][r] = p[r];
+      std::memcpy(b.f64[c].data(), col.data, sizeof(double) * static_cast<size_t>(n));
     } else {
-      const uint8_t *p = static_cast<const uint8_t *>(col.data);
-      for (int r = 0; r < n; ++r) b.b[c][r] = p[r] ? 1 : 0;
+      std::memcpy(b.b[c].data(), col.data, static_cast<size_t>(n));
     }
   }
   return b;
@@ -328,24 +325,113 @@ Batch project_cols(const Batch &in, const std::vector<Val> &exprs) {
   return out;
 }
 
-Batch do_filter(const Batch &in, const Val &pred) {
-  std::vector<int> keep;
-  keep.reserve(in.n_rows);
-  for (int r = 0; r < in.n_rows; ++r) {
-    if (eval_pred(pred, in, r)) keep.push_back(r);
+bool pred_col_lit(const Val &pred, int *col, int64_t *lo, int64_t *hi, bool *eq_only) {
+  *eq_only = false;
+  if (pred.kind != ValKind::CALL || pred.args.size() < 2) return false;
+  if (pred.name == "and") {
+    int c0 = -1, c1 = -1;
+    int64_t lo0, hi0, lo1, hi1;
+    bool e0, e1;
+    if (!pred_col_lit(pred.args[0], &c0, &lo0, &hi0, &e0)) return false;
+    if (!pred_col_lit(pred.args[1], &c1, &lo1, &hi1, &e1)) return false;
+    if (c0 != c1) return false;
+    *col = c0;
+    *lo = lo0 > lo1 ? lo0 : lo1;
+    *hi = hi0 < hi1 ? hi0 : hi1;
+    *eq_only = *lo == *hi;
+    return true;
   }
-  Batch out;
-  out.n_rows = static_cast<int>(keep.size());
-  for (int c = 0; c < in.n_cols(); ++c) {
-    out.add_col(in.types[c], out.n_rows);
-    for (int i = 0; i < out.n_rows; ++i) {
-      const int r = keep[i];
-      if (in.types[c] == NS_F64) out.f64[c][i] = in.f64[c][r];
-      else if (in.types[c] == NS_BOOL) out.b[c][i] = in.b[c][r];
-      else out.i64[c][i] = in.i64[c][r];
+  const Val *c = nullptr;
+  const Val *lit = nullptr;
+  bool flip = false;
+  if (pred.args[0].kind == ValKind::COL && pred.args[1].kind == ValKind::I64) {
+    c = &pred.args[0];
+    lit = &pred.args[1];
+  } else if (pred.args[1].kind == ValKind::COL && pred.args[0].kind == ValKind::I64) {
+    c = &pred.args[1];
+    lit = &pred.args[0];
+    flip = true;
+  } else {
+    return false;
+  }
+  *col = static_cast<int>(c->i);
+  const int64_t v = lit->i;
+  if (pred.name == "eq") {
+    *lo = v;
+    *hi = v;
+    *eq_only = true;
+    return true;
+  }
+  if (pred.name == "ge") {
+    if (flip) { *lo = INT64_MIN; *hi = v; }
+    else { *lo = v; *hi = INT64_MAX; }
+    return true;
+  }
+  if (pred.name == "le") {
+    if (flip) { *lo = v; *hi = INT64_MAX; }
+    else { *lo = INT64_MIN; *hi = v; }
+    return true;
+  }
+  if (pred.name == "gt") {
+    if (flip) { *lo = INT64_MIN; *hi = v - 1; }
+    else { *lo = v + 1; *hi = INT64_MAX; }
+    return true;
+  }
+  if (pred.name == "lt") {
+    if (flip) { *lo = v + 1; *hi = INT64_MAX; }
+    else { *lo = INT64_MIN; *hi = v - 1; }
+    return true;
+  }
+  return false;
+}
+
+Batch do_filter(Batch in, const Val &pred) {
+  int col = -1;
+  int64_t lo = 0, hi = 0;
+  bool eq_only = false;
+  if (pred_col_lit(pred, &col, &lo, &hi, &eq_only) &&
+      col >= 0 && col < in.n_cols() && in.types[col] != NS_F64) {
+    const int64_t *src = in.i64[col].data();
+    int w = 0;
+    for (int r = 0; r < in.n_rows; ++r) {
+      const int64_t v = src[r];
+      if (v < lo || v > hi) continue;
+      if (w != r) {
+        for (int c = 0; c < in.n_cols(); ++c) {
+          if (in.types[c] == NS_F64) in.f64[c][w] = in.f64[c][r];
+          else if (in.types[c] == NS_BOOL) in.b[c][w] = in.b[c][r];
+          else in.i64[c][w] = in.i64[c][r];
+        }
+      }
+      w += 1;
     }
+    in.n_rows = w;
+    for (int c = 0; c < in.n_cols(); ++c) {
+      if (in.types[c] == NS_F64) in.f64[c].resize(static_cast<size_t>(w));
+      else if (in.types[c] == NS_BOOL) in.b[c].resize(static_cast<size_t>(w));
+      else in.i64[c].resize(static_cast<size_t>(w));
+    }
+    return in;
   }
-  return out;
+  int w = 0;
+  for (int r = 0; r < in.n_rows; ++r) {
+    if (!eval_pred(pred, in, r)) continue;
+    if (w != r) {
+      for (int c = 0; c < in.n_cols(); ++c) {
+        if (in.types[c] == NS_F64) in.f64[c][w] = in.f64[c][r];
+        else if (in.types[c] == NS_BOOL) in.b[c][w] = in.b[c][r];
+        else in.i64[c][w] = in.i64[c][r];
+      }
+    }
+    w += 1;
+  }
+  in.n_rows = w;
+  for (int c = 0; c < in.n_cols(); ++c) {
+    if (in.types[c] == NS_F64) in.f64[c].resize(static_cast<size_t>(w));
+    else if (in.types[c] == NS_BOOL) in.b[c].resize(static_cast<size_t>(w));
+    else in.i64[c].resize(static_cast<size_t>(w));
+  }
+  return in;
 }
 
 static uint64_t mix(uint64_t x) {
@@ -396,7 +482,32 @@ struct OpenHash {
   }
 };
 
+const int64_t *i64_ptr(const Val &v, const Batch &b) {
+  if (v.kind != ValKind::COL) return nullptr;
+  const int c = static_cast<int>(v.i);
+  if (c < 0 || c >= b.n_cols() || b.types[c] == NS_F64) return nullptr;
+  return b.i64[c].data();
+}
+
+const double *f64_ptr(const Val &v, const Batch &b) {
+  if (v.kind != ValKind::COL) return nullptr;
+  const int c = static_cast<int>(v.i);
+  if (c < 0 || c >= b.n_cols() || b.types[c] != NS_F64) return nullptr;
+  return b.f64[c].data();
+}
+
+uint64_t mix_key(int64_t v) {
+  uint64_t h = 1469598103934665603ULL;
+  h ^= mix(static_cast<uint64_t>(v));
+  h *= 1099511628211ULL;
+  return h;
+}
+
 uint64_t row_key(const Batch &b, const std::vector<Val> &keys, int row) {
+  if (keys.size() == 1) {
+    const int64_t *p = i64_ptr(keys[0], b);
+    if (p != nullptr) return mix_key(p[row]);
+  }
   uint64_t h = 1469598103934665603ULL;
   for (const auto &k : keys) {
     const int64_t v = eval_num(k, b, row).as_i();
@@ -419,8 +530,9 @@ Batch do_hashagg(const Batch &in, const std::vector<Val> &keys, const std::vecto
     bool init = false;
   };
   std::vector<std::vector<Acc>> accs;
+  const int64_t *key_p = (keys.size() == 1) ? i64_ptr(keys[0], in) : nullptr;
   for (int r = 0; r < in.n_rows; ++r) {
-    const uint64_t k = row_key(in, keys, r);
+    const uint64_t k = key_p != nullptr ? mix_key(key_p[r]) : row_key(in, keys, r);
     int g = ht.find(k);
     if (g < 0) {
       g = static_cast<int>(first.size());
@@ -433,11 +545,19 @@ Batch do_hashagg(const Batch &in, const std::vector<Val> &keys, const std::vecto
       const Val &fn = aggs[a];
       if (fn.kind != ValKind::CALL) continue;
       if (fn.name == "count") {
-        if (fn.args.empty()) ac.cnt += 1;
-        else ac.cnt += 1;
+        ac.cnt += 1;
         continue;
       }
-      EvalNum x = eval_num(fn.args[0], in, r);
+      const int64_t *ip = fn.args.empty() ? nullptr : i64_ptr(fn.args[0], in);
+      const double *fp = fn.args.empty() ? nullptr : f64_ptr(fn.args[0], in);
+      EvalNum x;
+      if (fp != nullptr) {
+        x = {true, 0, fp[r]};
+      } else if (ip != nullptr) {
+        x = {false, ip[r], 0};
+      } else {
+        x = eval_num(fn.args[0], in, r);
+      }
       if (!ac.init) {
         ac.init = true;
         ac.is_f = x.is_f;
@@ -512,6 +632,105 @@ Batch do_hashagg(const Batch &in, const std::vector<Val> &keys, const std::vecto
   return out;
 }
 
+/* One row: for each [lo,hi] segment, the agg list. Rows outside every
+ * segment are dropped. Used for Q9-style multi-bucket scans. */
+Batch do_segagg(const Batch &in, const Val &key, const std::vector<Val> &bounds,
+                const std::vector<Val> &aggs) {
+  const int nseg = static_cast<int>(bounds.size() / 2);
+  if (nseg <= 0) throw std::runtime_error("segagg bounds");
+  struct Acc {
+    int64_t cnt = 0;
+    int64_t isum = 0;
+    double fsum = 0;
+    bool is_f = false;
+    int64_t imin = 0, imax = 0;
+    double fmin = 0, fmax = 0;
+    bool init = false;
+  };
+  std::vector<int64_t> lo(static_cast<size_t>(nseg)), hi(static_cast<size_t>(nseg));
+  for (int s = 0; s < nseg; ++s) {
+    lo[static_cast<size_t>(s)] = bounds[static_cast<size_t>(s) * 2].i;
+    hi[static_cast<size_t>(s)] = bounds[static_cast<size_t>(s) * 2 + 1].i;
+  }
+  std::vector<std::vector<Acc>> accs(static_cast<size_t>(nseg), std::vector<Acc>(aggs.size()));
+  const int64_t *kp = i64_ptr(key, in);
+  for (int r = 0; r < in.n_rows; ++r) {
+    const int64_t kv = kp != nullptr ? kp[r] : eval_num(key, in, r).as_i();
+    int seg = -1;
+    for (int s = 0; s < nseg; ++s) {
+      if (kv >= lo[static_cast<size_t>(s)] && kv <= hi[static_cast<size_t>(s)]) {
+        seg = s;
+        break;
+      }
+    }
+    if (seg < 0) continue;
+    for (size_t a = 0; a < aggs.size(); ++a) {
+      Acc &ac = accs[static_cast<size_t>(seg)][a];
+      const Val &fn = aggs[a];
+      if (fn.kind != ValKind::CALL) continue;
+      if (fn.name == "count") {
+        ac.cnt += 1;
+        continue;
+      }
+      const int64_t *ip = fn.args.empty() ? nullptr : i64_ptr(fn.args[0], in);
+      const double *fp = fn.args.empty() ? nullptr : f64_ptr(fn.args[0], in);
+      EvalNum x;
+      if (fp != nullptr) {
+        x = {true, 0, fp[r]};
+      } else if (ip != nullptr) {
+        x = {false, ip[r], 0};
+      } else {
+        x = eval_num(fn.args[0], in, r);
+      }
+      if (!ac.init) {
+        ac.init = true;
+        ac.is_f = x.is_f;
+        ac.imin = ac.imax = x.as_i();
+        ac.fmin = ac.fmax = x.as_f();
+      }
+      if (fn.name == "sum" || fn.name == "avg") {
+        ac.cnt += 1;
+        if (x.is_f || ac.is_f) {
+          ac.is_f = true;
+          ac.fsum += x.as_f();
+        } else {
+          ac.isum += x.i;
+        }
+      }
+    }
+  }
+  Batch out;
+  out.n_rows = 1;
+  const int ncols = nseg * static_cast<int>(aggs.size());
+  for (int s = 0; s < nseg; ++s) {
+    for (size_t a = 0; a < aggs.size(); ++a) {
+      const Val &fn = aggs[a];
+      NsType t = NS_I64;
+      if (fn.kind == ValKind::CALL && (fn.name == "avg" ||
+          (!fn.args.empty() && fn.args[0].kind == ValKind::COL &&
+           in.types[static_cast<int>(fn.args[0].i)] == NS_F64))) {
+        t = NS_F64;
+      }
+      out.add_col(t, 1);
+      const int oc = out.n_cols() - 1;
+      const Acc &ac = accs[static_cast<size_t>(s)][a];
+      if (fn.name == "count") {
+        out.i64[oc][0] = ac.cnt;
+      } else if (fn.name == "sum") {
+        if (t == NS_F64) out.f64[oc][0] = ac.is_f ? ac.fsum : static_cast<double>(ac.isum);
+        else out.i64[oc][0] = ac.isum;
+      } else if (fn.name == "avg") {
+        out.f64[oc][0] =
+            ac.cnt ? (ac.is_f ? ac.fsum : static_cast<double>(ac.isum)) / ac.cnt : NAN;
+      } else {
+        out.i64[oc][0] = 0;
+      }
+    }
+  }
+  (void)ncols;
+  return out;
+}
+
 void append_batch(Batch *dst, const Batch &src) {
   if (dst->n_cols() == 0) {
     *dst = src;
@@ -555,26 +774,47 @@ Batch slice_rows(const Batch &in, int start, int n) {
 
 const int kJoinTile = 262144;
 
+void build_i64_join(
+    const int64_t *keys, int n, OpenHash *ht, std::vector<std::vector<int>> *buckets,
+    int *next) {
+  for (int r = 0; r < n; ++r) {
+    const uint64_t k = mix(static_cast<uint64_t>(keys[r]));
+    int g = ht->find(k);
+    if (g < 0) {
+      g = (*next)++;
+      ht->insert(k, g);
+    }
+    (*buckets)[static_cast<size_t>(g)].push_back(r);
+  }
+}
+
 Batch do_join_core(const Batch &left, const Batch &right, const Val &lk, const Val &rk) {
   OpenHash ht(static_cast<size_t>(right.n_rows) + 8);
   std::vector<std::vector<int>> buckets(right.n_rows + 1);
   int next = 0;
-  for (int r = 0; r < right.n_rows; ++r) {
-    const uint64_t k = mix(static_cast<uint64_t>(eval_num(rk, right, r).as_i()));
-    int g = ht.find(k);
-    if (g < 0) {
-      g = next++;
-      ht.insert(k, g);
+  const int64_t *rkp = i64_ptr(rk, right);
+  const int64_t *lkp = i64_ptr(lk, left);
+  if (rkp != nullptr) {
+    build_i64_join(rkp, right.n_rows, &ht, &buckets, &next);
+  } else {
+    for (int r = 0; r < right.n_rows; ++r) {
+      const uint64_t k = mix(static_cast<uint64_t>(eval_num(rk, right, r).as_i()));
+      int g = ht.find(k);
+      if (g < 0) {
+        g = next++;
+        ht.insert(k, g);
+      }
+      buckets[g].push_back(r);
     }
-    buckets[g].push_back(r);
   }
   std::vector<int> lr, rr;
   for (int l = 0; l < left.n_rows; ++l) {
-    const uint64_t k = mix(static_cast<uint64_t>(eval_num(lk, left, l).as_i()));
-    const int g = ht.find(k);
+    const int64_t kv = lkp != nullptr ? lkp[l] : eval_num(lk, left, l).as_i();
+    const int g = ht.find(mix(static_cast<uint64_t>(kv)));
     if (g < 0) continue;
     for (int r : buckets[g]) {
-      if (eval_num(lk, left, l).as_i() == eval_num(rk, right, r).as_i()) {
+      const int64_t rv = rkp != nullptr ? rkp[r] : eval_num(rk, right, r).as_i();
+      if (kv == rv) {
         lr.push_back(l);
         rr.push_back(r);
         const size_t cells =
@@ -627,12 +867,15 @@ void collect_join_pairs(
     const Batch &left, const Batch &right, const Val &lk, const Val &rk,
     OpenHash *ht, const std::vector<std::vector<int>> *buckets,
     std::vector<int> *lr, std::vector<int> *rr, size_t width) {
+  const int64_t *lkp = i64_ptr(lk, left);
+  const int64_t *rkp = i64_ptr(rk, right);
   for (int l = 0; l < left.n_rows; ++l) {
-    const uint64_t k = mix(static_cast<uint64_t>(eval_num(lk, left, l).as_i()));
-    const int g = ht->find(k);
+    const int64_t kv = lkp != nullptr ? lkp[l] : eval_num(lk, left, l).as_i();
+    const int g = ht->find(mix(static_cast<uint64_t>(kv)));
     if (g < 0) continue;
     for (int r : (*buckets)[static_cast<size_t>(g)]) {
-      if (eval_num(lk, left, l).as_i() == eval_num(rk, right, r).as_i()) {
+      const int64_t rv = rkp != nullptr ? rkp[r] : eval_num(rk, right, r).as_i();
+      if (kv == rv) {
         lr->push_back(l);
         rr->push_back(r);
         const size_t cells = lr->size() * (width + 1);
@@ -666,14 +909,19 @@ Batch do_join_project(
   OpenHash ht(static_cast<size_t>(right.n_rows) + 8);
   std::vector<std::vector<int>> buckets(static_cast<size_t>(right.n_rows) + 1);
   int next = 0;
-  for (int r = 0; r < right.n_rows; ++r) {
-    const uint64_t k = mix(static_cast<uint64_t>(eval_num(rk, right, r).as_i()));
-    int g = ht.find(k);
-    if (g < 0) {
-      g = next++;
-      ht.insert(k, g);
+  const int64_t *rkp = i64_ptr(rk, right);
+  if (rkp != nullptr) {
+    build_i64_join(rkp, right.n_rows, &ht, &buckets, &next);
+  } else {
+    for (int r = 0; r < right.n_rows; ++r) {
+      const uint64_t k = mix(static_cast<uint64_t>(eval_num(rk, right, r).as_i()));
+      int g = ht.find(k);
+      if (g < 0) {
+        g = next++;
+        ht.insert(k, g);
+      }
+      buckets[static_cast<size_t>(g)].push_back(r);
     }
-    buckets[static_cast<size_t>(g)].push_back(r);
   }
   Batch acc;
   const size_t width = projs.size();
@@ -715,22 +963,29 @@ Batch do_join_idx(const Batch &left, const Batch &right, const Val &lk, const Va
   OpenHash ht(static_cast<size_t>(right.n_rows) + 8);
   std::vector<std::vector<int>> buckets(right.n_rows + 1);
   int next = 0;
-  for (int r = 0; r < right.n_rows; ++r) {
-    const uint64_t k = mix(static_cast<uint64_t>(eval_num(rk, right, r).as_i()));
-    int g = ht.find(k);
-    if (g < 0) {
-      g = next++;
-      ht.insert(k, g);
+  const int64_t *rkp = i64_ptr(rk, right);
+  const int64_t *lkp = i64_ptr(lk, left);
+  if (rkp != nullptr) {
+    build_i64_join(rkp, right.n_rows, &ht, &buckets, &next);
+  } else {
+    for (int r = 0; r < right.n_rows; ++r) {
+      const uint64_t k = mix(static_cast<uint64_t>(eval_num(rk, right, r).as_i()));
+      int g = ht.find(k);
+      if (g < 0) {
+        g = next++;
+        ht.insert(k, g);
+      }
+      buckets[g].push_back(r);
     }
-    buckets[g].push_back(r);
   }
   std::vector<int> lr, rr;
   for (int l = 0; l < left.n_rows; ++l) {
-    const uint64_t k = mix(static_cast<uint64_t>(eval_num(lk, left, l).as_i()));
-    const int g = ht.find(k);
+    const int64_t kv = lkp != nullptr ? lkp[l] : eval_num(lk, left, l).as_i();
+    const int g = ht.find(mix(static_cast<uint64_t>(kv)));
     if (g < 0) continue;
     for (int r : buckets[g]) {
-      if (eval_num(lk, left, l).as_i() == eval_num(rk, right, r).as_i()) {
+      const int64_t rv = rkp != nullptr ? rkp[r] : eval_num(rk, right, r).as_i();
+      if (kv == rv) {
         lr.push_back(l);
         rr.push_back(r);
         if (lr.size() > 20000000u) {
@@ -752,15 +1007,30 @@ Batch do_join_idx(const Batch &left, const Batch &right, const Val &lk, const Va
 
 Batch do_semi(const Batch &left, const Batch &right, const Val &lk, const Val &rk) {
   OpenHash ht(static_cast<size_t>(right.n_rows) + 8);
-  for (int r = 0; r < right.n_rows; ++r) {
-    const uint64_t k = static_cast<uint64_t>(eval_num(rk, right, r).as_i());
-    if (ht.find(k) < 0) ht.insert(k, r);
+  const int64_t *rkp = i64_ptr(rk, right);
+  const int64_t *lkp = i64_ptr(lk, left);
+  if (rkp != nullptr) {
+    for (int r = 0; r < right.n_rows; ++r) {
+      const uint64_t k = static_cast<uint64_t>(rkp[r]);
+      if (ht.find(k) < 0) ht.insert(k, r);
+    }
+  } else {
+    for (int r = 0; r < right.n_rows; ++r) {
+      const uint64_t k = static_cast<uint64_t>(eval_num(rk, right, r).as_i());
+      if (ht.find(k) < 0) ht.insert(k, r);
+    }
   }
   std::vector<int> keep;
   keep.reserve(static_cast<size_t>(left.n_rows));
-  for (int l = 0; l < left.n_rows; ++l) {
-    const uint64_t k = static_cast<uint64_t>(eval_num(lk, left, l).as_i());
-    if (ht.find(k) >= 0) keep.push_back(l);
+  if (lkp != nullptr) {
+    for (int l = 0; l < left.n_rows; ++l) {
+      if (ht.find(static_cast<uint64_t>(lkp[l])) >= 0) keep.push_back(l);
+    }
+  } else {
+    for (int l = 0; l < left.n_rows; ++l) {
+      const uint64_t k = static_cast<uint64_t>(eval_num(lk, left, l).as_i());
+      if (ht.find(k) >= 0) keep.push_back(l);
+    }
   }
   Batch out;
   out.n_rows = static_cast<int>(keep.size());
@@ -1282,6 +1552,34 @@ void acc_update(Acc &ac, const Val &fn, const std::vector<Val> *proj, const Join
   }
 }
 
+bool try_fused_scan_hashagg(const Val &child, const std::vector<Val> &keys,
+                            const std::vector<Val> &aggs, const NsBatch *inputs, int n_inputs,
+                            Batch *out) {
+  (void)inputs;
+  (void)n_inputs;
+  std::vector<Val> preds;
+  const Val *cur = &child;
+  while (cur->kind == ValKind::CALL && cur->name == "filter" && cur->args.size() >= 2) {
+    preds.push_back(cur->args[0]);
+    cur = &cur->args[1];
+  }
+  if (cur->kind != ValKind::CALL || cur->name != "scan" || cur->args.empty()) {
+    return false;
+  }
+  const int idx = static_cast<int>(cur->args[0].i);
+  const int ns = file_n_splits(idx);
+  if (idx < 0 || ns != 1) return false;
+  Batch b = read_file_split(idx, 0);
+  for (int i = static_cast<int>(preds.size()) - 1; i >= 0; --i) {
+    b = do_filter(std::move(b), preds[static_cast<size_t>(i)]);
+  }
+  *out = do_hashagg(b, keys, aggs);
+  std::fprintf(stderr, "nativesql: fused scan-hashagg scan=%d rows=%d groups=%d\n",
+               idx, b.n_rows, out->n_rows);
+  std::fflush(stderr);
+  return true;
+}
+
 bool try_fused_hashagg(const Val &child, const std::vector<Val> &keys,
                        const std::vector<Val> &aggs, const NsBatch *inputs, int n_inputs,
                        Batch *out) {
@@ -1491,7 +1789,7 @@ Batch eval_plan(const Val &node, const NsBatch *inputs, int n_inputs) {
   if (n == "filter") {
     PredScope scope(direct_file_scan(node.args[1]), node.args[0]);
     Batch child = eval_plan(node.args[1], inputs, n_inputs);
-    return do_filter(child, node.args[0]);
+    return do_filter(std::move(child), node.args[0]);
   }
   if (n == "project") {
     const Val &child = node.args[1];
@@ -1507,11 +1805,18 @@ Batch eval_plan(const Val &node, const NsBatch *inputs, int n_inputs) {
   if (n == "hashagg") {
     Batch fused;
     if (try_fused_hashagg(node.args[2], node.args[0].args, node.args[1].args, inputs,
-                          n_inputs, &fused)) {
+                          n_inputs, &fused) ||
+        try_fused_scan_hashagg(node.args[2], node.args[0].args, node.args[1].args, inputs,
+                               n_inputs, &fused)) {
       return fused;
     }
     Batch child = eval_plan(node.args[2], inputs, n_inputs);
     return do_hashagg(child, node.args[0].args, node.args[1].args);
+  }
+  if (n == "segagg") {
+    if (node.args.size() < 4) throw std::runtime_error("segagg arity");
+    Batch child = eval_plan(node.args[3], inputs, n_inputs);
+    return do_segagg(child, node.args[0], node.args[1].args, node.args[2].args);
   }
   if (n == "hashjoin") {
     Batch joined;
@@ -1571,7 +1876,6 @@ int ns_execute_scan(
     int n_inputs,
     NsBatch *out) {
   g_file_scans = scans;
-  std::lock_guard<std::mutex> exec_lock(g_exec_mu);
   try {
     std::fprintf(stderr, "nativesql: exec ir=%s n=%d\n", plan_ir ? plan_ir : "", n_inputs);
     if (g_file_scans) {

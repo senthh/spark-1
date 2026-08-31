@@ -19,7 +19,7 @@ package org.apache.spark.sql.execution.nativesql
 
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
-import org.apache.spark.sql.catalyst.plans.{Inner, LeftSemi}
+import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, Inner, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.types._
@@ -78,6 +78,52 @@ object NativeSqlPlan {
 
   def compile(plan: LogicalPlan): Option[Compiled] = compile0(plan)
 
+  /**
+   * Q9-style Project: CASE of uncorrelated scalar COUNT/AVG on the same
+   * fact scan, bucketed by a quantity between-predicate. One segmented
+   * scan instead of one scan per subquery. The CASE stays in Spark.
+   */
+  def compileSharedBuckets(
+      projectList: Seq[NamedExpression],
+      child: LogicalPlan): Option[(Compiled, Seq[NamedExpression])] = {
+    val cases = projectList.map(asBucketCase)
+    if (cases.exists(_.isEmpty) || cases.size < 2) {
+      None
+    } else {
+      val parsed = cases.map(_.get)
+      val subs = parsed.flatMap(c => Seq(c.cnt, c.thn, c.els)).map(parseBucketSub)
+      if (subs.exists(_.isEmpty)) {
+        None
+      } else {
+        val got = subs.map(_.get)
+        if (!got.forall(_.scanKey == got.head.scanKey)) {
+          None
+        } else {
+          compile0(child).flatMap(reason => buildSharedBuckets(parsed, got, reason))
+        }
+      }
+    }
+  }
+
+  /** Project or WithCTE(Project) after MergeSubplans inlined into ScalarSubquery plans. */
+  def compileSharedBucketsPlan(plan: LogicalPlan): Option[(Compiled, Seq[NamedExpression])] = {
+    val inlined = inlineCteScalars(plan)
+    findBucketProject(inlined).flatMap { case (plist, child) =>
+      compileSharedBuckets(plist, child)
+    }
+  }
+
+  @scala.annotation.tailrec
+  private def findBucketProject(p: LogicalPlan): Option[(Seq[NamedExpression], LogicalPlan)] = {
+    p match {
+      case ReturnAnswer(c) => findBucketProject(c)
+      case SubqueryAlias(_, c) => findBucketProject(c)
+      case WithCTE(c, _) => findBucketProject(c)
+      case Project(plist, child) => Some((plist, child))
+      case _ => None
+    }
+  }
+
   case class Compiled(
       ir: String,
       leaves: Seq[LeafData],
@@ -91,7 +137,7 @@ object NativeSqlPlan {
     def isPassthroughScan: Boolean = ir.matches("""\(scan \d+\)""") || ir.startsWith("(range ")
     def isHeavy: Boolean =
       ir.contains("hashjoin") || ir.contains("hashagg") || ir.contains("hashsemi") ||
-        ir.contains("(union ") || fileRels.size >= 2
+        ir.contains("segagg") || ir.contains("(union ") || fileRels.size >= 2
     def withLeafOutputs: Compiled = {
       if (leafOutputs.nonEmpty) this
       else copy(leafOutputs = leaves.collect { case FileLeaf(p) => p.output })
@@ -122,22 +168,26 @@ object NativeSqlPlan {
 
     case Filter(cond, child) =>
       compile0(child).flatMap { c0 =>
-        val c = c0.withLeafOutputs
         val parts = splitAnd(cond)
-        val (pushed, residual) = parts.partition(p => predOnOneFileLeaf(p, c))
-        val newLeaves = attachPredsToLeaves(c, pushed)
-        val ignorable = residual.forall(isIgnorablePred)
-        val residualCompiled = residual.flatMap(p => compilePred(p, c.output)).filter(_ != "true")
-        if (!ignorable && residualCompiled.size != residual.count(p => !isIgnorablePred(p))) {
-          None
-        } else {
-          val leafPreds = pushed.flatMap(p => compilePred(p, c.output)).filter(_ != "true")
-          val preds = residualCompiled ++ leafPreds
-          if (preds.isEmpty) {
-            Some(c.copy(leaves = newLeaves))
+        val (semiParts, rest) = parts.partition(isSemiPred)
+        applySemis(c0.withLeafOutputs, semiParts).flatMap { c1 =>
+          val c = c1.withLeafOutputs
+          val (pushed, residual0) = rest.partition(p => predOnOneFileLeaf(p, c))
+          val residual = residual0.filterNot(p => isDroppedExistsFlag(p, c.output))
+          val newLeaves = attachPredsToLeaves(c, pushed)
+          val ignorable = residual.forall(isIgnorablePred)
+          val residualCompiled = residual.flatMap(p => compilePred(p, c.output)).filter(_ != "true")
+          if (!ignorable && residualCompiled.size != residual.count(p => !isIgnorablePred(p))) {
+            None
           } else {
-            val pred = preds.reduce((a, b) => s"(and $a $b)")
-            Some(c.copy(ir = s"(filter $pred ${c.ir})", leaves = newLeaves, output = c.output))
+            val leafPreds = pushed.flatMap(p => compilePred(p, c.output)).filter(_ != "true")
+            val preds = residualCompiled ++ leafPreds
+            if (preds.isEmpty) {
+              Some(c.copy(leaves = newLeaves))
+            } else {
+              val pred = preds.reduce((a, b) => s"(and $a $b)")
+              Some(c.copy(ir = s"(filter $pred ${c.ir})", leaves = newLeaves, output = c.output))
+            }
           }
         }
       }
@@ -222,18 +272,25 @@ object NativeSqlPlan {
       }
 
     case Join(left, right, LeftSemi, Some(cond), _) =>
-      for {
-        l <- compile0(left)
-        r <- compile0(right)
-        (lk, rk) <- compileJoinKeys(cond, l.output, r.output)
-        rIr = shiftScans(r.ir, l.leaves.size)
-      } yield {
-        Compiled(
-          s"(hashsemi $lk $rk ${l.ir} $rIr)",
-          l.leaves ++ r.leaves,
-          left.output,
-          leafOutputs = l.withLeafOutputs.leafOutputs ++ r.withLeafOutputs.leafOutputs)
+      compileSemi(left, right, cond)
+
+    case Join(left, right, _: ExistenceJoin, Some(cond), _) =>
+      compileSemi(left, right, cond)
+
+    case Intersect(left, right, isAll) if !isAll =>
+      compile0(left).flatMap { l =>
+        compile0(right).flatMap { r =>
+          // C++ hashsemi is single-key; multi-column INTERSECT would drop equalities.
+          if (l.output.size != 1 || r.output.size != 1) {
+            None
+          } else {
+            compileSemiCompiled(l, r, EqualTo(l.output.head, r.output.head))
+          }
+        }
       }
+
+    case Distinct(child) =>
+      compile0(Aggregate(child.output, child.output, child))
 
     case u: Union if u.children.size >= 2 && u.children.forall(ch => compile0(ch).isDefined) =>
       val compiled = u.children.flatMap(compile0)
@@ -447,6 +504,468 @@ object NativeSqlPlan {
     for (a <- compileExpr(l, schema); b <- compileExpr(r, schema)) yield s"($op $a $b)"
 
   private def colIndex(ref: String): Int = ref.drop(1).toInt
+
+  private def compileSemi(
+      left: LogicalPlan,
+      right: LogicalPlan,
+      cond: Expression): Option[Compiled] = {
+    for {
+      l <- compile0(left)
+      r <- compile0(right)
+      out <- compileSemiCompiled(l, r, cond)
+    } yield out
+  }
+
+  private def compileSemiCompiled(
+      l: Compiled,
+      r: Compiled,
+      cond: Expression): Option[Compiled] = {
+    if (!semiPartitionSafe(l, r)) {
+      None
+    } else {
+      compileJoinKeys(cond, l.output, r.output).map { case (lk, rk) =>
+        Compiled(
+          s"(hashsemi $lk $rk ${l.ir} ${shiftScans(r.ir, l.leaves.size)})",
+          l.leaves ++ r.leaves,
+          l.output,
+          leafOutputs = l.withLeafOutputs.leafOutputs ++ r.withLeafOutputs.leafOutputs)
+      }
+    }
+  }
+
+  /**
+   * File-backed hashsemi partitions on the largest leaf (the probe). The IR left
+   * is the preserved side, so that leaf must be the probe. Otherwise each fact
+   * split emits matching dim rows and concat duplicates them (TPC-DS Q10).
+   */
+  private def semiPartitionSafe(l: Compiled, r: Compiled): Boolean = {
+    if (!r.hasFileLeaf) {
+      true
+    } else if (!l.hasFileLeaf) {
+      false
+    } else {
+      leafBytes(l) >= leafBytes(r)
+    }
+  }
+
+  private def leafBytes(c: Compiled): Long = {
+    val sizes = c.fileRels.map { p =>
+      try {
+        val n = p.stats.sizeInBytes
+        if (n == null || n.signum < 0) Long.MaxValue else n.toLong
+      } catch {
+        case _: Throwable => Long.MaxValue
+      }
+    }
+    if (sizes.isEmpty) 0L else sizes.max
+  }
+
+  private def isSemiPred(e: Expression): Boolean = e match {
+    case _: Exists => true
+    case In(_, Seq(_: ListQuery)) => true
+    case EqualTo(_, s: ScalarSubquery) if !s.isCorrelated => true
+    case EqualTo(s: ScalarSubquery, _) if !s.isCorrelated => true
+    case Or(_, _) => flattenOrExists(e).isDefined
+    case _ => false
+  }
+
+  private def flattenOrExists(e: Expression): Option[Seq[Exists]] = e match {
+    case ex: Exists => Some(Seq(ex))
+    case Or(l, r) =>
+      for (a <- flattenOrExists(l); b <- flattenOrExists(r)) yield a ++ b
+    case _ => None
+  }
+
+  private def applySemis(c: Compiled, parts: Seq[Expression]): Option[Compiled] = {
+    parts.foldLeft(Option(c)) { (acc, p) =>
+      acc.flatMap(cur => applyOneSemi(cur, p))
+    }
+  }
+
+  private def applyOneSemi(c: Compiled, e: Expression): Option[Compiled] = e match {
+    case ex: Exists =>
+      compile0(ex.plan).flatMap { r =>
+        existsCond(ex, c.output, r.output).flatMap(cond => compileSemiCompiled(c, r, cond))
+      }
+    case In(value, Seq(lq: ListQuery)) =>
+      compile0(lq.plan).flatMap { r =>
+        val cond =
+          if (lq.joinCond.nonEmpty) Some(lq.joinCond.reduce(And))
+          else r.output.headOption.map(o => EqualTo(value, o))
+        cond.flatMap(cnd => compileSemiCompiled(c, r, cnd))
+      }
+    case EqualTo(a, s: ScalarSubquery) if !s.isCorrelated =>
+      compile0(s.plan).flatMap { r =>
+        if (r.output.isEmpty) None
+        else compileSemiCompiled(c, r, EqualTo(a, r.output.head))
+      }
+    case EqualTo(s: ScalarSubquery, a) if !s.isCorrelated =>
+      compile0(s.plan).flatMap { r =>
+        if (r.output.isEmpty) None
+        else compileSemiCompiled(c, r, EqualTo(a, r.output.head))
+      }
+    case Or(_, _) =>
+      flattenOrExists(e).flatMap(applyOrExists(c, _))
+    case _ => None
+  }
+
+  private def applyOrExists(c: Compiled, xs: Seq[Exists]): Option[Compiled] = {
+    if (xs.size < 2) {
+      xs.headOption.flatMap(ex => applyOneSemi(c, ex))
+    } else {
+      val compiled = xs.map { ex =>
+        compile0(ex.plan).flatMap { r =>
+          existsCond(ex, c.output, r.output).flatMap { cond =>
+            compileJoinKeys(cond, c.output, r.output).map { case (lk, rk) =>
+              (lk, Compiled(
+                s"(project (list $rk) ${r.ir})",
+                r.leaves,
+                r.output.take(1),
+                leafOutputs = r.withLeafOutputs.leafOutputs))
+            }
+          }
+        }
+      }
+      if (compiled.exists(_.isEmpty) || compiled.map(_.get._1).distinct.size != 1) {
+        None
+      } else {
+        val lk = compiled.head.get._1
+        var offset = c.leaves.size
+        val rights = compiled.map(_.get._2)
+        val unionIr = rights.map { r =>
+          val s = shiftScans(r.ir, offset)
+          offset += r.leaves.size
+          s
+        }.reduce((a, b) => s"(union $a $b)")
+        val allLeaves = c.leaves ++ rights.flatMap(_.leaves)
+        val allOuts = c.withLeafOutputs.leafOutputs ++ rights.flatMap(_.withLeafOutputs.leafOutputs)
+        val combined = Compiled(
+          s"(hashsemi $lk c0 ${c.ir} $unionIr)",
+          allLeaves,
+          c.output,
+          leafOutputs = allOuts)
+        val rightSide = Compiled(
+          unionIr,
+          rights.flatMap(_.leaves),
+          rights.head.output,
+          leafOutputs = rights.flatMap(_.withLeafOutputs.leafOutputs))
+        if (semiPartitionSafe(c, rightSide)) Some(combined) else None
+      }
+    }
+  }
+
+  private def existsCond(
+      ex: Exists,
+      leftOut: Seq[Attribute],
+      rightOut: Seq[Attribute]): Option[Expression] = {
+    if (ex.joinCond.nonEmpty) {
+      Some(ex.joinCond.reduce(And))
+    } else {
+      val eqs = rightOut.flatMap { r =>
+        leftOut.find(l => l.name == r.name && l.dataType == r.dataType).map(l => EqualTo(l, r))
+      }
+      if (eqs.size == 1) Some(eqs.head) else None
+    }
+  }
+
+  private def isDroppedExistsFlag(e: Expression, out: Seq[Attribute]): Boolean = {
+    val known = AttributeSet(out)
+    e match {
+      case a: Attribute => !known.contains(a)
+      case IsNotNull(a: Attribute) => !known.contains(a)
+      case EqualTo(a: Attribute, Literal(true, BooleanType)) => !known.contains(a)
+      case EqualTo(Literal(true, BooleanType), a: Attribute) => !known.contains(a)
+      case _ => false
+    }
+  }
+
+  private case class BucketCase(
+      cnt: ScalarSubquery,
+      thresh: Long,
+      thn: ScalarSubquery,
+      els: ScalarSubquery,
+      name: String,
+      dt: DataType)
+
+  private case class BucketSub(
+      scanKey: String,
+      scan: LogicalPlan,
+      qty: Attribute,
+      lo: Long,
+      hi: Long,
+      kind: String,
+      aggCol: Option[Attribute])
+
+  private def anyLong(v: Any): Option[Long] = v match {
+    case i: Int => Some(i.toLong)
+    case l: Long => Some(l)
+    case i: java.lang.Integer => Some(i.longValue())
+    case l: java.lang.Long => Some(l.longValue())
+    case s: Short => Some(s.toLong)
+    case d: Decimal => Some(d.toLong)
+    case _ => None
+  }
+
+  private def litLong(e: Expression): Option[Long] = e match {
+    case Literal(v, _) => anyLong(v)
+    case Cast(c, _, _, _) => litLong(c)
+    case _ => None
+  }
+
+  private def unwrapScalar(e: Expression): Option[ScalarSubquery] = e match {
+    case s: ScalarSubquery => Some(s)
+    case GetStructField(s: ScalarSubquery, i, _) =>
+      Some(s.copy(plan = extractNthOutput(s.plan, i)))
+    case Cast(c, _, _, _) => unwrapScalar(c)
+    case _ => None
+  }
+
+  private def inlineCteScalars(plan: LogicalPlan): LogicalPlan = {
+    val defs = plan.collectWithSubqueries { case w: WithCTE => w.cteDefs }.flatten
+    if (defs.isEmpty) {
+      plan
+    } else {
+      plan.transformAllExpressions {
+        case s: ScalarSubquery => s.copy(plan = resolveCte(s.plan, defs))
+      }
+    }
+  }
+
+  private def resolveCte(p: LogicalPlan, defs: Seq[CTERelationDef]): LogicalPlan = {
+    p.transformUp {
+      case r: CTERelationRef =>
+        defs.find(_.id == r.cteId).map(_.child).getOrElse(r)
+    }
+  }
+
+  private def extractNthOutput(plan: LogicalPlan, idx: Int): LogicalPlan = {
+    unwrapAlias(plan) match {
+      case Project(Seq(Alias(cns: CreateNamedStruct, _)), child) =>
+        val fields = cns.valExprs
+        if (idx >= 0 && idx < fields.size) {
+          Project(Seq(Alias(fields(idx), s"_f$idx")()), child)
+        } else {
+          plan
+        }
+      case Project(plist, child) if idx >= 0 && idx < plist.size =>
+        Project(Seq(plist(idx)), child)
+      case a: Aggregate if idx >= 0 && idx < a.aggregateExpressions.size =>
+        a.copy(aggregateExpressions = Seq(a.aggregateExpressions(idx)))
+      case other => other
+    }
+  }
+
+  private def asBucketCase(ne: NamedExpression): Option[BucketCase] = {
+    val (name, inner, dt) = ne match {
+      case a: Alias => (a.name, a.child, a.dataType)
+      case other => (other.name, other, other.dataType)
+    }
+    def fromPred(
+        pred: Expression,
+        thn: Expression,
+        els: Expression): Option[BucketCase] = {
+      val c = pred match {
+        case GreaterThan(s, lit) => unwrapScalar(s).filter(!_.isCorrelated).flatMap { sq =>
+          litLong(lit).map(v => (sq, v))
+        }
+        case GreaterThanOrEqual(s, lit) => unwrapScalar(s).filter(!_.isCorrelated).flatMap { sq =>
+          litLong(lit).map(v => (sq, v - 1))
+        }
+        case _ => None
+      }
+      for {
+        (sq, thresh) <- c
+        t <- unwrapScalar(thn).filter(!_.isCorrelated)
+        f <- unwrapScalar(els).filter(!_.isCorrelated)
+      } yield BucketCase(sq, thresh, t, f, name, dt)
+    }
+    inner match {
+      case CaseWhen(Seq((pred, thn)), Some(els)) => fromPred(pred, thn, els)
+      case If(pred, thn, els) => fromPred(pred, thn, els)
+      case _ => None
+    }
+  }
+
+  private def scanKey(p: LogicalPlan): Option[String] = unwrapAlias(p) match {
+    case LogicalRelation(fs: HadoopFsRelation, _, _, _, _) =>
+      Some("f:" + fs.location.rootPaths.map(_.toString).sorted.mkString("|"))
+    case l: LocalRelation =>
+      Some("l:" + l.output.map(a => a.name + ":" + a.dataType.simpleString).mkString(","))
+    case _ => None
+  }
+
+  private def peelToScan(p: LogicalPlan): (Seq[Expression], LogicalPlan) = {
+    var cur = p
+    val preds = scala.collection.mutable.ArrayBuffer.empty[Expression]
+    var done = false
+    while (!done) {
+      unwrapAlias(cur) match {
+        case Filter(c, ch) =>
+          preds ++= splitAnd(c)
+          cur = ch
+        case Project(_, ch) =>
+          cur = ch
+        case other =>
+          cur = other
+          done = true
+      }
+    }
+    (preds.toSeq, cur)
+  }
+
+  private def qtyBounds(preds: Seq[Expression]): Option[(Attribute, Long, Long)] = {
+    val lo = scala.collection.mutable.Map.empty[ExprId, (Attribute, Long)]
+    val hi = scala.collection.mutable.Map.empty[ExprId, (Attribute, Long)]
+    preds.foreach {
+      case GreaterThanOrEqual(a: Attribute, l) =>
+        litLong(l).foreach(v => lo(a.exprId) = (a, v))
+      case LessThanOrEqual(a: Attribute, l) =>
+        litLong(l).foreach(v => hi(a.exprId) = (a, v))
+      case GreaterThan(a: Attribute, l) =>
+        litLong(l).foreach(v => lo(a.exprId) = (a, v + 1))
+      case LessThan(a: Attribute, l) =>
+        litLong(l).foreach(v => hi(a.exprId) = (a, v - 1))
+      case GreaterThanOrEqual(l, a: Attribute) =>
+        litLong(l).foreach(v => hi(a.exprId) = (a, v))
+      case LessThanOrEqual(l, a: Attribute) =>
+        litLong(l).foreach(v => lo(a.exprId) = (a, v))
+      case _ =>
+    }
+    lo.keys.collectFirst {
+      case id if hi.contains(id) =>
+        val (a, l) = lo(id)
+        (a, l, hi(id)._2)
+    }
+  }
+
+  private def namedAgg(ne: NamedExpression): Option[(String, Option[Attribute])] = {
+    val e = ne match {
+      case Alias(c, _) => c
+      case other => other
+    }
+    e match {
+      case AggregateExpression(Count(_), _, _, _, _) => Some(("count", None))
+      case AggregateExpression(Average(c, _), _, _, _, _) =>
+        attrOf(c).map(a => ("avg", Some(a)))
+      case Count(_) => Some(("count", None))
+      case Average(c, _) => attrOf(c).map(a => ("avg", Some(a)))
+      case _ => None
+    }
+  }
+
+  private def attrOf(e: Expression): Option[Attribute] = e match {
+    case a: Attribute => Some(a)
+    case Alias(c, _) => attrOf(c)
+    case Cast(c, _, _, _) => attrOf(c)
+    case UnscaledValue(c) => attrOf(c)
+    case _ => None
+  }
+
+  private def resolveProjectedAgg(
+      ne: NamedExpression,
+      aggs: Seq[NamedExpression]): Option[NamedExpression] = {
+    namedAgg(ne).map(_ => ne).orElse {
+      val inner = ne match {
+        case Alias(c, _) => c
+        case other => other
+      }
+      inner match {
+        case a: Attribute =>
+          aggs.find(_.exprId == a.exprId).orElse(aggs.find(_.name == a.name))
+        case _ => Some(ne)
+      }
+    }
+  }
+
+  private def parseBucketSub(s: ScalarSubquery): Option[BucketSub] = {
+    if (s.isCorrelated) {
+      None
+    } else {
+      val (preds, scan, neOpt) = peelAgg(s.plan)
+      for {
+        ne <- neOpt
+        key <- scanKey(scan)
+        (qty, lo, hi) <- qtyBounds(preds)
+        (kind, col) <- namedAgg(ne)
+      } yield BucketSub(key, unwrapAlias(scan), qty, lo, hi, kind, col)
+    }
+  }
+
+  private def peelAgg(
+      p: LogicalPlan): (Seq[Expression], LogicalPlan, Option[NamedExpression]) = {
+    unwrapAlias(p) match {
+      case Aggregate(Nil, aggs, child, _) =>
+        val (preds, scan) = peelToScan(child)
+        (preds, scan, aggs.headOption.flatMap(a => resolveProjectedAgg(a, aggs)))
+      case Project(plist, child) if plist.size == 1 =>
+        unwrapAlias(child) match {
+          case Aggregate(Nil, aggs, gch, _) =>
+            val (preds, scan) = peelToScan(gch)
+            (preds, scan, resolveProjectedAgg(plist.head, aggs))
+          case other =>
+            val (preds, scan, ne) = peelAgg(other)
+            (preds, scan, ne.orElse(Some(plist.head)))
+        }
+      case _ =>
+        val (preds, scan) = peelToScan(p)
+        (preds, scan, None)
+    }
+  }
+
+  private def buildSharedBuckets(
+      cases: Seq[BucketCase],
+      subs: Seq[BucketSub],
+      reason: Compiled): Option[(Compiled, Seq[NamedExpression])] = {
+    val schema = subs.head.scan.output
+    val qty = schema.indexWhere(_.exprId == subs.head.qty.exprId)
+    val disc = cases.flatMap(c => parseBucketSub(c.thn)).flatMap(_.aggCol).headOption
+    val prof = cases.flatMap(c => parseBucketSub(c.els)).flatMap(_.aggCol).headOption
+    val di = disc.map(a => schema.indexWhere(_.exprId == a.exprId)).getOrElse(-1)
+    val pi = prof.map(a => schema.indexWhere(_.exprId == a.exprId)).getOrElse(-1)
+    val buckets = cases.flatMap(c => parseBucketSub(c.cnt)).map(s => (s.lo, s.hi)).distinct.sortBy(_._1)
+    if (qty < 0 || di < 0 || pi < 0 || buckets.size != cases.size) {
+      None
+    } else {
+      val idxOf = buckets.zipWithIndex.toMap
+      val bounds = buckets.map { case (lo, hi) => s"${lo}i64 ${hi}i64" }.mkString(" ")
+      val aggs = s"(count) (sum c$di) (count c$di) (sum c$pi) (count c$pi)"
+      val factIr = s"(segagg c$qty (list $bounds) (list $aggs) (scan 0))"
+      val rIr = shiftScans(reason.ir, 1)
+      val ir = s"(hashjoin 0i64 0i64 $factIr (project (list 0i64) $rIr))"
+      val kinds = buckets.flatMap(_ =>
+        Seq(NativeAggKind.Count, NativeAggKind.AvgSum, NativeAggKind.AvgCnt,
+          NativeAggKind.AvgSum, NativeAggKind.AvgCnt))
+      val wideOut = buckets.zipWithIndex.flatMap { case (_, i) =>
+        val dt = cases(i).dt
+        Seq(
+          AttributeReference(s"_b${i}_cnt", LongType)(),
+          AttributeReference(s"_b${i}_avgd", dt)(),
+          AttributeReference(s"_b${i}_avgp", dt)())
+      }
+      val newList = cases.flatMap { c =>
+        parseBucketSub(c.cnt).flatMap { sub =>
+          idxOf.get((sub.lo, sub.hi)).map { i =>
+            val cnt = wideOut(i * 3)
+            val avgd = wideOut(i * 3 + 1)
+            val avgp = wideOut(i * 3 + 2)
+            Alias(If(GreaterThan(cnt, Literal(c.thresh)), avgd, avgp), c.name)()
+          }
+        }
+      }
+      if (newList.size != cases.size) {
+        None
+      } else {
+        Some((
+          Compiled(
+            ir,
+            FileLeaf(subs.head.scan) +: reason.leaves,
+            wideOut,
+            aggKinds = kinds,
+            leafOutputs = Seq(schema) ++ reason.withLeafOutputs.leafOutputs),
+          newList))
+      }
+    }
+  }
 
   private def compileJoinKeys(
       cond: Expression,

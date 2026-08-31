@@ -49,8 +49,8 @@ public final class NativeSqlJni {
       String planIr, Object[][] columns, int[] numRows, Object[] scans);
 
   /**
-   * Hadoop FS helpers used by C++ parquet open (no full-file copy to /tmp).
-   * One cached stream per thread.
+   * Hadoop FS helpers used by C++ parquet open. Never copies to /tmp.
+   * Short-circuit NativeIO is disabled; that path aborted YARN executors (134).
    */
   private static final ThreadLocal<HdfsHandle> HDFS = new ThreadLocal<>();
 
@@ -59,6 +59,15 @@ public final class NativeSqlJni {
     FileSystem fs;
     FSDataInputStream in;
     long size;
+    long pos;
+  }
+
+  private static Configuration readConf() {
+    Configuration conf = new Configuration(SparkHadoopUtil.get().conf());
+    conf.setBoolean("dfs.client.read.shortcircuit", false);
+    conf.setBoolean("dfs.client.use.legacy.blockreader", false);
+    conf.set("dfs.domain.socket.path", "");
+    return conf;
   }
 
   private static HdfsHandle openHdfs(String uri) throws IOException {
@@ -70,13 +79,13 @@ public final class NativeSqlJni {
       closeQuiet(h);
     }
     Path p = new Path(uri);
-    Configuration conf = SparkHadoopUtil.get().conf();
-    FileSystem fs = p.getFileSystem(conf);
+    FileSystem fs = p.getFileSystem(readConf());
     HdfsHandle n = new HdfsHandle();
     n.uri = uri;
     n.fs = fs;
     n.in = fs.open(p);
     n.size = fs.getFileStatus(p).getLen();
+    n.pos = 0L;
     HDFS.set(n);
     return n;
   }
@@ -100,33 +109,48 @@ public final class NativeSqlJni {
   }
 
   public static int hdfsPread(String uri, long offset, byte[] buf, int n) throws IOException {
+    try {
+      return preadOnce(uri, offset, buf, n);
+    } catch (Throwable t) {
+      System.err.println("nativesql: hdfsPread retry uri=" + uri + " off=" + offset +
+          " n=" + n + " err=" + t);
+      t.printStackTrace(System.err);
+      HdfsHandle old = HDFS.get();
+      closeQuiet(old);
+      HDFS.remove();
+      return preadOnce(uri, offset, buf, n);
+    }
+  }
+
+  private static int preadOnce(String uri, long offset, byte[] buf, int n) throws IOException {
     HdfsHandle h = openHdfs(uri);
     if (offset >= h.size || n <= 0) {
       return 0;
     }
     int want = n;
-    if (offset + want > h.size) {
+    if (offset + (long) want > h.size) {
       want = (int) (h.size - offset);
     }
     if (want > buf.length) {
       want = buf.length;
     }
-    /* Fresh stream per read: cached seek+read was throwing on fact files. */
-    Path p = new Path(uri);
-    try (FSDataInputStream in = h.fs.open(p)) {
-      int got = in.read(offset, buf, 0, want);
-      if (got < 0) {
-        return 0;
-      }
-      int pos = got;
-      while (pos < want) {
-        int r = in.read(offset + pos, buf, pos, want - pos);
-        if (r < 0) {
-          break;
+    /* seek+readFully. Positioned/short-circuit reads abort on this cluster.
+     * C++ only requests the parquet footer and surviving column chunks. */
+    synchronized (h) {
+      if (h.pos != offset) {
+        try {
+          h.in.seek(offset);
+        } catch (IOException seekErr) {
+          closeQuiet(h);
+          HDFS.remove();
+          h = openHdfs(uri);
+          h.in.seek(offset);
         }
-        pos += r;
+        h.pos = offset;
       }
-      return pos;
+      h.in.readFully(buf, 0, want);
+      h.pos += want;
     }
+    return want;
   }
 }

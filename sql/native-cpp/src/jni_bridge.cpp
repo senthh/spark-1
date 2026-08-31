@@ -25,11 +25,11 @@
 #include <string>
 #include <vector>
 
-static std::mutex g_jni_mu;
 static thread_local JNIEnv *g_hdfs_env = nullptr;
 static jclass g_jni_cls = nullptr;
 static jmethodID g_mid_hdfs_size = nullptr;
 static jmethodID g_mid_hdfs_pread = nullptr;
+static std::once_flag g_jni_once;
 
 static bool jni_ok(JNIEnv *env) { return env != nullptr && !env->ExceptionCheck(); }
 
@@ -71,27 +71,29 @@ static int64_t java_hdfs_pread(const char *uri, int64_t off, void *buf, int64_t 
     env->ExceptionClear();
     return -1;
   }
+  if (env->PushLocalFrame(8) != 0) {
+    env->ExceptionClear();
+    return -1;
+  }
   const jint want = n > static_cast<int64_t>(INT32_MAX) ? INT32_MAX : static_cast<jint>(n);
   jstring juri = env->NewStringUTF(uri);
   jbyteArray jbuf = env->NewByteArray(want);
   if (juri == nullptr || jbuf == nullptr) {
-    if (juri) env->DeleteLocalRef(juri);
-    if (jbuf) env->DeleteLocalRef(jbuf);
+    env->PopLocalFrame(nullptr);
     return -1;
   }
   jint got = env->CallStaticIntMethod(g_jni_cls, mid, juri, static_cast<jlong>(off),
                                       jbuf, want);
-  env->DeleteLocalRef(juri);
   if (env->ExceptionCheck()) {
     env->ExceptionDescribe();
     env->ExceptionClear();
-    env->DeleteLocalRef(jbuf);
+    env->PopLocalFrame(nullptr);
     return -1;
   }
   if (got > 0) {
     env->GetByteArrayRegion(jbuf, 0, got, reinterpret_cast<jbyte *>(buf));
   }
-  env->DeleteLocalRef(jbuf);
+  env->PopLocalFrame(nullptr);
   return static_cast<int64_t>(got);
 }
 
@@ -193,7 +195,7 @@ static void fill_col(JNIEnv *env, NsCol *col, jobject arr, int rows) {
 extern "C" JNIEXPORT jobjectArray JNICALL
 Java_org_apache_spark_sql_execution_nativesql_NativeSqlJni_execute(
     JNIEnv *env, jclass, jstring planIr, jobjectArray columns, jintArray numRows) {
-  std::lock_guard<std::mutex> jni_lock(g_jni_mu);
+  g_hdfs_env = env;
   const char *ir = env->GetStringUTFChars(planIr, nullptr);
   const jsize n_in = columns ? env->GetArrayLength(columns) : 0;
   jint *nrow = numRows ? env->GetIntArrayElements(numRows, nullptr) : nullptr;
@@ -390,24 +392,24 @@ static jobjectArray pack_result(JNIEnv *env, NsBatch *out) {
   return result;
 }
 
+static void init_jni_hdfs(JNIEnv *env) {
+  jclass local =
+      env->FindClass("org/apache/spark/sql/execution/nativesql/NativeSqlJni");
+  if (local == nullptr) return;
+  g_jni_cls = reinterpret_cast<jclass>(env->NewGlobalRef(local));
+  env->DeleteLocalRef(local);
+  g_mid_hdfs_size =
+      env->GetStaticMethodID(g_jni_cls, "hdfsSize", "(Ljava/lang/String;)J");
+  g_mid_hdfs_pread = env->GetStaticMethodID(
+      g_jni_cls, "hdfsPread", "(Ljava/lang/String;J[BI)I");
+}
+
 extern "C" JNIEXPORT jobjectArray JNICALL
 Java_org_apache_spark_sql_execution_nativesql_NativeSqlJni_executeScan(
     JNIEnv *env, jclass, jstring planIr, jobjectArray columns, jintArray numRows,
     jobjectArray scans) {
-  std::lock_guard<std::mutex> jni_lock(g_jni_mu);
   g_hdfs_env = env;
-  if (g_jni_cls == nullptr) {
-    jclass local =
-        env->FindClass("org/apache/spark/sql/execution/nativesql/NativeSqlJni");
-    if (local != nullptr) {
-      g_jni_cls = reinterpret_cast<jclass>(env->NewGlobalRef(local));
-      env->DeleteLocalRef(local);
-      g_mid_hdfs_size =
-          env->GetStaticMethodID(g_jni_cls, "hdfsSize", "(Ljava/lang/String;)J");
-      g_mid_hdfs_pread = env->GetStaticMethodID(
-          g_jni_cls, "hdfsPread", "(Ljava/lang/String;J[BI)I");
-    }
-  }
+  std::call_once(g_jni_once, init_jni_hdfs, env);
   ns_parquet_set_hdfs_io(java_hdfs_size, java_hdfs_pread);
   ns_strdict_clear();
   const char *ir = env->GetStringUTFChars(planIr, nullptr);
@@ -575,7 +577,7 @@ Java_org_apache_spark_sql_execution_nativesql_NativeSqlJni_executeScan(
   if (nrow) env->ReleaseIntArrayElements(numRows, nrow, JNI_ABORT);
   if (rc != 0) {
     jclass ex = env->FindClass("java/lang/RuntimeException");
-    env->ThrowNew(ex, "Native SQL parquet execute failed");
+    env->ThrowNew(ex, "Native SQL parquet execute failed (hdfs range/scan)");
     return nullptr;
   }
   return pack_result(env, &out);

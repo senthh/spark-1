@@ -36,9 +36,11 @@ NsHdfsPreadFn g_hdfs_pread = nullptr;
 #include <cctype>
 #include <climits>
 #include <cstdint>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <list>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -55,7 +57,6 @@ namespace {
 
 thread_local std::vector<std::pair<int64_t, std::string>> g_strdict;
 thread_local std::unordered_set<int64_t> g_seen;
-std::mutex g_pq_mu;
 const size_t kMaxStrDict = 1000000;
 
 int32_t mix_k1(int32_t k1) {
@@ -327,8 +328,18 @@ bool rg_survives_preds(const parquet::RowGroupMetaData *rg, const NsFileScan &sc
     if (!cc) continue;
     auto st = cc->statistics();
     if (st && !pred_ok_stats(st.get(), pred)) return false;
-    (void)file;
-    (void)bloom_hits;
+    /* Optional bloom skip. Deserialize can abort on some files; default off.
+     * SPARK_NATIVESQL_BLOOM=1 enables eq-only probes. */
+    static const bool bloom_on = []() {
+      const char *e = std::getenv("SPARK_NATIVESQL_BLOOM");
+      return e != nullptr && e[0] == '1';
+    }();
+    if (bloom_on && pred.op == 1 && file != nullptr) {
+      if (bloom_excludes_eq(file, cc.get(), pred.value)) {
+        if (bloom_hits != nullptr) *bloom_hits += 1;
+        return false;
+      }
+    }
   }
   return true;
 }
@@ -528,12 +539,152 @@ class HdfsRandomAccessFile : public arrow::io::RandomAccessFile {
 };
 #endif
 
+/* Per-executor byte-range cache (Velox AsyncDataCache). Survives tasks so
+ * dims and repeated store_sales scans do not re-hit HDFS. Cap via
+ * SPARK_NATIVESQL_CACHE_BYTES (default 1GB, same as Velox memCacheSize). */
+class FileRangeCache {
+ public:
+  static FileRangeCache &inst() {
+    static FileRangeCache c;
+    return c;
+  }
+
+  bool copy(const std::string &uri, int64_t pos, int64_t n, uint8_t *dst) {
+    if (n <= 0 || dst == nullptr) return true;
+    std::lock_guard<std::mutex> lk(mu_);
+    auto *e = find_locked(uri, pos, n);
+    if (e == nullptr) {
+      misses_++;
+      return false;
+    }
+    std::memcpy(dst, e->buf->data() + (pos - e->off), static_cast<size_t>(n));
+    touch_locked(e);
+    hits_++;
+    return true;
+  }
+
+  std::shared_ptr<arrow::Buffer> pin(const std::string &uri, int64_t pos, int64_t n,
+                                     int64_t *entry_off) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto *e = find_locked(uri, pos, n);
+    if (e == nullptr) {
+      misses_++;
+      return nullptr;
+    }
+    touch_locked(e);
+    hits_++;
+    if (entry_off) *entry_off = e->off;
+    return e->buf;
+  }
+
+  void put(const std::string &uri, int64_t off, std::shared_ptr<arrow::Buffer> buf) {
+    if (!buf || buf->size() <= 0 || uri.empty()) return;
+    const int64_t n = buf->size();
+    std::lock_guard<std::mutex> lk(mu_);
+    if (n > cap_) return;
+    if (find_locked(uri, off, n) != nullptr) return;
+    evict_locked(n);
+    auto &lst = files_[uri];
+    lst.push_front(Entry{off, n, std::move(buf), ++tick_});
+    used_ += n;
+    puts_++;
+  }
+
+  void log() {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::fprintf(stderr,
+                 "nativesql: pq cache hits=%llu miss=%llu put=%llu evict=%llu "
+                 "used=%lld cap=%lld files=%zu\n",
+                 static_cast<unsigned long long>(hits_),
+                 static_cast<unsigned long long>(misses_),
+                 static_cast<unsigned long long>(puts_),
+                 static_cast<unsigned long long>(evicts_),
+                 static_cast<long long>(used_), static_cast<long long>(cap_),
+                 files_.size());
+    std::fflush(stderr);
+  }
+
+ private:
+  struct Entry {
+    int64_t off;
+    int64_t len;
+    std::shared_ptr<arrow::Buffer> buf;
+    uint64_t tick;
+  };
+
+  FileRangeCache() : cap_(default_cap()), used_(0), tick_(0), hits_(0), misses_(0),
+                     puts_(0), evicts_(0) {}
+
+  static int64_t default_cap() {
+    const char *e = std::getenv("SPARK_NATIVESQL_CACHE_BYTES");
+    if (e == nullptr || e[0] == '\0') e = std::getenv("NATIVESQL_CACHE_BYTES");
+    if (e != nullptr && e[0] != '\0') {
+      char *end = nullptr;
+      const long long v = std::strtoll(e, &end, 10);
+      if (end != e && v > 0) return static_cast<int64_t>(v);
+    }
+    return 1024LL * 1024 * 1024;
+  }
+
+  Entry *find_locked(const std::string &uri, int64_t pos, int64_t n) {
+    auto it = files_.find(uri);
+    if (it == files_.end()) return nullptr;
+    for (auto &e : it->second) {
+      if (e.buf && pos >= e.off && pos + n <= e.off + e.len) return &e;
+    }
+    return nullptr;
+  }
+
+  void touch_locked(Entry *e) {
+    if (e) e->tick = ++tick_;
+  }
+
+  void evict_locked(int64_t need) {
+    while (used_ + need > cap_ && !files_.empty()) {
+      std::string best_uri;
+      std::list<Entry>::iterator best;
+      bool found = false;
+      uint64_t oldest = std::numeric_limits<uint64_t>::max();
+      for (auto &kv : files_) {
+        for (auto it = kv.second.begin(); it != kv.second.end(); ++it) {
+          if (it->tick < oldest) {
+            oldest = it->tick;
+            best_uri = kv.first;
+            best = it;
+            found = true;
+          }
+        }
+      }
+      if (!found) break;
+      used_ -= best->len;
+      if (used_ < 0) used_ = 0;
+      auto fit = files_.find(best_uri);
+      fit->second.erase(best);
+      if (fit->second.empty()) files_.erase(fit);
+      evicts_++;
+    }
+  }
+
+  std::mutex mu_;
+  int64_t cap_;
+  int64_t used_;
+  uint64_t tick_;
+  uint64_t hits_;
+  uint64_t misses_;
+  uint64_t puts_;
+  uint64_t evicts_;
+  std::unordered_map<std::string, std::list<Entry>> files_;
+};
+
+/* Ranged HDFS file: JNI seek+pread only for requested byte ranges.
+ * Local spans plus the process FileRangeCache. */
 class JavaHdfsFile : public arrow::io::RandomAccessFile {
  public:
   JavaHdfsFile(std::string uri, int64_t size)
-      : uri_(std::move(uri)), size_(size), pos_(0), closed_(false) {}
+      : uri_(std::move(uri)), size_(size), pos_(0), closed_(false), fetched_(0) {}
   arrow::Status Close() override {
     closed_ = true;
+    cache_.clear();
     return arrow::Status::OK();
   }
   bool closed() const override { return closed_; }
@@ -545,21 +696,64 @@ class JavaHdfsFile : public arrow::io::RandomAccessFile {
     return arrow::Status::OK();
   }
   arrow::Result<int64_t> GetSize() override { return size_; }
+
+  int64_t fetched_bytes() const { return fetched_; }
+
+  arrow::Status Prefetch(int64_t position, int64_t nbytes) {
+    if (closed_ || g_hdfs_pread == nullptr) return arrow::Status::IOError("hdfs closed");
+    if (nbytes <= 0 || position >= size_) return arrow::Status::OK();
+    if (position < 0) position = 0;
+    if (position + nbytes > size_) nbytes = size_ - position;
+    if (cache_covers(position, nbytes)) return arrow::Status::OK();
+    int64_t eoff = 0;
+    auto pinned = FileRangeCache::inst().pin(uri_, position, nbytes, &eoff);
+    if (pinned) {
+      cache_.push_back({eoff, pinned});
+      return arrow::Status::OK();
+    }
+    ARROW_ASSIGN_OR_RAISE(auto buf, arrow::AllocateResizableBuffer(nbytes));
+    ARROW_ASSIGN_OR_RAISE(int64_t n, read_jni(position, nbytes, buf->mutable_data()));
+    if (n < nbytes) {
+      ARROW_RETURN_NOT_OK(buf->Resize(n));
+    }
+    if (n > 0) {
+      std::shared_ptr<arrow::Buffer> owned(std::move(buf));
+      FileRangeCache::inst().put(uri_, position, owned);
+      cache_.push_back({position, owned});
+    }
+    return arrow::Status::OK();
+  }
+
   arrow::Result<int64_t> ReadAt(int64_t position, int64_t nbytes, void *out) override {
     if (closed_ || g_hdfs_pread == nullptr) return arrow::Status::IOError("hdfs closed");
     if (nbytes <= 0) return 0;
-    const int64_t cap = 8 * 1024 * 1024;
-    int64_t total = 0;
+    if (position >= size_) return 0;
+    if (position + nbytes > size_) nbytes = size_ - position;
     auto *dst = static_cast<uint8_t *>(out);
-    while (total < nbytes) {
-      const int64_t n = std::min(cap, nbytes - total);
-      const int64_t got = g_hdfs_pread(uri_.c_str(), position + total, dst + total, n);
-      if (got < 0) return arrow::Status::IOError("hdfsPread java");
-      if (got == 0) break;
-      total += got;
-      if (got < n) break;
+    int64_t from_cache = 0;
+    if (cache_copy(position, nbytes, dst, &from_cache) && from_cache == nbytes) {
+      return nbytes;
     }
-    return total;
+    if (FileRangeCache::inst().copy(uri_, position, nbytes, dst)) {
+      return nbytes;
+    }
+    if (from_cache > 0 && from_cache < nbytes) {
+      ARROW_ASSIGN_OR_RAISE(int64_t n,
+                            read_jni(position + from_cache, nbytes - from_cache,
+                                     dst + from_cache));
+      return from_cache + n;
+    }
+    ARROW_ASSIGN_OR_RAISE(int64_t n, read_jni(position, nbytes, dst));
+    if (n > 0) {
+      auto maybe = arrow::AllocateBuffer(n);
+      if (maybe.ok() && *maybe) {
+        std::shared_ptr<arrow::Buffer> owned(std::move(*maybe));
+        std::memcpy(owned->mutable_data(), dst, static_cast<size_t>(n));
+        FileRangeCache::inst().put(uri_, position, owned);
+        cache_.push_back({position, owned});
+      }
+    }
+    return n;
   }
   arrow::Result<std::shared_ptr<arrow::Buffer>> ReadAt(int64_t position,
                                                        int64_t nbytes) override {
@@ -582,10 +776,55 @@ class JavaHdfsFile : public arrow::io::RandomAccessFile {
   }
 
  private:
+  struct Cached {
+    int64_t off;
+    std::shared_ptr<arrow::Buffer> buf;
+  };
+
+  bool cache_covers(int64_t position, int64_t nbytes) const {
+    for (const auto &c : cache_) {
+      if (!c.buf) continue;
+      if (position >= c.off && position + nbytes <= c.off + c.buf->size()) return true;
+    }
+    return false;
+  }
+
+  bool cache_copy(int64_t position, int64_t nbytes, uint8_t *dst, int64_t *got) const {
+    for (const auto &c : cache_) {
+      if (!c.buf) continue;
+      if (position < c.off || position >= c.off + c.buf->size()) continue;
+      const int64_t avail = c.off + c.buf->size() - position;
+      const int64_t n = std::min(nbytes, avail);
+      std::memcpy(dst, c.buf->data() + (position - c.off), static_cast<size_t>(n));
+      *got = n;
+      return true;
+    }
+    *got = 0;
+    return false;
+  }
+
+  arrow::Result<int64_t> read_jni(int64_t position, int64_t nbytes, void *out) {
+    const int64_t cap = 8 * 1024 * 1024;
+    int64_t total = 0;
+    auto *dst = static_cast<uint8_t *>(out);
+    while (total < nbytes) {
+      const int64_t n = std::min(cap, nbytes - total);
+      const int64_t got = g_hdfs_pread(uri_.c_str(), position + total, dst + total, n);
+      if (got < 0) return arrow::Status::IOError("hdfsPread java");
+      if (got == 0) break;
+      total += got;
+      fetched_ += got;
+      if (got < n) break;
+    }
+    return total;
+  }
+
   std::string uri_;
   int64_t size_;
   int64_t pos_;
   bool closed_;
+  int64_t fetched_;
+  std::vector<Cached> cache_;
 };
 
 bool is_hdfs_uri(const char *p) {
@@ -598,6 +837,28 @@ std::string local_fs_path(const char *p) {
   return p;
 }
 
+arrow::Status prefetch_parquet_footer(JavaHdfsFile *f, int64_t sz) {
+  if (f == nullptr || sz < 8) return arrow::Status::IOError("hdfs footer");
+  uint8_t tail[8];
+  ARROW_ASSIGN_OR_RAISE(int64_t n, f->ReadAt(sz - 8, 8, tail));
+  if (n < 8) return arrow::Status::IOError("hdfs footer magic");
+  int32_t flen = 0;
+  std::memcpy(&flen, tail, 4);
+  const bool magic = std::memcmp(tail + 4, "PAR1", 4) == 0;
+  int64_t want = 0;
+  if (magic && flen > 0 && static_cast<int64_t>(flen) < sz - 8) {
+    want = static_cast<int64_t>(flen);
+    const int64_t cap = 16LL * 1024 * 1024;
+    if (want > cap) want = cap;
+  } else {
+    want = std::min(sz - 8, static_cast<int64_t>(4 * 1024 * 1024));
+  }
+  std::fprintf(stderr, "nativesql: pq footer magic=%d len=%d prefetch=%lld\n",
+               magic ? 1 : 0, flen, static_cast<long long>(want + 8));
+  std::fflush(stderr);
+  return f->Prefetch(sz - 8 - want, want + 8);
+}
+
 arrow::Result<std::shared_ptr<arrow::io::RandomAccessFile>> open_scan_file(
     const char *path) {
   if (path == nullptr || path[0] == '\0') {
@@ -607,12 +868,22 @@ arrow::Result<std::shared_ptr<arrow::io::RandomAccessFile>> open_scan_file(
     if (g_hdfs_size != nullptr && g_hdfs_pread != nullptr) {
       int64_t sz = g_hdfs_size(path);
       if (sz < 0) return arrow::Status::IOError("hdfsSize java failed");
-      std::fprintf(stderr, "nativesql: pq hdfs=java path=%s size=%lld\n", path,
-                   static_cast<long long>(sz));
-      std::fflush(stderr);
       if (sz <= 0) return arrow::Status::IOError("hdfs empty");
-      /* Dims and small files: one buffer. Fact files use seek+pread. */
-      if (sz <= 16 * 1024 * 1024) {
+      /* Dims: one sequential buffer. Fact files: footer + later column chunks. */
+      const int64_t kSmall = 4LL * 1024 * 1024;
+      if (sz <= kSmall) {
+        int64_t eoff = 0;
+        auto pinned = FileRangeCache::inst().pin(path, 0, sz, &eoff);
+        if (pinned && eoff == 0 && pinned->size() >= sz) {
+          std::fprintf(stderr, "nativesql: pq hdfs=cache path=%s size=%lld\n", path,
+                       static_cast<long long>(sz));
+          std::fflush(stderr);
+          FileRangeCache::inst().log();
+          return std::make_shared<arrow::io::BufferReader>(pinned);
+        }
+        std::fprintf(stderr, "nativesql: pq hdfs=slurp path=%s size=%lld\n", path,
+                     static_cast<long long>(sz));
+        std::fflush(stderr);
         auto maybe = arrow::AllocateBuffer(sz);
         if (!maybe.ok() || !*maybe) {
           return arrow::Status::IOError("hdfs slurp alloc");
@@ -629,33 +900,19 @@ arrow::Result<std::shared_ptr<arrow::io::RandomAccessFile>> open_scan_file(
           }
           off += got;
         }
+        FileRangeCache::inst().put(path, 0, owned);
+        FileRangeCache::inst().log();
         return std::make_shared<arrow::io::BufferReader>(owned);
       }
-      return std::shared_ptr<arrow::io::RandomAccessFile>(new JavaHdfsFile(path, sz));
+      std::fprintf(stderr, "nativesql: pq hdfs=range path=%s size=%lld\n", path,
+                   static_cast<long long>(sz));
+      std::fflush(stderr);
+      auto file = std::make_shared<JavaHdfsFile>(path, sz);
+      ARROW_RETURN_NOT_OK(prefetch_parquet_footer(file.get(), sz));
+      FileRangeCache::inst().log();
+      return file;
     }
-#if defined(__linux__)
-    HdfsApi &api = hdfs_api();
-    if (api.handle == nullptr || api.OpenFile == nullptr || api.Pread == nullptr) {
-      return arrow::Status::IOError("libhdfs not loaded");
-    }
-    hdfsFS fs = hdfs_connect(api, path);
-    if (fs == nullptr) return arrow::Status::IOError("hdfs connect failed");
-    const std::string hp = hdfs_fs_path(path);
-    hdfsFile hf = api.OpenFile(fs, hp.c_str(), O_RDONLY, 0, 0, 0);
-    if (hf == nullptr) return arrow::Status::IOError("hdfs open failed: " + hp);
-    int64_t sz = 0;
-    if (api.GetPathInfo != nullptr) {
-      hdfsFileInfo *info = api.GetPathInfo(fs, hp.c_str());
-      if (info != nullptr) {
-        sz = info->mSize;
-        if (api.FreeFileInfo != nullptr) api.FreeFileInfo(info, 1);
-      }
-    }
-    return std::shared_ptr<arrow::io::RandomAccessFile>(
-        new HdfsRandomAccessFile(&api, fs, hf, sz));
-#else
-    return arrow::Status::NotImplemented("hdfs parquet open requires linux libhdfs");
-#endif
+    return arrow::Status::IOError("hdfs parquet requires JNI Hadoop FS");
   }
   return arrow::io::ReadableFile::Open(local_fs_path(path));
 }
@@ -828,11 +1085,90 @@ void fill_from_array(
   }
 }
 
+struct ByteSpan {
+  int64_t off;
+  int64_t len;
+};
+
+bool col_chunk_span(const parquet::ColumnChunkMetaData *cc, ByteSpan *out) {
+  if (cc == nullptr || out == nullptr) return false;
+  int64_t start = 0;
+  if (cc->has_dictionary_page() && cc->dictionary_page_offset() > 0) {
+    start = cc->dictionary_page_offset();
+  } else if (cc->data_page_offset() > 0) {
+    start = cc->data_page_offset();
+  } else if (cc->file_offset() > 0) {
+    start = cc->file_offset();
+  }
+  int64_t sz = cc->total_compressed_size();
+  if (sz <= 0) return false;
+  if (start <= 0) return false;
+  out->off = start;
+  out->len = sz;
+  return true;
+}
+
+void merge_spans(std::vector<ByteSpan> *spans) {
+  if (spans == nullptr || spans->size() < 2) return;
+  std::sort(spans->begin(), spans->end(),
+            [](const ByteSpan &a, const ByteSpan &b) { return a.off < b.off; });
+  std::vector<ByteSpan> out;
+  out.reserve(spans->size());
+  ByteSpan cur = (*spans)[0];
+  const int64_t gap = 64 * 1024;
+  for (size_t i = 1; i < spans->size(); ++i) {
+    const ByteSpan &n = (*spans)[i];
+    if (n.off <= cur.off + cur.len + gap) {
+      const int64_t end = std::max(cur.off + cur.len, n.off + n.len);
+      cur.len = end - cur.off;
+    } else {
+      out.push_back(cur);
+      cur = n;
+    }
+  }
+  out.push_back(cur);
+  spans->swap(out);
+}
+
+void prefetch_needed(JavaHdfsFile *jf, const parquet::FileMetaData *md,
+                     const std::vector<int> &rgs, const std::vector<int> &read_idx) {
+  if (jf == nullptr || md == nullptr) return;
+  std::vector<ByteSpan> spans;
+  for (int rg : rgs) {
+    auto rgm = md->RowGroup(rg);
+    if (!rgm) continue;
+    for (int leaf : read_idx) {
+      if (leaf < 0 || leaf >= rgm->num_columns()) continue;
+      ByteSpan sp{};
+      if (col_chunk_span(rgm->ColumnChunk(leaf).get(), &sp)) {
+        spans.push_back(sp);
+      }
+    }
+  }
+  merge_spans(&spans);
+  int64_t bytes = 0;
+  for (const auto &sp : spans) {
+    auto st = jf->Prefetch(sp.off, sp.len);
+    if (!st.ok()) {
+      std::fprintf(stderr, "nativesql: pq prefetch miss off=%lld len=%lld %s\n",
+                   static_cast<long long>(sp.off), static_cast<long long>(sp.len),
+                   st.ToString().c_str());
+      std::fflush(stderr);
+    } else {
+      bytes += sp.len;
+    }
+  }
+  std::fprintf(stderr,
+               "nativesql: pq prefetch spans=%zu bytes=%lld fetched=%lld rgs=%zu cols=%zu\n",
+               spans.size(), static_cast<long long>(bytes),
+               static_cast<long long>(jf->fetched_bytes()), rgs.size(), read_idx.size());
+  std::fflush(stderr);
+}
+
 int read_one(const NsFileSplit &sp, const NsFileScan &scan, std::vector<std::vector<int64_t>> *i64,
              std::vector<std::vector<double>> *f64, std::vector<std::vector<uint8_t>> *b,
              int *nrows) {
   try {
-    std::lock_guard<std::mutex> lock(g_pq_mu);
     std::shared_ptr<arrow::io::RandomAccessFile> infile;
     std::shared_ptr<arrow::Buffer> owned;
     if (sp.bytes != nullptr && sp.nbytes > 0) {
@@ -980,6 +1316,9 @@ int read_one(const NsFileSplit &sp, const NsFileScan &scan, std::vector<std::vec
     for (int idx : read_idx) {
       if (idx < 0 || idx >= nleaf) return -1;
     }
+    if (auto *jf = dynamic_cast<JavaHdfsFile *>(infile.get())) {
+      prefetch_needed(jf, md.get(), rgs, read_idx);
+    }
     int total = 0;
     for (int rg : rgs) {
       std::shared_ptr<arrow::Table> table;
@@ -1086,10 +1425,69 @@ int read_one(const NsFileSplit &sp, const NsFileScan &scan, std::vector<std::vec
                                                 ci.begin(), ci.end());
         }
       }
-      total += pn;
+      int kept = pn;
+      if (scan.n_preds > 0 && scan.preds != nullptr && pn > 0) {
+        int w = 0;
+        for (int r = 0; r < pn; ++r) {
+          bool ok = true;
+          for (int p = 0; p < scan.n_preds && ok; ++p) {
+            const NsColPred &pr = scan.preds[p];
+            if (pr.col < 0 || pr.col >= scan.n_cols) continue;
+            const size_t c = static_cast<size_t>(pr.col);
+            const size_t idx = static_cast<size_t>(total + r);
+            int64_t v = 0;
+            if (idx < (*i64)[c].size()) v = (*i64)[c][idx];
+            else if (idx < (*f64)[c].size()) v = static_cast<int64_t>((*f64)[c][idx]);
+            switch (pr.op) {
+              case 1: ok = v == pr.value; break;
+              case 2: ok = v >= pr.value; break;
+              case 3: ok = v <= pr.value; break;
+              case 4: ok = v > pr.value; break;
+              case 5: ok = v < pr.value; break;
+              default: break;
+            }
+          }
+          if (!ok) continue;
+          if (w != r) {
+            for (int c = 0; c < scan.n_cols; ++c) {
+              const size_t src = static_cast<size_t>(total + r);
+              const size_t dst = static_cast<size_t>(total + w);
+              if (src < (*i64)[static_cast<size_t>(c)].size()) {
+                (*i64)[static_cast<size_t>(c)][dst] = (*i64)[static_cast<size_t>(c)][src];
+              }
+              if (src < (*f64)[static_cast<size_t>(c)].size()) {
+                (*f64)[static_cast<size_t>(c)][dst] = (*f64)[static_cast<size_t>(c)][src];
+              }
+              if (src < (*b)[static_cast<size_t>(c)].size()) {
+                (*b)[static_cast<size_t>(c)][dst] = (*b)[static_cast<size_t>(c)][src];
+              }
+            }
+          }
+          w += 1;
+        }
+        for (int c = 0; c < scan.n_cols; ++c) {
+          const size_t keep = static_cast<size_t>(total + w);
+          if ((*i64)[static_cast<size_t>(c)].size() > keep) {
+            (*i64)[static_cast<size_t>(c)].resize(keep);
+          }
+          if ((*f64)[static_cast<size_t>(c)].size() > keep) {
+            (*f64)[static_cast<size_t>(c)].resize(keep);
+          }
+          if ((*b)[static_cast<size_t>(c)].size() > keep) {
+            (*b)[static_cast<size_t>(c)].resize(keep);
+          }
+        }
+        kept = w;
+      }
+      total += kept;
     }
     *nrows = total;
-    std::fprintf(stderr, "nativesql: pq ok rows=%d rgs=%zu\n", total, rgs.size());
+    int64_t fetched = -1;
+    if (auto *jf = dynamic_cast<JavaHdfsFile *>(infile.get())) {
+      fetched = jf->fetched_bytes();
+    }
+    std::fprintf(stderr, "nativesql: pq ok rows=%d rgs=%zu fetched=%lld\n", total,
+                 rgs.size(), static_cast<long long>(fetched));
     std::fflush(stderr);
     return 0;
   } catch (...) {

@@ -17,9 +17,12 @@
 
 package org.apache.spark.sql.execution.nativesql
 
-import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, IntegerLiteral, NamedExpression, SortOrder}
+import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.plans.physical.IdentityBroadcastMode
-import org.apache.spark.sql.execution.{FileSourceScanExec, ProjectExec, SparkPlan, SparkStrategy}
+import org.apache.spark.sql.execution.{
+  FileSourceScanExec, GlobalLimitExec, LocalLimitExec, ProjectExec, SortExec, SparkPlan,
+  SparkStrategy, TakeOrderedAndProjectExec, UnionExec}
 import org.apache.spark.sql.execution.datasources.{FileSourceStrategy, HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.execution.exchange.BroadcastExchangeExec
 import org.apache.spark.sql.internal.SQLConf
@@ -41,26 +44,94 @@ object NativeSqlStrategy extends SparkStrategy {
       Nil
     } else {
       val rewritten = NativePhysicalRewrites.rewrite(plan)
-      NativeSqlPlan.compile(rewritten) match {
-        case Some(compiled) if compiled.hasFileLeaf =>
-          planFileBacked(compiled)
-        case Some(compiled) =>
-          NativeSqlExec(compiled, Nil) :: Nil
+      NativeSqlPlan.compileSharedBucketsPlan(rewritten).flatMap { case (compiled, cases) =>
+        val planned = planFileBacked(compiled)
+        if (planned.nonEmpty) Some(ProjectExec(cases, planned.head)) else None
+      } match {
+        case Some(p) => p :: Nil
         case None =>
-          rewritten match {
-            case Project(plist, child) =>
-              NativeSqlPlan.compile(child) match {
-                case Some(compiled) if compiled.hasFileLeaf =>
-                  planFileBacked(compiled).map(n => ProjectExec(plist, n))
-                case Some(compiled) =>
-                  ProjectExec(plist, NativeSqlExec(compiled, Nil)) :: Nil
-                case _ =>
-                  Nil
-              }
-            case _ =>
-              Nil
+          NativeSqlPlan.compile(rewritten) match {
+            case Some(compiled) if compiled.hasFileLeaf =>
+              val planned = planFileBacked(compiled)
+              if (planned.nonEmpty) planned else planHybridTop(rewritten)
+            case Some(compiled) =>
+              NativeSqlExec(compiled, Nil) :: Nil
+            case None =>
+              planHybridTop(rewritten)
           }
       }
+    }
+  }
+
+  /**
+   * Nodes we do not compile to IR (Sort/Limit, two-fact Union, identity Project)
+   * stay in Spark. The child is still offloaded when [[NativeSqlPlan.compile]]
+   * succeeds. File-backed Sort stays out of C++ so Spark can TakeOrdered.
+   */
+  private def planHybridTop(plan: LogicalPlan): Seq[SparkPlan] = plan match {
+    case ReturnAnswer(child) =>
+      planHybridTop(child)
+    case Limit(IntegerLiteral(n), Sort(order, true, child, _)) =>
+      planNativeChild(child).map(c => takeOrdered(n, order, child.output, c))
+    case Limit(IntegerLiteral(n), Project(plist, Sort(order, true, child, _))) =>
+      planNativeChild(child).map(c => takeOrdered(n, order, plist, c))
+    case GlobalLimit(IntegerLiteral(n), Sort(order, true, child, _)) =>
+      planNativeChild(child).map(c => takeOrdered(n, order, child.output, c))
+    case GlobalLimit(IntegerLiteral(n), LocalLimit(IntegerLiteral(_), child)) =>
+      planNativeChild(child).map(c => GlobalLimitExec(n, LocalLimitExec(n, c)))
+    case GlobalLimit(IntegerLiteral(n), child) =>
+      planNativeChild(child).map(c => GlobalLimitExec(n, c))
+    case LocalLimit(IntegerLiteral(n), child) =>
+      planNativeChild(child).map(c => LocalLimitExec(n, c))
+    case Sort(order, global, child, _) =>
+      planNativeChild(child).map(c => SortExec(order, global, c))
+    case Project(plist, child) =>
+      NativeSqlPlan.compileSharedBuckets(plist, child) match {
+        case Some((compiled, cases)) =>
+          val planned = planFileBacked(compiled)
+          if (planned.nonEmpty) ProjectExec(cases, planned.head) :: Nil else Nil
+        case None if isIdentityProject(plist) =>
+          planNativeChild(child).map(n => ProjectExec(plist, n))
+        case None =>
+          Nil
+      }
+    case u: Union =>
+      val kids = u.children.map(c => apply(c))
+      if (kids.nonEmpty && kids.forall(_.nonEmpty)) {
+        UnionExec(kids.map(_.head)) :: Nil
+      } else {
+        Nil
+      }
+    case _ =>
+      Nil
+  }
+
+  private def planNativeChild(child: LogicalPlan): Seq[SparkPlan] = {
+    NativeSqlPlan.compile(child) match {
+      case Some(compiled) if compiled.hasFileLeaf =>
+        val planned = planFileBacked(compiled)
+        if (planned.nonEmpty) planned else planHybridTop(child)
+      case Some(compiled) =>
+        NativeSqlExec(compiled, Nil) :: Nil
+      case None =>
+        planHybridTop(child)
+    }
+  }
+
+  private def takeOrdered(
+      n: Int,
+      order: Seq[SortOrder],
+      projectList: Seq[NamedExpression],
+      child: SparkPlan): SparkPlan = {
+    TakeOrderedAndProjectExec(n, order, projectList, child)
+  }
+
+  /** Reorder / rename only. Do not eval substr or other ops on hashed strings. */
+  private def isIdentityProject(plist: Seq[NamedExpression]): Boolean = {
+    plist.forall {
+      case _: Attribute => true
+      case Alias(_: Attribute, _) => true
+      case _ => false
     }
   }
 

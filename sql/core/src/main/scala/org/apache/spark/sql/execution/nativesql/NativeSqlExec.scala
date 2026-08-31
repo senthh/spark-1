@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.execution.nativesql
 
+import scala.reflect.ClassTag
+
 import org.apache.spark.{Partition, TaskContext}
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.deploy.SparkHadoopUtil
@@ -68,6 +70,16 @@ case class NativeSqlExec(
     } else {
       executeInMemory()
     }
+  }
+
+  /**
+   * Leftover Spark parents (BHJ build via IdentityBroadcast, CollectLimit)
+   * call executeBroadcast. Collect the native result instead of throwing
+   * the empty UnsupportedOperationException that aborted Q3/Q6/Q8/Q10/Q11.
+   */
+  override protected[sql] def doExecuteBroadcast[T](): Broadcast[T] = {
+    sparkContext.broadcast(executeCollect().asInstanceOf[T])(
+      ClassTag.AnyRef.asInstanceOf[ClassTag[T]])
   }
 
   override def executeCollect(): Array[InternalRow] = {
@@ -142,7 +154,7 @@ case class NativeSqlExec(
       var depth = 0
       var s = p
       var seen = 0
-      while (s > 0 && seen < 4) {
+      while (s > 0 && seen < 8) {
         s -= 1
         if (ir.charAt(s) == ')') {
           depth += 1
@@ -150,7 +162,10 @@ case class NativeSqlExec(
           if (depth == 0) {
             val slice = ir.substring(s, p)
             if (slice.startsWith("(project") || slice.startsWith("(filter") ||
-                slice.startsWith("(scan")) {
+                slice.startsWith("(scan") || slice.startsWith("(hashagg") ||
+                slice.startsWith("(segagg") ||
+                slice.startsWith("(hashjoin") || slice.startsWith("(hashsemi") ||
+                slice.startsWith("(sort") || slice.startsWith("(union")) {
               colRe.findAllMatchIn(slice).foreach { m =>
                 cols += m.group(1).toInt
               }

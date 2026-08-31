@@ -84,6 +84,41 @@ int main() {
   if (out.n_rows != 8) fail("agg groups");
   ns_batch_free(&out);
 
+  /* two quantity buckets: 1-20 and 21-40; qty 45 is dropped */
+  {
+    int64_t qty[4] = {1, 5, 25, 45};
+    int64_t disc[4] = {10, 20, 30, 40};
+    int64_t prof[4] = {1, 2, 3, 4};
+    NsCol sc[3];
+    sc[0].type = NS_I64;
+    sc[0].n_rows = 4;
+    sc[0].data = qty;
+    sc[1].type = NS_I64;
+    sc[1].n_rows = 4;
+    sc[1].data = disc;
+    sc[2].type = NS_I64;
+    sc[2].n_rows = 4;
+    sc[2].data = prof;
+    NsBatch sb;
+    sb.n_cols = 3;
+    sb.n_rows = 4;
+    sb.cols = sc;
+    if (ns_execute(
+            "(segagg c0 (list 1i64 20i64 21i64 40i64) "
+            "(list (count) (sum c1) (count c1) (sum c2) (count c2)) (scan 0))",
+            &sb, 1, &out) != 0) {
+      fail("segagg");
+    }
+    if (out.n_rows != 1 || out.n_cols != 10) fail("segagg shape");
+    const int64_t *c0 = static_cast<const int64_t *>(out.cols[0].data);
+    const int64_t *s1 = static_cast<const int64_t *>(out.cols[1].data);
+    const int64_t *c5 = static_cast<const int64_t *>(out.cols[5].data);
+    const int64_t *s6 = static_cast<const int64_t *>(out.cols[6].data);
+    if (c0[0] != 2 || s1[0] != 30) fail("segagg bucket0");
+    if (c5[0] != 1 || s6[0] != 30) fail("segagg bucket1");
+    ns_batch_free(&out);
+  }
+
   int64_t rids[3] = {1, 3, 9};
   int64_t rvals[3] = {100, 300, 900};
   NsCol rcols[2];

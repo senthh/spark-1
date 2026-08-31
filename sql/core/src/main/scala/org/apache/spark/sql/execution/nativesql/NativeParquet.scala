@@ -20,7 +20,7 @@ package org.apache.spark.sql.execution.nativesql
 import java.io.File
 
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FileUtil, Path}
+import org.apache.hadoop.fs.Path
 
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.execution.FileSourceScanExec
@@ -82,8 +82,7 @@ object NativeParquet {
 
   /**
    * JNI scan spec: paths, starts, lengths, blobs, names, types, preds.
-   * HDFS files <= 16MB are opened in C++ via Hadoop FS (no /tmp copy).
-   * Larger fact files are copied locally until random HDFS reads are stable.
+   * Remote files stay as HDFS URIs. C++ reads them through Hadoop FS.
    */
   def scanSpec(
       files: Array[PartitionedFile],
@@ -97,7 +96,6 @@ object NativeParquet {
     val starts = new Array[Long](n)
     val lengths = new Array[Long](n)
     val blobs = new Array[AnyRef](n)
-    val temps = new java.util.ArrayList[File]()
     var i = 0
     while (i < n) {
       val f = files(i)
@@ -105,12 +103,8 @@ object NativeParquet {
       val local = localFile(hp)
       if (local != null) {
         paths(i) = local
-      } else if (remoteLen(hp, hadoopConf) <= 16L * 1024 * 1024) {
-        paths(i) = hp.toString
       } else {
-        val tmp = copyToLocal(hp, hadoopConf)
-        paths(i) = tmp.getAbsolutePath
-        temps.add(tmp)
+        paths(i) = hp.toString
       }
       blobs(i) = null
       starts(i) = f.start
@@ -126,7 +120,7 @@ object NativeParquet {
     new PreparedScan(
       Array(paths, starts, lengths, blobs, names, types,
         Array(pcols, pops, pvals).asInstanceOf[Array[AnyRef]]),
-      temps.toArray(new Array[File](0)))
+      Array.empty[File])
   }
 
   /** Integer comparisons Spark already pushed as dataFilters (plus AND / BETWEEN). */
@@ -225,22 +219,4 @@ object NativeParquet {
     }
   }
 
-  private def remoteLen(p: Path, conf: Configuration): Long = {
-    try {
-      p.getFileSystem(conf).getFileStatus(p).getLen
-    } catch {
-      case _: Exception => Long.MaxValue
-    }
-  }
-
-  private def copyToLocal(p: Path, conf: Configuration): File = {
-    val fs = p.getFileSystem(conf)
-    val tmp = File.createTempFile("nativesql-", ".parquet")
-    tmp.deleteOnExit()
-    if (!FileUtil.copy(fs, p, tmp, false, conf)) {
-      tmp.delete()
-      throw new IllegalStateException(s"cannot copy parquet to local: $p")
-    }
-    tmp
-  }
 }
