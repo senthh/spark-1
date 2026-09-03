@@ -15,10 +15,10 @@ case class MorselScanExec(
   override protected def doExecute(): RDD[InternalRow] = {
     val columnNames = output.map(_.name).toArray
     
-    // Strip URI schemes (file://, hdfs://) to get plain filesystem path
+    // Strip URI schemes (file:/, file://, hdfs://) to get plain filesystem path
     val cleanPath = filePath
-      .replaceFirst("^file://", "")
-      .replaceFirst("^hdfs://[^/]+", "")
+      .replaceFirst("^file:/+", "")
+      .replaceFirst("^hdfs:/+[^/]*", "")
     
     sparkContext.parallelize(Seq(cleanPath), 1).mapPartitions { iter =>
       if (!iter.hasNext) {
