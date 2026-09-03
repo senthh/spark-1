@@ -9,8 +9,14 @@
 #include "morsel_scheduler.h"
 #include <arrow/compute/api.h>
 #include <arrow/io/file.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <parquet/arrow/reader.h>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
+#include <utility>
 
 // Platform-specific SIMD includes
 #if defined(__x86_64__) || defined(_M_X64)
@@ -22,6 +28,111 @@
 
 namespace morsel {
 
+inline int64_t parquet_footer_rows(const std::string& path) {
+  auto file_result = arrow::io::ReadableFile::Open(path);
+  if (!file_result.ok()) {
+    throw std::runtime_error("Cannot open: " + path);
+  }
+  std::unique_ptr<parquet::arrow::FileReader> reader;
+  auto status = parquet::arrow::OpenFile(
+      file_result.ValueUnsafe(), arrow::default_memory_pool(), &reader);
+  if (!status.ok() || !reader) {
+    throw std::runtime_error("Cannot create reader: " + path);
+  }
+  return reader->parquet_reader()->metadata()->num_rows();
+}
+
+inline bool value_i64(const std::shared_ptr<arrow::Array>& a, int64_t i, int64_t* out) {
+  if (!a || i < 0 || i >= a->length() || a->IsNull(i)) {
+    return false;
+  }
+  switch (a->type_id()) {
+    case arrow::Type::INT8:
+      *out = std::static_pointer_cast<arrow::Int8Array>(a)->Value(i);
+      return true;
+    case arrow::Type::INT16:
+      *out = std::static_pointer_cast<arrow::Int16Array>(a)->Value(i);
+      return true;
+    case arrow::Type::INT32:
+      *out = std::static_pointer_cast<arrow::Int32Array>(a)->Value(i);
+      return true;
+    case arrow::Type::INT64:
+      *out = std::static_pointer_cast<arrow::Int64Array>(a)->Value(i);
+      return true;
+    case arrow::Type::UINT32:
+      *out = static_cast<int64_t>(
+          std::static_pointer_cast<arrow::UInt32Array>(a)->Value(i));
+      return true;
+    case arrow::Type::FLOAT:
+      *out = static_cast<int64_t>(
+          std::static_pointer_cast<arrow::FloatArray>(a)->Value(i));
+      return true;
+    case arrow::Type::DOUBLE:
+      *out = static_cast<int64_t>(
+          std::static_pointer_cast<arrow::DoubleArray>(a)->Value(i));
+      return true;
+    case arrow::Type::DECIMAL128: {
+      auto dec = std::static_pointer_cast<arrow::Decimal128Array>(a);
+      arrow::Decimal128 d(dec->GetValue(i));
+      auto as_int = d.ToInteger<int64_t>();
+      if (!as_int.ok()) {
+        return false;
+      }
+      *out = *as_int;
+      return true;
+    }
+    case arrow::Type::STRING: {
+      try {
+        *out = std::stoll(
+            std::static_pointer_cast<arrow::StringArray>(a)->GetString(i));
+        return true;
+      } catch (...) {
+        return false;
+      }
+    }
+    default:
+      return false;
+  }
+}
+
+inline bool value_f64(const std::shared_ptr<arrow::Array>& a, int64_t i, double* out) {
+  if (!a || i < 0 || i >= a->length() || a->IsNull(i)) {
+    return false;
+  }
+  switch (a->type_id()) {
+    case arrow::Type::DOUBLE:
+      *out = std::static_pointer_cast<arrow::DoubleArray>(a)->Value(i);
+      return true;
+    case arrow::Type::FLOAT:
+      *out = std::static_pointer_cast<arrow::FloatArray>(a)->Value(i);
+      return true;
+    case arrow::Type::DECIMAL128: {
+      auto dec = std::static_pointer_cast<arrow::Decimal128Array>(a);
+      auto* ty = static_cast<const arrow::Decimal128Type*>(a->type().get());
+      arrow::Decimal128 d(dec->GetValue(i));
+      *out = d.ToDouble(ty->scale());
+      return true;
+    }
+    case arrow::Type::STRING: {
+      try {
+        *out = std::stod(
+            std::static_pointer_cast<arrow::StringArray>(a)->GetString(i));
+        return true;
+      } catch (...) {
+        return false;
+      }
+    }
+    default: {
+      int64_t v = 0;
+      if (!value_i64(a, i, &v)) {
+        return false;
+      }
+      *out = static_cast<double>(v);
+      return true;
+    }
+  }
+}
+
 // ============================================================================
 // ParquetScanOperator: Streaming parquet scan with morsels
 // Based on DuckDB's ParquetScan
@@ -30,9 +141,16 @@ class ParquetScanOperator : public Operator {
 private:
   std::string file_path;
   std::vector<std::string> column_names;
+  std::vector<int> column_indices;
+  // No column values are needed (COUNT(*) shape). The footer already carries
+  // per-row-group counts, so the data pages are never touched.
+  bool count_only = false;
+  std::shared_ptr<parquet::FileMetaData> file_metadata;
   std::unique_ptr<parquet::arrow::FileReader> reader;
+  std::vector<std::unique_ptr<parquet::arrow::FileReader>> thread_readers;
   std::atomic<int> current_row_group{0};
-  int total_row_groups;
+  std::atomic<int64_t> rows_read{0};
+  int total_row_groups = 0;
   std::mutex reader_mutex;
 
 public:
@@ -58,40 +176,111 @@ public:
       throw std::runtime_error("Cannot create reader");
     }
 
-    total_row_groups = reader->parquet_reader()->metadata()->num_row_groups();
+    file_metadata = reader->parquet_reader()->metadata();
+    total_row_groups = file_metadata->num_row_groups();
+
+    // An empty projection means "no columns needed", not "all columns".
+    count_only = column_names.empty();
+
+    if (!column_names.empty()) {
+      std::shared_ptr<arrow::Schema> schema;
+      auto gs = reader->GetSchema(&schema);
+      if (!gs.ok() || !schema) {
+        throw std::runtime_error("Cannot read schema");
+      }
+      for (const auto& name : column_names) {
+        const int idx = schema->GetFieldIndex(name);
+        if (idx < 0) {
+          throw std::runtime_error("Missing column: " + name);
+        }
+        column_indices.push_back(idx);
+      }
+    }
+  }
+
+  parquet::arrow::FileReader* reader_for(int thread_id) {
+    if (thread_id < 0) {
+      thread_id = 0;
+    }
+    std::lock_guard<std::mutex> lock(reader_mutex);
+    if (thread_readers.size() <= static_cast<size_t>(thread_id)) {
+      thread_readers.resize(static_cast<size_t>(thread_id) + 1);
+    }
+    if (!thread_readers[thread_id]) {
+      auto file_result = arrow::io::ReadableFile::Open(file_path);
+      if (!file_result.ok()) {
+        throw std::runtime_error("Cannot open: " + file_path);
+      }
+      auto st = parquet::arrow::OpenFile(
+          file_result.ValueUnsafe(), arrow::default_memory_pool(),
+          &thread_readers[thread_id]);
+      if (!st.ok()) {
+        throw std::runtime_error("Cannot create per-thread reader");
+      }
+    }
+    return thread_readers[thread_id].get();
+  }
+
+  int row_groups() const { return total_row_groups; }
+
+  int64_t total_rows_read() const {
+    return rows_read.load(std::memory_order_acquire);
+  }
+
+  // Read a specific row group. morsel_id on the token is the row-group index.
+  std::shared_ptr<Morsel> read_row_group(int rg, int thread_id = 0) {
+    if (rg < 0 || rg >= total_row_groups) {
+      return nullptr;
+    }
+
+    if (count_only) {
+      rows_read.fetch_add(file_metadata->RowGroup(rg)->num_rows(),
+                          std::memory_order_relaxed);
+      return nullptr;
+    }
+
+    parquet::arrow::FileReader* rdr = nullptr;
+    try {
+      rdr = reader_for(thread_id);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "morsel: reader_for failed: %s\n", e.what());
+      std::fflush(stderr);
+      return nullptr;
+    }
+
+    std::shared_ptr<arrow::Table> table;
+    arrow::Status status = column_indices.empty()
+      ? rdr->ReadRowGroup(rg, &table)
+      : rdr->ReadRowGroup(rg, column_indices, &table);
+    if (!status.ok() || !table) {
+      std::fprintf(stderr, "morsel: ReadRowGroup %d failed: %s\n",
+                   rg, status.ToString().c_str());
+      std::fflush(stderr);
+      return nullptr;
+    }
+
+    auto batch_result = table->CombineChunksToBatch();
+    if (!batch_result.ok()) {
+      std::fprintf(stderr, "morsel: CombineChunks rg=%d failed: %s\n",
+                   rg, batch_result.status().ToString().c_str());
+      std::fflush(stderr);
+      return nullptr;
+    }
+
+    auto batch = *batch_result;
+    rows_read.fetch_add(batch->num_rows(), std::memory_order_relaxed);
+    return std::make_shared<Morsel>(batch, 0, batch->num_rows(), rg, rg);
   }
 
   std::shared_ptr<Morsel> process_morsel(
       std::shared_ptr<Morsel> input,
       ExecutionContext* ctx) override {
-
-    // Get next row group atomically
-    int rg = current_row_group.fetch_add(1);
-    if (rg >= total_row_groups) {
-      return nullptr;  // No more row groups
-    }
-
-    // Read row group
-    std::shared_ptr<arrow::Table> table;
-    {
-      std::lock_guard<std::mutex> lock(reader_mutex);
-      auto status = reader->ReadRowGroup(rg, &table);
-      if (!status.ok()) {
-        return nullptr;
-      }
-    }
-
-    // Convert to RecordBatch
-    auto batch_result = table->CombineChunksToBatch();
-    if (!batch_result.ok()) {
-      return nullptr;
-    }
-
-    auto batch = *batch_result;
-
-    // Return as morsel
-    return std::make_shared<Morsel>(
-      batch, 0, batch->num_rows(), rg, 0);
+    (void)ctx;
+    const int rg = (input && input->morsel_id >= 0)
+      ? input->morsel_id
+      : current_row_group.fetch_add(1);
+    const int tid = ctx ? ctx->thread_id : 0;
+    return read_row_group(rg, tid);
   }
 
   const char* name() const override { return "ParquetScan"; }
@@ -120,28 +309,37 @@ public:
     if (!input) return nullptr;
 
     auto batch = input->slice();
-    auto column = batch->column(column_index);
-
-    // Use Arrow compute for now (it uses SIMD internally)
-    // TODO: Implement custom AVX-512 filter like DuckDB
-    arrow::compute::ExecContext exec_ctx(ctx->pool);
-
-    // Map CompareOperator to function name (Arrow 15+ removed CompareOperatorToFunctionName)
-    std::string func_name;
-    if (op == arrow::compute::CompareOperator::GREATER) func_name = "greater";
-    else if (op == arrow::compute::CompareOperator::LESS) func_name = "less";
-    else if (op == arrow::compute::CompareOperator::EQUAL) func_name = "equal";
-    else func_name = "greater";  // default
-
-    auto compare_result = arrow::compute::CallFunction(
-      func_name,
-      {column, literal}, &exec_ctx);
-
-    if (!compare_result.ok()) {
+    if (column_index < 0 || column_index >= batch->num_columns()) {
       return nullptr;
     }
+    auto column = batch->column(column_index);
 
-    auto filter_array = compare_result->make_array();
+    int64_t lit = 0;
+    if (literal && literal->is_valid &&
+        literal->type->id() == arrow::Type::INT64) {
+      lit = std::static_pointer_cast<arrow::Int64Scalar>(literal)->value;
+    }
+
+    arrow::BooleanBuilder mask;
+    (void)mask.Reserve(batch->num_rows());
+    for (int64_t i = 0; i < batch->num_rows(); i++) {
+      int64_t v = 0;
+      bool keep = value_i64(column, i, &v);
+      if (keep) {
+        if (op == arrow::compute::CompareOperator::GREATER) keep = v > lit;
+        else if (op == arrow::compute::CompareOperator::LESS) keep = v < lit;
+        else if (op == arrow::compute::CompareOperator::EQUAL) keep = v == lit;
+        else if (op == arrow::compute::CompareOperator::GREATER_EQUAL) keep = v >= lit;
+        else if (op == arrow::compute::CompareOperator::LESS_EQUAL) keep = v <= lit;
+        else keep = v > lit;
+      }
+      (void)mask.Append(keep);
+    }
+    std::shared_ptr<arrow::Array> filter_array;
+    if (!mask.Finish(&filter_array).ok()) {
+      return nullptr;
+    }
+    arrow::compute::ExecContext exec_ctx(ctx->pool);
 
     // Apply filter
     arrow::compute::FilterOptions filter_opts;
@@ -214,9 +412,13 @@ private:
   std::vector<std::string> aggregate_functions;  // "sum", "count", etc.
 
   // Thread-local hash tables (one per thread)
+  struct AggAcc {
+    int64_t count = 0;
+    double sum = 0;
+  };
+
   struct AggregateState {
-    std::unordered_map<int64_t, std::vector<int64_t>> hash_table;
-    std::mutex mutex;
+    std::unordered_map<int64_t, AggAcc> hash_table;
   };
 
   std::vector<std::unique_ptr<AggregateState>> thread_states;
@@ -244,34 +446,33 @@ public:
     if (!input) return nullptr;
 
     auto batch = input->slice();
+    if (!ctx || ctx->thread_id < 0 ||
+        static_cast<size_t>(ctx->thread_id) >= thread_states.size()) {
+      return nullptr;
+    }
     auto* state = thread_states[ctx->thread_id].get();
 
-    // Simple aggregation: group by first column, sum second column
-    // TODO: Generalize for multiple group-by columns and aggregates
     if (group_by_columns.size() != 1 || aggregate_columns.size() != 1) {
-      return nullptr;  // Not implemented yet
+      return nullptr;
     }
 
     int group_col = group_by_columns[0];
     int agg_col = aggregate_columns[0];
+    if (group_col < 0 || group_col >= batch->num_columns() ||
+        agg_col < 0 || agg_col >= batch->num_columns()) {
+      return nullptr;
+    }
 
-    auto group_array = std::static_pointer_cast<arrow::Int64Array>(
-      batch->column(group_col));
-    auto agg_array = std::static_pointer_cast<arrow::Int64Array>(
-      batch->column(agg_col));
+    auto group_array = batch->column(group_col);
+    auto agg_array = batch->column(agg_col);
 
-    // Thread-local aggregation (no lock needed)
     for (int64_t i = 0; i < batch->num_rows(); i++) {
-      if (!group_array->IsNull(i) && !agg_array->IsNull(i)) {
-        int64_t key = group_array->Value(i);
-        int64_t value = agg_array->Value(i);
-
+      int64_t key = 0;
+      double value = 0;
+      if (value_i64(group_array, i, &key) && value_f64(agg_array, i, &value)) {
         auto& entry = state->hash_table[key];
-        if (entry.empty()) {
-          entry.resize(2);  // [count, sum]
-        }
-        entry[0]++;        // count
-        entry[1] += value; // sum
+        entry.count++;
+        entry.sum += value;
       }
     }
 
@@ -282,28 +483,21 @@ public:
   std::shared_ptr<arrow::RecordBatch> finalize(
       ExecutionContext* ctx) override {
 
-    // Merge all thread-local hash tables
-    std::unordered_map<int64_t, std::vector<int64_t>> merged;
-
+    std::unordered_map<int64_t, AggAcc> merged;
     for (auto& state : thread_states) {
       for (auto& [key, values] : state->hash_table) {
         auto& entry = merged[key];
-        if (entry.empty()) {
-          entry = values;
-        } else {
-          entry[0] += values[0];  // count
-          entry[1] += values[1];  // sum
-        }
+        entry.count += values.count;
+        entry.sum += values.sum;
       }
     }
 
-    // Convert to Arrow RecordBatch
     arrow::Int64Builder key_builder;
-    arrow::Int64Builder sum_builder;
+    arrow::DoubleBuilder sum_builder;
 
     for (auto& [key, values] : merged) {
       (void)key_builder.Append(key);
-      (void)sum_builder.Append(values[1]);  // sum
+      (void)sum_builder.Append(values.sum);
     }
 
     std::shared_ptr<arrow::Array> key_array, sum_array;
@@ -312,7 +506,7 @@ public:
 
     auto schema = arrow::schema({
       arrow::field("group_key", arrow::int64()),
-      arrow::field("sum", arrow::int64())
+      arrow::field("sum", arrow::float64())
     });
 
     return arrow::RecordBatch::Make(

@@ -37,31 +37,31 @@ int main(int argc, char** argv) {
       "ss_sold_date_sk", "ss_item_sk", "ss_quantity", "ss_sales_price"
     };
     auto scan = std::make_shared<ParquetScanOperator>(file_path, columns);
+    const int nrg = scan->row_groups();
+    std::cout << "Row groups: " << nrg << "\n";
+    std::cout << "Footer rows: " << parquet_footer_rows(file_path) << "\n";
     pipeline->add_operator(scan);
 
-    // Filter: ss_quantity > 10
-    auto filter_literal = std::make_shared<arrow::Int64Scalar>(10);
-    auto filter = std::make_shared<FilterOperator>(
-      2,  // ss_quantity column
-      arrow::compute::CompareOperator::GREATER,
-      filter_literal);
-    pipeline->add_operator(filter);
+    const bool apply_filter = argc > 3 && std::string(argv[3]) == "filter";
+    if (apply_filter) {
+      // Filter: column 2 > 10 (store_sales.ss_quantity when present)
+      auto filter_literal = std::make_shared<arrow::Int64Scalar>(10);
+      auto filter = std::make_shared<FilterOperator>(
+        2,
+        arrow::compute::CompareOperator::GREATER,
+        filter_literal);
+      pipeline->add_operator(filter);
 
-    // Project: select first 3 columns
-    auto project = std::make_shared<ProjectOperator>(
-      std::vector<int>{0, 1, 2});
-    pipeline->add_operator(project);
+      auto project = std::make_shared<ProjectOperator>(
+        std::vector<int>{0, 1, 2});
+      pipeline->add_operator(project);
+    }
 
-    // Add pipeline
     scheduler.add_pipeline(pipeline);
+    scheduler.schedule_row_groups(0, nrg);
 
-    // Benchmark execution
     auto start = high_resolution_clock::now();
-
-    // Start scheduler
     scheduler.start();
-
-    // Wait for completion
     scheduler.wait_for_completion();
 
     auto end = high_resolution_clock::now();
@@ -79,7 +79,16 @@ int main(int argc, char** argv) {
       total_rows += batch->num_rows();
     }
 
+    std::cout << "Scan rows: " << scan->total_rows_read() << "\n";
     std::cout << "Total rows: " << total_rows << "\n";
+    if (total_rows == 0 && scan->total_rows_read() == 0 && nrg > 0) {
+      std::cerr << "ERROR: scheduled " << nrg
+                << " row groups but produced 0 rows\n";
+      if (!scheduler.error_message().empty()) {
+        std::cerr << "Worker error: " << scheduler.error_message() << "\n";
+      }
+      return 1;
+    }
 
     if (!results.empty()) {
       std::cout << "Schema: " << results[0]->schema()->ToString() << "\n";
