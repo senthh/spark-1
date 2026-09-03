@@ -152,13 +152,11 @@ Java_org_apache_spark_sql_execution_morsel_MorselEngine_scanParquet(
   }
 }
 
-JNIEXPORT jint JNICALL
+JNIEXPORT jlong JNICALL
 Java_org_apache_spark_sql_execution_morsel_MorselEngine_getBatchRows(
     JNIEnv*, jclass, jlong batch_handle) {
   auto* r = reinterpret_cast<MorselScanResult*>(batch_handle);
-  if (!r) return 0;
-  if (r->num_rows > static_cast<int64_t>(INT32_MAX)) return INT32_MAX;
-  return static_cast<jint>(r->num_rows);
+  return r ? static_cast<jlong>(r->num_rows) : 0;
 }
 
 JNIEXPORT jint JNICALL

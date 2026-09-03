@@ -198,6 +198,11 @@ private:
   std::atomic<int> outstanding{0};
   std::mutex done_mu;
   std::condition_variable done_cv;
+
+  // Idle workers block here instead of spinning. Spinning burned CPU that the
+  // JVM's own executor threads need, for the whole duration of every query.
+  std::mutex work_mu;
+  std::condition_variable work_cv;
   std::mutex error_mutex;
   std::string last_error;
 
@@ -206,6 +211,15 @@ private:
     last_error = msg;
     std::fprintf(stderr, "morsel: worker error: %s\n", msg.c_str());
     std::fflush(stderr);
+  }
+
+  bool has_work() const {
+    for (const auto& q : work_queues) {
+      if (q && !q->empty()) {
+        return true;
+      }
+    }
+    return false;
   }
 
   void complete_one() {
@@ -249,7 +263,10 @@ private:
       }
 
       if (!did_work) {
-        std::this_thread::yield();
+        std::unique_lock<std::mutex> lock(work_mu);
+        work_cv.wait_for(lock, std::chrono::milliseconds(1), [this] {
+          return has_work() || !running.load(std::memory_order_relaxed);
+        });
       }
     }
   }
@@ -269,6 +286,8 @@ public:
   ~MorselScheduler() {
     stop();
   }
+
+  int thread_count() const { return num_threads; }
 
   // Add a pipeline to execute
   void add_pipeline(std::shared_ptr<Pipeline> pipeline) {
@@ -295,6 +314,7 @@ public:
       outstanding.fetch_add(1, std::memory_order_relaxed);
       work_queues[pipeline_id]->push(morsel);
     }
+    work_cv.notify_all();
   }
 
   // One token per row group. morsel_id is the row-group index the scan reads.
@@ -309,6 +329,7 @@ public:
       work_queues[pipeline_id]->push(
         std::make_shared<Morsel>(nullptr, 0, 0, 0, i));
     }
+    work_cv.notify_all();
   }
 
   void schedule_units(int pipeline_id, int n) {
@@ -357,6 +378,7 @@ public:
   void stop() {
     if (running.load(std::memory_order_relaxed)) {
       running.store(false, std::memory_order_relaxed);
+      work_cv.notify_all();
 
       for (auto& worker : workers) {
         if (worker.joinable()) {

@@ -48,20 +48,24 @@ class MorselColumnarRule extends ColumnarRule {
               case _ => agg
             }
 
-          case scan: FileSourceScanExec =>
-            val paths = scan.relation.location.rootPaths
-            if (paths.isEmpty) {
-              scan
-            } else {
-              MorselScanExec(
-                filePath = paths.head.toString,
-                output = scan.output,
-                filterCol = -1,
-                filterValue = 0)
-            }
+          // MorselScanExec reports a row count and no column values, so it can
+          // only replace a scan that feeds nothing but row counts downstream.
+          // Rewriting a scan whose columns are actually read would silently
+          // return empty rows instead of data.
+          case scan: FileSourceScanExec if servesRowCountsOnly(scan) =>
+            scan.relation.location.rootPaths.headOption
+              .map(p => MorselScanExec(filePath = p.toString, output = scan.output))
+              .getOrElse(scan)
         }
       }
     }
+  }
+
+  private def servesRowCountsOnly(scan: FileSourceScanExec): Boolean = {
+    scan.output.isEmpty &&
+      scan.requiredSchema.isEmpty &&
+      scan.dataFilters.isEmpty &&
+      scan.partitionFilters.isEmpty
   }
 
   private def unwrap(plan: SparkPlan): SparkPlan = plan match {

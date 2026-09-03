@@ -19,7 +19,7 @@ public class MorselEngine {
     int filterCol,
     long filterValue);
 
-  public static native int getBatchRows(long batchHandle);
+  public static native long getBatchRows(long batchHandle);
   public static native int getBatchCols(long batchHandle);
   public static native void freeBatch(long batchHandle);
   public static native void shutdown(long schedulerHandle);
