@@ -36,6 +36,7 @@ import org.apache.spark.sql.execution.adaptive.AdaptiveRulesHolder
 import org.apache.spark.sql.execution.aggregate.{ResolveEncodersInScalaAgg, ScalaUDAF}
 import org.apache.spark.sql.execution.analysis.DetectAmbiguousSelfJoin
 import org.apache.spark.sql.execution.command.{CheckViewReferences, CommandCheck}
+import org.apache.spark.sql.execution.columnar.MorselColumnarRule
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.execution.datasources.v2.{TableCapabilityCheck, V2SessionCatalog}
 import org.apache.spark.sql.execution.streaming.runtime.ResolveWriteToStream
@@ -384,7 +385,7 @@ abstract class BaseSessionStateBuilder(
   }
 
   protected def columnarRules: Seq[ColumnarRule] = {
-    extensions.buildColumnarRules(session)
+    MorselColumnarRule() +: extensions.buildColumnarRules(session)
   }
 
   protected def adaptiveRulesHolder: AdaptiveRulesHolder = {
