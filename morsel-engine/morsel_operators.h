@@ -8,6 +8,7 @@
 
 #include "morsel_scheduler.h"
 #include <arrow/compute/api.h>
+#include <arrow/io/file.h>
 #include <parquet/arrow/reader.h>
 #include <unordered_map>
 
@@ -40,8 +41,8 @@ public:
     : file_path(path), column_names(cols) {
 
     // Open parquet file
-    auto file = arrow::io::ReadableFile::Open(path);
-    if (!file.ok()) {
+    auto file_result = arrow::io::ReadableFile::Open(path);
+    if (!file_result.ok()) {
       throw std::runtime_error("Cannot open: " + path);
     }
 
@@ -50,7 +51,7 @@ public:
     props.set_use_threads(false);  // Morsel scheduler handles parallelism
     props.set_batch_size(100000);
 
-    auto status = parquet::arrow::OpenFile(*file,
+    auto status = parquet::arrow::OpenFile(file_result.ValueUnsafe(),
       arrow::default_memory_pool(), &reader);
 
     if (!status.ok()) {
@@ -125,8 +126,15 @@ public:
     // TODO: Implement custom AVX-512 filter like DuckDB
     arrow::compute::ExecContext exec_ctx(ctx->pool);
 
+    // Map CompareOperator to function name (Arrow 15+ removed CompareOperatorToFunctionName)
+    std::string func_name;
+    if (op == arrow::compute::CompareOperator::GREATER) func_name = "greater";
+    else if (op == arrow::compute::CompareOperator::LESS) func_name = "less";
+    else if (op == arrow::compute::CompareOperator::EQUAL) func_name = "equal";
+    else func_name = "greater";  // default
+
     auto compare_result = arrow::compute::CallFunction(
-      arrow::compute::CompareOperatorToFunctionName(op),
+      func_name,
       {column, literal}, &exec_ctx);
 
     if (!compare_result.ok()) {
@@ -136,8 +144,9 @@ public:
     auto filter_array = compare_result->make_array();
 
     // Apply filter
+    arrow::compute::FilterOptions filter_opts;
     auto filter_result = arrow::compute::Filter(
-      batch, filter_array, &exec_ctx);
+      batch, filter_array, filter_opts, &exec_ctx);
 
     if (!filter_result.ok()) {
       return nullptr;
@@ -293,13 +302,13 @@ public:
     arrow::Int64Builder sum_builder;
 
     for (auto& [key, values] : merged) {
-      key_builder.Append(key);
-      sum_builder.Append(values[1]);  // sum
+      (void)key_builder.Append(key);
+      (void)sum_builder.Append(values[1]);  // sum
     }
 
     std::shared_ptr<arrow::Array> key_array, sum_array;
-    key_builder.Finish(&key_array);
-    sum_builder.Finish(&sum_array);
+    (void)key_builder.Finish(&key_array);
+    (void)sum_builder.Finish(&sum_array);
 
     auto schema = arrow::schema({
       arrow::field("group_key", arrow::int64()),
@@ -404,12 +413,13 @@ public:
       arrow::Buffer::Wrap(build_indices.data(), build_indices.size() * 8));
 
     // Take from probe side
+    arrow::compute::TakeOptions take_opts;
     auto probe_result = arrow::compute::Take(
-      probe_batch, probe_indices_array, &exec_ctx);
+      probe_batch, probe_indices_array, take_opts, &exec_ctx);
 
     // Take from build side
     auto build_result = arrow::compute::Take(
-      build_state->build_data, build_indices_array, &exec_ctx);
+      build_state->build_data, build_indices_array, take_opts, &exec_ctx);
 
     if (!probe_result.ok() || !build_result.ok()) {
       return nullptr;
