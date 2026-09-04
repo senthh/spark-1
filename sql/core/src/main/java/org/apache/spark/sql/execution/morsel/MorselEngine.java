@@ -32,7 +32,8 @@ public class MorselEngine {
     String groupCol,
     String sumCol,
     String filterCol,
-    long filterValue);
+    long filterValue,
+    int filterOp);
 
   public static native int getAggRows(long handle);
   public static native void copyAggKeys(long handle, long[] keys);

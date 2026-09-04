@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.execution.morsel
 
+import org.apache.spark.SparkException
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, GenericInternalRow, UnsafeProjection}
@@ -26,54 +27,64 @@ import org.apache.spark.unsafe.types.UTF8String
 
 /**
  * Fused scan + optional greater-than filter + group-by sum, executed in C++.
+ * One Spark task per file; Spark's Final HashAggregate merges the partials.
  */
 case class MorselHashAggExec(
-    filePath: String,
+    filePaths: Seq[String],
     groupCol: String,
     sumCol: String,
     filterCol: Option[String],
     filterValue: Long,
+    filterOp: Int,
     output: Seq[Attribute])
   extends LeafExecNode {
 
   override protected def doExecute(): RDD[InternalRow] = {
-    val path = MorselPaths.clean(filePath)
+    val paths = filePaths.map(MorselPaths.clean)
     val group = groupCol
     val sum = sumCol
     val fcol = filterCol.orNull
     val fval = filterValue
+    val fop = if (filterCol.isDefined) filterOp else 0
+    val nThreads = if (paths.length > 1) 2 else 8
     val outSchema = output.map(_.dataType).toArray
     val schema = output
-    sparkContext.parallelize(Seq(path), 1).mapPartitions { iter =>
+    val nParts = math.max(paths.length, 1)
+    sparkContext.parallelize(paths, nParts).mapPartitions { iter =>
       if (!iter.hasNext) {
         Iterator.empty
       } else {
-        val scheduler = MorselEngine.initScheduler(8)
+        val path = iter.next()
+        val scheduler = MorselEngine.initScheduler(nThreads)
         val handle = MorselEngine.hashAggregate(
-          scheduler, iter.next(), group, sum, fcol, fval)
+          scheduler, path, group, sum, fcol, fval, fop)
         if (handle == 0) {
-          Iterator.empty
-        } else {
-          try {
-            val n = MorselEngine.getAggRows(handle)
-            val keys = new Array[Long](n)
-            val sums = new Array[Double](n)
-            MorselEngine.copyAggKeys(handle, keys)
-            MorselEngine.copyAggSums(handle, sums)
-            val proj = UnsafeProjection.create(schema.map(_.dataType).toArray)
-            (0 until n).iterator.map { i =>
-              val row = new GenericInternalRow(outSchema.length)
-              if (outSchema.length >= 1) {
-                row.update(0, MorselHashAggExec.asSpark(keys(i).toDouble, outSchema(0)))
-              }
-              if (outSchema.length >= 2) {
+          throw SparkException.internalError(
+            s"morsel hashAggregate failed for $path")
+        }
+        try {
+          val n = MorselEngine.getAggRows(handle)
+          val keys = new Array[Long](n)
+          val sums = new Array[Double](n)
+          MorselEngine.copyAggKeys(handle, keys)
+          MorselEngine.copyAggSums(handle, sums)
+          val proj = UnsafeProjection.create(schema.map(_.dataType).toArray)
+          (0 until n).iterator.map { i =>
+            val row = new GenericInternalRow(outSchema.length)
+            if (outSchema.length >= 1) {
+              row.update(0, MorselHashAggExec.asSpark(keys(i).toDouble, outSchema(0)))
+            }
+            if (outSchema.length >= 2) {
+              if (java.lang.Double.isNaN(sums(i))) {
+                row.setNullAt(1)
+              } else {
                 row.update(1, MorselHashAggExec.asSpark(sums(i), outSchema(1)))
               }
-              proj(row).copy()
             }
-          } finally {
-            MorselEngine.freeAgg(handle)
+            proj(row).copy()
           }
+        } finally {
+          MorselEngine.freeAgg(handle)
         }
       }
     }

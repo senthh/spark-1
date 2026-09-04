@@ -32,7 +32,7 @@ import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
  * output is empty. MorselColumnarRule enforces that.
  */
 case class MorselScanExec(
-    filePath: String,
+    filePaths: Seq[String],
     output: Seq[Attribute],
     filterCol: Int = -1,
     filterValue: Long = 0)
@@ -47,9 +47,10 @@ case class MorselScanExec(
     val columnNames = output.map(_.name).toArray
     val fCol = filterCol
     val fVal = filterValue
-    sparkContext.parallelize(Seq(MorselPaths.clean(filePath)), 1).map { path =>
-      MorselScanExec.scanRowCount(path, columnNames, fCol, fVal)
-    }
+    sparkContext.parallelize(filePaths.map(MorselPaths.clean), math.max(filePaths.length, 1))
+      .map { path =>
+        MorselScanExec.scanRowCount(path, columnNames, fCol, fVal)
+      }
   }
 
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
@@ -78,7 +79,7 @@ object MorselScanExec {
     try {
       val handle = MorselEngine.scanParquet(scheduler, path, columns, filterCol, filterValue)
       if (handle == 0) {
-        0L
+        throw new RuntimeException(s"morsel scanParquet failed for $path")
       } else {
         try {
           MorselEngine.getBatchRows(handle)

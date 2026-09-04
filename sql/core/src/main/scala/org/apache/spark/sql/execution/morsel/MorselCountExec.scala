@@ -17,29 +17,35 @@
 
 package org.apache.spark.sql.execution.morsel
 
+import org.apache.spark.SparkException
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, GenericInternalRow, UnsafeProjection}
 import org.apache.spark.sql.execution.LeafExecNode
 
 /** COUNT(*) from parquet footer metadata. Does not decode columns. */
-case class MorselCountExec(filePath: String, output: Seq[Attribute])
+case class MorselCountExec(filePaths: Seq[String], output: Seq[Attribute])
   extends LeafExecNode {
 
   override protected def doExecute(): RDD[InternalRow] = {
-    val path = MorselPaths.clean(filePath)
+    val paths = filePaths.map(MorselPaths.clean)
     val schema = output
-    sparkContext.parallelize(Seq(path), 1).mapPartitions { iter =>
+    sparkContext.parallelize(Seq(paths), 1).mapPartitions { iter =>
       if (!iter.hasNext) {
         Iterator.empty
       } else {
-        val n = MorselEngine.footerRowCount(iter.next())
-        if (n < 0) {
-          Iterator.empty
-        } else {
-          val proj = UnsafeProjection.create(schema.map(_.dataType).toArray)
-          Iterator.single(proj(new GenericInternalRow(Array[Any](n))).copy())
+        val files = iter.next()
+        var total = 0L
+        files.foreach { p =>
+          val n = MorselEngine.footerRowCount(p)
+          if (n < 0) {
+            throw SparkException.internalError(
+              s"morsel footerRowCount failed for $p")
+          }
+          total += n
         }
+        val proj = UnsafeProjection.create(schema.map(_.dataType).toArray)
+        Iterator.single(proj(new GenericInternalRow(Array[Any](total))).copy())
       }
     }
   }

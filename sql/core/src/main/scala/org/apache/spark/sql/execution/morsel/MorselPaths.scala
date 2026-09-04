@@ -18,11 +18,23 @@
 package org.apache.spark.sql.execution.morsel
 
 object MorselPaths {
+  def isPosix(filePath: String): Boolean = {
+    if (filePath == null || filePath.isEmpty) {
+      false
+    } else if (filePath.startsWith("hdfs:") ||
+        filePath.startsWith("s3a:") ||
+        filePath.startsWith("s3n:") ||
+        filePath.startsWith("s3:") ||
+        filePath.startsWith("viewfs:")) {
+      false
+    } else {
+      filePath.startsWith("file:") || filePath.startsWith("/")
+    }
+  }
+
   def clean(filePath: String): String = {
     if (filePath.startsWith("file:")) {
       filePath.replaceFirst("^file:/*", "/")
-    } else if (filePath.startsWith("hdfs://")) {
-      filePath.replaceFirst("^hdfs://[^/]+", "")
     } else if (filePath.nonEmpty && !filePath.startsWith("/")) {
       "/" + filePath
     } else {

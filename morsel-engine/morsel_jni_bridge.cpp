@@ -7,8 +7,10 @@
 #include "morsel_operators.h"
 #include <jni.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -27,8 +29,19 @@ struct MorselAggResult {
 // One scheduler per executor thread that first called init.
 static thread_local std::unique_ptr<MorselScheduler> g_scheduler;
 
+static void require_posix_path(const std::string& raw) {
+  if (raw.compare(0, 7, "hdfs://") == 0 ||
+      raw.compare(0, 5, "s3a://") == 0 ||
+      raw.compare(0, 5, "s3n://") == 0 ||
+      raw.compare(0, 4, "s3://") == 0 ||
+      raw.compare(0, 8, "viewfs://") == 0) {
+    throw std::runtime_error("non-posix path is not supported: " + raw);
+  }
+}
+
 static std::string clean_fs_path(const char* raw) {
   std::string p = raw ? raw : "";
+  require_posix_path(p);
   if (p.compare(0, 5, "file:") == 0) {
     size_t i = 5;
     while (i < p.size() && p[i] == '/') {
@@ -52,8 +65,12 @@ extern "C" {
 JNIEXPORT jlong JNICALL
 Java_org_apache_spark_sql_execution_morsel_MorselEngine_initScheduler(
     JNIEnv*, jclass, jint num_threads) {
+  const int n = num_threads > 0 ? num_threads : 1;
+  if (g_scheduler && g_scheduler->thread_count() != n) {
+    g_scheduler.reset();
+  }
   if (!g_scheduler) {
-    g_scheduler = std::make_unique<MorselScheduler>(num_threads);
+    g_scheduler = std::make_unique<MorselScheduler>(n);
   }
   return reinterpret_cast<jlong>(g_scheduler.get());
 }
@@ -211,7 +228,8 @@ Java_org_apache_spark_sql_execution_morsel_MorselEngine_hashAggregate(
     jstring jgroup,
     jstring jsum,
     jstring jfilter,
-    jlong jfilter_value) {
+    jlong jfilter_value,
+    jint jfilter_op) {
 
   auto* scheduler = reinterpret_cast<MorselScheduler*>(scheduler_handle);
   const char* raw_path = env->GetStringUTFChars(jpath, nullptr);
@@ -252,29 +270,27 @@ Java_org_apache_spark_sql_execution_morsel_MorselEngine_hashAggregate(
     }
 
     scheduler->reset();
-    auto pipeline = std::make_shared<Pipeline>();
-    pipeline->requires_finalize = true;
+    auto pipe = std::make_shared<Pipeline>();
+    pipe->requires_finalize = true;
     auto scan_op = std::make_shared<ParquetScanOperator>(path, cols);
     const int nrg = scan_op->row_groups();
-    pipeline->add_operator(scan_op);
-
-    if (filter_idx >= 0) {
-      auto filter_literal = std::make_shared<arrow::Int64Scalar>(jfilter_value);
-      pipeline->add_operator(std::make_shared<FilterOperator>(
-          filter_idx, arrow::compute::CompareOperator::GREATER, filter_literal));
-    }
-
     auto agg_op = std::make_shared<HashAggregateOperator>(
         std::vector<int>{group_idx},
         std::vector<int>{sum_idx},
         std::vector<std::string>{"sum"},
-        64);
-    pipeline->add_operator(agg_op);
-
-    scheduler->add_pipeline(pipeline);
+        scheduler->thread_count());
+    if (filter_idx >= 0 && jfilter_op != 0) {
+      agg_op->set_filter(filter_idx, jfilter_value, jfilter_op == 2);
+    }
+    pipe->add_operator(scan_op);
+    pipe->add_operator(agg_op);
+    scheduler->add_pipeline(pipe);
     scheduler->schedule_row_groups(0, nrg);
     scheduler->start();
     scheduler->wait_for_completion();
+    if (!scheduler->error_message().empty()) {
+      throw std::runtime_error(scheduler->error_message());
+    }
 
     ExecutionContext ctx(0, 0);
     auto batch = agg_op->finalize(&ctx);
@@ -286,7 +302,9 @@ Java_org_apache_spark_sql_execution_morsel_MorselEngine_hashAggregate(
       out->sums.resize(static_cast<size_t>(batch->num_rows()));
       for (int64_t i = 0; i < batch->num_rows(); i++) {
         out->keys[static_cast<size_t>(i)] = keys->Value(i);
-        out->sums[static_cast<size_t>(i)] = sums->Value(i);
+        out->sums[static_cast<size_t>(i)] = sums->IsNull(i)
+            ? std::numeric_limits<double>::quiet_NaN()
+            : sums->Value(i);
       }
     }
 
@@ -296,9 +314,10 @@ Java_org_apache_spark_sql_execution_morsel_MorselEngine_hashAggregate(
     if (filter_c) {
       env->ReleaseStringUTFChars(jfilter, filter_c);
     }
+    const char* opname = (jfilter_op == 2) ? ">=" : (jfilter_op == 1) ? ">" : "";
     std::fprintf(stderr,
-                 "morsel: hashagg %s groups=%zu rgs=%d filter=%s>%ld\n",
-                 path.c_str(), out->keys.size(), nrg, filter.c_str(),
+                 "morsel: hashagg %s groups=%zu rgs=%d fused=1 filter=%s%s%ld\n",
+                 path.c_str(), out->keys.size(), nrg, filter.c_str(), opname,
                  static_cast<long>(jfilter_value));
     std::fflush(stderr);
     return reinterpret_cast<jlong>(out);

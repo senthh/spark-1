@@ -9,14 +9,19 @@
 #include "morsel_scheduler.h"
 #include <arrow/compute/api.h>
 #include <arrow/io/file.h>
+#include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <parquet/arrow/reader.h>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 // Platform-specific SIMD includes
 #if defined(__x86_64__) || defined(_M_X64)
@@ -133,6 +138,283 @@ inline bool value_f64(const std::shared_ptr<arrow::Array>& a, int64_t i, double*
   }
 }
 
+inline bool parse_i64(std::string_view s, int64_t* out) {
+  if (s.empty() || !out) {
+    return false;
+  }
+  const char* b = s.data();
+  const char* e = b + s.size();
+  auto r = std::from_chars(b, e, *out);
+  return r.ec == std::errc() && r.ptr == e;
+}
+
+inline bool parse_f64(std::string_view s, double* out) {
+  if (s.empty() || !out) {
+    return false;
+  }
+  char buf[64];
+  const size_t n = s.size() < sizeof(buf) - 1 ? s.size() : sizeof(buf) - 1;
+  std::memcpy(buf, s.data(), n);
+  buf[n] = '\0';
+  char* end = nullptr;
+  *out = std::strtod(buf, &end);
+  return end != buf;
+}
+
+struct AggAcc {
+  int64_t count = 0;
+  double sum = 0;
+};
+
+inline void acc_add(std::unordered_map<int64_t, AggAcc>& ht, int64_t key, double val) {
+  auto& e = ht[key];
+  e.count++;
+  e.sum += val;
+}
+
+inline void acc_touch(std::unordered_map<int64_t, AggAcc>& ht, int64_t key) {
+  ht[key];
+}
+
+inline bool keep_key(int64_t key, bool has_filter, int64_t lit, bool inclusive) {
+  if (!has_filter) {
+    return true;
+  }
+  return inclusive ? key >= lit : key > lit;
+}
+
+inline bool fill_filter_mask(
+    const std::shared_ptr<arrow::Array>& filter_array,
+    int64_t lit,
+    bool inclusive,
+    std::vector<uint8_t>* mask) {
+  if (!filter_array || !mask) {
+    return false;
+  }
+  const int64_t n = filter_array->length();
+  mask->assign(static_cast<size_t>(n), 0);
+  const auto ft = filter_array->type_id();
+  if (ft == arrow::Type::INT32) {
+    const auto* a = static_cast<const arrow::Int32Array*>(filter_array.get());
+    const int32_t* raw = a->raw_values();
+    for (int64_t i = 0; i < n; i++) {
+      if (!a->IsNull(i) && keep_key(raw[i], true, lit, inclusive)) {
+        (*mask)[static_cast<size_t>(i)] = 1;
+      }
+    }
+    return true;
+  }
+  if (ft == arrow::Type::INT64) {
+    const auto* a = static_cast<const arrow::Int64Array*>(filter_array.get());
+    const int64_t* raw = a->raw_values();
+    for (int64_t i = 0; i < n; i++) {
+      if (!a->IsNull(i) && keep_key(raw[i], true, lit, inclusive)) {
+        (*mask)[static_cast<size_t>(i)] = 1;
+      }
+    }
+    return true;
+  }
+  if (ft == arrow::Type::STRING) {
+    const auto* a = static_cast<const arrow::StringArray*>(filter_array.get());
+    for (int64_t i = 0; i < n; i++) {
+      int64_t v = 0;
+      if (!a->IsNull(i) && parse_i64(a->GetView(i), &v) &&
+          keep_key(v, true, lit, inclusive)) {
+        (*mask)[static_cast<size_t>(i)] = 1;
+      }
+    }
+    return true;
+  }
+  for (int64_t i = 0; i < n; i++) {
+    int64_t v = 0;
+    if (value_i64(filter_array, i, &v) && keep_key(v, true, lit, inclusive)) {
+      (*mask)[static_cast<size_t>(i)] = 1;
+    }
+  }
+  return true;
+}
+
+// Type is resolved once per morsel. The row loop only touches raw buffers.
+inline void accumulate_morsel(
+    const std::shared_ptr<arrow::Array>& group_array,
+    const std::shared_ptr<arrow::Array>& agg_array,
+    const std::shared_ptr<arrow::Array>& filter_array,
+    int64_t filter_lit,
+    bool has_filter,
+    bool filter_inclusive,
+    std::unordered_map<int64_t, AggAcc>& ht) {
+
+  if (!group_array || !agg_array) {
+    return;
+  }
+  const int64_t n = group_array->length();
+  const auto kt = group_array->type_id();
+  const auto vt = agg_array->type_id();
+
+  static thread_local bool logged_types = false;
+  if (!logged_types) {
+    std::fprintf(stderr, "morsel: types kt=%d vt=%d filter_sep=%d\n",
+                 static_cast<int>(kt), static_cast<int>(vt),
+                 filter_array ? 1 : 0);
+    std::fflush(stderr);
+    logged_types = true;
+  }
+
+  std::vector<uint8_t> mask_store;
+  const uint8_t* mask = nullptr;
+  if (filter_array) {
+    fill_filter_mask(filter_array, filter_lit, filter_inclusive, &mask_store);
+    mask = mask_store.data();
+    has_filter = false;
+  }
+
+  auto masked = [&](int64_t i) -> bool {
+    return mask == nullptr || mask[static_cast<size_t>(i)] != 0;
+  };
+
+  auto take_dec = [&](const arrow::Decimal128Array* vals, int64_t i, int32_t scale,
+                      double inv) -> double {
+    (void)scale;
+    return arrow::Decimal128(vals->GetValue(i)).ToDouble(0) * inv;
+  };
+
+  if (kt == arrow::Type::INT32) {
+    const auto* keys = static_cast<const arrow::Int32Array*>(group_array.get());
+    const int32_t* kraw = keys->raw_values();
+    if (vt == arrow::Type::DOUBLE) {
+      const auto* vals = static_cast<const arrow::DoubleArray*>(agg_array.get());
+      const double* vraw = vals->raw_values();
+      for (int64_t i = 0; i < n; i++) {
+        if (!masked(i) || keys->IsNull(i)) continue;
+        const int64_t key = kraw[i];
+        if (!keep_key(key, has_filter, filter_lit, filter_inclusive)) continue;
+        if (vals->IsNull(i)) {
+          acc_touch(ht, key);
+        } else {
+          acc_add(ht, key, vraw[i]);
+        }
+      }
+      return;
+    }
+    if (vt == arrow::Type::INT64) {
+      const auto* vals = static_cast<const arrow::Int64Array*>(agg_array.get());
+      const int64_t* vraw = vals->raw_values();
+      for (int64_t i = 0; i < n; i++) {
+        if (!masked(i) || keys->IsNull(i)) continue;
+        const int64_t key = kraw[i];
+        if (!keep_key(key, has_filter, filter_lit, filter_inclusive)) continue;
+        if (vals->IsNull(i)) {
+          acc_touch(ht, key);
+        } else {
+          acc_add(ht, key, static_cast<double>(vraw[i]));
+        }
+      }
+      return;
+    }
+    if (vt == arrow::Type::DECIMAL128) {
+      const auto* vals = static_cast<const arrow::Decimal128Array*>(agg_array.get());
+      const auto* ty = static_cast<const arrow::Decimal128Type*>(agg_array->type().get());
+      const int32_t scale = ty->scale();
+      const double inv = std::pow(10.0, -scale);
+      for (int64_t i = 0; i < n; i++) {
+        if (!masked(i) || keys->IsNull(i)) continue;
+        const int64_t key = kraw[i];
+        if (!keep_key(key, has_filter, filter_lit, filter_inclusive)) continue;
+        if (vals->IsNull(i)) {
+          acc_touch(ht, key);
+        } else {
+          acc_add(ht, key, take_dec(vals, i, scale, inv));
+        }
+      }
+      return;
+    }
+  }
+
+  if (kt == arrow::Type::INT64) {
+    const auto* keys = static_cast<const arrow::Int64Array*>(group_array.get());
+    const int64_t* kraw = keys->raw_values();
+    if (vt == arrow::Type::DOUBLE) {
+      const auto* vals = static_cast<const arrow::DoubleArray*>(agg_array.get());
+      const double* vraw = vals->raw_values();
+      for (int64_t i = 0; i < n; i++) {
+        if (!masked(i) || keys->IsNull(i)) continue;
+        const int64_t key = kraw[i];
+        if (!keep_key(key, has_filter, filter_lit, filter_inclusive)) continue;
+        if (vals->IsNull(i)) {
+          acc_touch(ht, key);
+        } else {
+          acc_add(ht, key, vraw[i]);
+        }
+      }
+      return;
+    }
+    if (vt == arrow::Type::INT64) {
+      const auto* vals = static_cast<const arrow::Int64Array*>(agg_array.get());
+      const int64_t* vraw = vals->raw_values();
+      for (int64_t i = 0; i < n; i++) {
+        if (!masked(i) || keys->IsNull(i)) continue;
+        const int64_t key = kraw[i];
+        if (!keep_key(key, has_filter, filter_lit, filter_inclusive)) continue;
+        if (vals->IsNull(i)) {
+          acc_touch(ht, key);
+        } else {
+          acc_add(ht, key, static_cast<double>(vraw[i]));
+        }
+      }
+      return;
+    }
+    if (vt == arrow::Type::DECIMAL128) {
+      const auto* vals = static_cast<const arrow::Decimal128Array*>(agg_array.get());
+      const auto* ty = static_cast<const arrow::Decimal128Type*>(agg_array->type().get());
+      const int32_t scale = ty->scale();
+      const double inv = std::pow(10.0, -scale);
+      for (int64_t i = 0; i < n; i++) {
+        if (!masked(i) || keys->IsNull(i)) continue;
+        const int64_t key = kraw[i];
+        if (!keep_key(key, has_filter, filter_lit, filter_inclusive)) continue;
+        if (vals->IsNull(i)) {
+          acc_touch(ht, key);
+        } else {
+          acc_add(ht, key, take_dec(vals, i, scale, inv));
+        }
+      }
+      return;
+    }
+  }
+
+  if (kt == arrow::Type::STRING && vt == arrow::Type::STRING) {
+    const auto* keys = static_cast<const arrow::StringArray*>(group_array.get());
+    const auto* vals = static_cast<const arrow::StringArray*>(agg_array.get());
+    for (int64_t i = 0; i < n; i++) {
+      if (!masked(i) || keys->IsNull(i)) continue;
+      int64_t key = 0;
+      if (!parse_i64(keys->GetView(i), &key)) continue;
+      if (!keep_key(key, has_filter, filter_lit, filter_inclusive)) continue;
+      if (vals->IsNull(i)) {
+        acc_touch(ht, key);
+        continue;
+      }
+      double val = 0;
+      if (!parse_f64(vals->GetView(i), &val)) continue;
+      acc_add(ht, key, val);
+    }
+    return;
+  }
+
+  for (int64_t i = 0; i < n; i++) {
+    if (!masked(i)) continue;
+    int64_t key = 0;
+    if (!value_i64(group_array, i, &key)) continue;
+    if (!keep_key(key, has_filter, filter_lit, filter_inclusive)) continue;
+    double val = 0;
+    if (!value_f64(agg_array, i, &val)) {
+      acc_touch(ht, key);
+      continue;
+    }
+    acc_add(ht, key, val);
+  }
+}
+
 // ============================================================================
 // ParquetScanOperator: Streaming parquet scan with morsels
 // Based on DuckDB's ParquetScan
@@ -239,32 +521,22 @@ public:
       return nullptr;
     }
 
-    parquet::arrow::FileReader* rdr = nullptr;
-    try {
-      rdr = reader_for(thread_id);
-    } catch (const std::exception& e) {
-      std::fprintf(stderr, "morsel: reader_for failed: %s\n", e.what());
-      std::fflush(stderr);
-      return nullptr;
-    }
+    parquet::arrow::FileReader* rdr = reader_for(thread_id);
 
     std::shared_ptr<arrow::Table> table;
     arrow::Status status = column_indices.empty()
       ? rdr->ReadRowGroup(rg, &table)
       : rdr->ReadRowGroup(rg, column_indices, &table);
     if (!status.ok() || !table) {
-      std::fprintf(stderr, "morsel: ReadRowGroup %d failed: %s\n",
-                   rg, status.ToString().c_str());
-      std::fflush(stderr);
-      return nullptr;
+      throw std::runtime_error(
+          "ReadRowGroup " + std::to_string(rg) + " failed: " + status.ToString());
     }
 
     auto batch_result = table->CombineChunksToBatch();
     if (!batch_result.ok()) {
-      std::fprintf(stderr, "morsel: CombineChunks rg=%d failed: %s\n",
-                   rg, batch_result.status().ToString().c_str());
-      std::fflush(stderr);
-      return nullptr;
+      throw std::runtime_error(
+          "CombineChunks rg=" + std::to_string(rg) + " failed: " +
+          batch_result.status().ToString());
     }
 
     auto batch = *batch_result;
@@ -410,12 +682,9 @@ private:
   std::vector<int> group_by_columns;
   std::vector<int> aggregate_columns;
   std::vector<std::string> aggregate_functions;  // "sum", "count", etc.
-
-  // Thread-local hash tables (one per thread)
-  struct AggAcc {
-    int64_t count = 0;
-    double sum = 0;
-  };
+  int filter_column = -1;
+  int64_t filter_literal = 0;
+  bool filter_inclusive = false;
 
   struct AggregateState {
     std::unordered_map<int64_t, AggAcc> hash_table;
@@ -437,6 +706,16 @@ public:
     for (int i = 0; i < num_threads; i++) {
       thread_states.push_back(std::make_unique<AggregateState>());
     }
+  }
+
+  void set_filter(int col, int64_t lit, bool inclusive) {
+    filter_column = col;
+    filter_literal = lit;
+    filter_inclusive = inclusive;
+  }
+
+  void set_greater_filter(int col, int64_t lit) {
+    set_filter(col, lit, false);
   }
 
   std::shared_ptr<Morsel> process_morsel(
@@ -465,16 +744,18 @@ public:
 
     auto group_array = batch->column(group_col);
     auto agg_array = batch->column(agg_col);
-
-    for (int64_t i = 0; i < batch->num_rows(); i++) {
-      int64_t key = 0;
-      double value = 0;
-      if (value_i64(group_array, i, &key) && value_f64(agg_array, i, &value)) {
-        auto& entry = state->hash_table[key];
-        entry.count++;
-        entry.sum += value;
+    std::shared_ptr<arrow::Array> filter_array;
+    const bool has_filter = filter_column >= 0;
+    if (has_filter && filter_column != group_col) {
+      if (filter_column >= batch->num_columns()) {
+        return nullptr;
       }
+      filter_array = batch->column(filter_column);
     }
+
+    accumulate_morsel(
+        group_array, agg_array, filter_array, filter_literal,
+        has_filter && !filter_array, filter_inclusive, state->hash_table);
 
     // Don't return anything - aggregation is stateful
     return nullptr;
@@ -497,7 +778,11 @@ public:
 
     for (auto& [key, values] : merged) {
       (void)key_builder.Append(key);
-      (void)sum_builder.Append(values.sum);
+      if (values.count == 0) {
+        (void)sum_builder.AppendNull();
+      } else {
+        (void)sum_builder.Append(values.sum);
+      }
     }
 
     std::shared_ptr<arrow::Array> key_array, sum_array;
