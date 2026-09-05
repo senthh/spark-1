@@ -11,7 +11,7 @@ import org.apache.spark.sql.execution.aggregate.HashAggregateExec
 import org.apache.spark.sql.execution.morsel.{
   MorselCountExec, MorselHashAggExec, MorselPaths, MorselScanExec}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.Decimal
+import org.apache.spark.sql.types.{Decimal, DecimalType}
 import org.apache.spark.unsafe.types.UTF8String
 
 /**
@@ -145,23 +145,23 @@ class MorselColumnarRule extends ColumnarRule with Logging {
       skip("unsupported-expr", s"group=${g.isDefined} sum=${s.isDefined}")
       return agg
     }
-    parsePlanFilter(agg) match {
-      case Left(why) =>
-        skip(why, s"${g.get},${s.get}")
-        agg
-      case Right(filt) =>
-        posixFiles(scanOpt.get) match {
-          case Some(files) =>
-            MorselHashAggExec(
-              filePaths = files,
-              groupCol = g.get,
-              sumCol = s.get,
-              filterCol = filt.map(_.col),
-              filterValue = filt.map(_.value).getOrElse(0L),
-              filterOp = filt.map(_.op).getOrElse(0),
-              output = agg.output)
-          case None => agg
-        }
+    val parsed = parsePlanFilter(agg)
+    if (!parsed.ok) {
+      skip(parsed.why, s"${g.get},${s.get}")
+      return agg
+    }
+    posixFiles(scanOpt.get) match {
+      case Some(files) =>
+        MorselHashAggExec(
+          filePaths = files,
+          groupCol = g.get,
+          sumCol = s.get,
+          filterCol = parsed.filt.map(_.col),
+          filterValue = parsed.filt.map(_.value).getOrElse(0L),
+          filterOp = parsed.filt.map(_.op).getOrElse(0),
+          sumScale = sumScale(agg),
+          output = agg.output)
+      case None => agg
     }
   }
 
@@ -194,31 +194,44 @@ class MorselColumnarRule extends ColumnarRule with Logging {
     }
   }
 
-  // Right(None) = no filter. Left = residual / unsupported. Never take one
-  // conjunct and drop the rest.
-  private def parsePlanFilter(plan: SparkPlan): Either[String, Option[BoundFilter]] = {
-    val parsed = filterExprs(plan).map { e =>
-      parseOneCmp(e) match {
-        case Some(b) => Right(b)
-        case None => Left(e.prettyName)
-      }
-    }
-    val bad = parsed.collect { case Left(n) => n }
+  // Avoid scala.util.Either: catalyst.expressions.Left/Right shadow it.
+  private case class FilterParse(ok: Boolean, why: String, filt: Option[BoundFilter])
+
+  // Never take one conjunct and drop the rest.
+  private def parsePlanFilter(plan: SparkPlan): FilterParse = {
+    val exprs = filterExprs(plan)
+    val bad = exprs.filter(parseOneCmp(_).isEmpty).map(_.prettyName)
     if (bad.nonEmpty) {
-      return Left("residual-filter:" + bad.mkString(","))
+      return FilterParse(false, "residual-filter:" + bad.mkString(","), None)
     }
-    val ok = parsed.collect { case Right(b) => b }.distinct
+    val ok = exprs.flatMap(parseOneCmp).distinct
     if (ok.isEmpty) {
-      Right(None)
+      FilterParse(true, "", None)
     } else if (ok.size == 1) {
-      Right(Some(ok.head))
+      FilterParse(true, "", Some(ok.head))
     } else {
-      Left("multi-filter")
+      FilterParse(false, "multi-filter", None)
     }
   }
 
   private def groupName(agg: HashAggregateExec): Option[String] = {
     leafName(agg.groupingExpressions.head)
+  }
+
+  private def sumScale(agg: HashAggregateExec): Int = {
+    def fromExpr(e: Expression): Int = e match {
+      case u: UnscaledValue => fromExpr(u.child)
+      case c: Cast => fromExpr(c.child)
+      case Alias(c, _) => fromExpr(c)
+      case _ => e.dataType match {
+        case d: DecimalType => d.scale
+        case _ => 0
+      }
+    }
+    agg.aggregateExpressions.head.aggregateFunction match {
+      case s: Sum => fromExpr(s.child)
+      case _ => 0
+    }
   }
 
   private def sumName(agg: HashAggregateExec): Option[String] = {
@@ -232,6 +245,7 @@ class MorselColumnarRule extends ColumnarRule with Logging {
     case a: Attribute => Some(a.name)
     case Alias(c, _) => leafName(c)
     case c: Cast => leafName(c.child)
+    case u: UnscaledValue => leafName(u.child)
     case _ => None
   }
 

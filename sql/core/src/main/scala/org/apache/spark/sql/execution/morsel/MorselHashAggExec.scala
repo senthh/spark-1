@@ -36,6 +36,7 @@ case class MorselHashAggExec(
     filterCol: Option[String],
     filterValue: Long,
     filterOp: Int,
+    sumScale: Int,
     output: Seq[Attribute])
   extends LeafExecNode {
 
@@ -47,6 +48,7 @@ case class MorselHashAggExec(
     val fval = filterValue
     val fop = if (filterCol.isDefined) filterOp else 0
     val nThreads = if (paths.length > 1) 2 else 8
+    val scale = sumScale
     val outSchema = output.map(_.dataType).toArray
     val schema = output
     val nParts = math.max(paths.length, 1)
@@ -78,7 +80,7 @@ case class MorselHashAggExec(
               if (java.lang.Double.isNaN(sums(i))) {
                 row.setNullAt(1)
               } else {
-                row.update(1, MorselHashAggExec.asSpark(sums(i), outSchema(1)))
+                row.update(1, MorselHashAggExec.asSpark(sums(i), outSchema(1), scale))
               }
             }
             proj(row).copy()
@@ -92,8 +94,10 @@ case class MorselHashAggExec(
 }
 
 object MorselHashAggExec {
-  def asSpark(value: Double, dt: DataType): Any = dt match {
+  def asSpark(value: Double, dt: DataType, unscaledScale: Int = 0): Any = dt match {
     case IntegerType => value.toInt
+    case LongType if unscaledScale > 0 =>
+      math.round(value * math.pow(10.0, unscaledScale.toDouble))
     case LongType => value.toLong
     case FloatType => value.toFloat
     case DoubleType => value
