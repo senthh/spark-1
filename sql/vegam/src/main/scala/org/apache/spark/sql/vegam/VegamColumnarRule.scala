@@ -17,57 +17,14 @@
 
 package org.apache.spark.sql.vegam
 
-import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{ColumnarRule, SparkPlan}
-import org.apache.spark.sql.execution.aggregate.HashAggregateExec
-import org.apache.spark.sql.execution.window.WindowExec
-import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.vegam.exec.VegamBackend
-import org.apache.spark.sql.vegam.plan.NativeStageCutter
-import org.apache.spark.sql.vegam.plan.NativeStageCutter.{CutOk, CutSkip}
 
 /**
- * Rewrites a fully-supported stage to [[NativeStageExec]]. If any node in the
- * stage cannot lower, the original Spark plan is kept.
+ * Columnar hook used when AQE is off (after EnsureRequirements).
+ * AQE uses [[VegamPlanRule]] via post-planner / stage-prep instead.
  */
-class VegamColumnarRule extends ColumnarRule with Logging {
+class VegamColumnarRule extends ColumnarRule {
 
-  override def preColumnarTransitions: Rule[SparkPlan] = {
-    new Rule[SparkPlan] {
-      override def apply(plan: SparkPlan): SparkPlan = {
-        val conf = SQLConf.get
-        if (!VegamConf.enabled(conf)) {
-          return plan
-        }
-        val requested = VegamConf.backend(conf)
-        if (VegamBackend.resolve(requested).isEmpty && requested != "auto") {
-          skip("backend", requested)
-          return plan
-        }
-        plan.transformDown {
-          case node if node.isInstanceOf[HashAggregateExec] || node.isInstanceOf[WindowExec] =>
-            NativeStageCutter.cut(node) match {
-              case CutOk(native) =>
-                VegamBackend.pick(requested, native) match {
-                  case Some(name) =>
-                    NativeStageExec(native, node.output, name)
-                  case None =>
-                    skip("backend-unsupported", native.getClass.getSimpleName)
-                    node
-                }
-              case CutSkip(why, detail) =>
-                skip(why, detail)
-                node
-            }
-        }
-      }
-    }
-  }
-
-  private def skip(why: String, detail: String): Unit = {
-    val msg = s"vegam: skip $why $detail"
-    logInfo(msg)
-    System.err.println(msg)
-  }
+  override def preColumnarTransitions: Rule[SparkPlan] = new VegamPlanRule
 }

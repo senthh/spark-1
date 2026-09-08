@@ -24,9 +24,10 @@ import org.apache.spark.sql.types.DataType
 /**
  * Stable binary encoding of [[NativePlan]] for the JNI task API.
  * This is not Substrait. Version 2 adds StagePlan and richer HashAgg.
+ * Version 3 adds ExpandSpec (rollup / grouping sets) on StagePlan.
  */
 object NativePlanCodec {
-  private val VERSION: Int = 2
+  private val VERSION: Int = 3
   private val KIND_COUNT: Int = 1
   private val KIND_HASHAGG: Int = 2
   private val KIND_STAGE: Int = 3
@@ -86,6 +87,7 @@ object NativePlanCodec {
             out.writeBoolean(false)
         }
         out.writeBoolean(s.complete)
+        writeExpand(out, s.expand)
     }
     out.flush()
     buf.toByteArray
@@ -94,7 +96,7 @@ object NativePlanCodec {
   def decode(bytes: Array[Byte]): NativePlan = {
     val in = new DataInputStream(new ByteArrayInputStream(bytes))
     val version = in.readInt()
-    if (version != 1 && version != 2) {
+    if (version < 1 || version > 3) {
       throw new IllegalArgumentException(s"unsupported NativePlan version $version")
     }
     in.readInt() match {
@@ -103,7 +105,7 @@ object NativePlanCodec {
       case KIND_HASHAGG =>
         decodeHashAgg(in, version)
       case KIND_STAGE =>
-        decodeStage(in)
+        decodeStage(in, version)
       case other =>
         throw new IllegalArgumentException(s"unsupported NativePlan kind $other")
     }
@@ -139,7 +141,7 @@ object NativePlanCodec {
     }
   }
 
-  private def decodeStage(in: DataInputStream): StagePlan = {
+  private def decodeStage(in: DataInputStream, version: Int): StagePlan = {
     val probe = readScan(in)
     val n = in.readInt()
     val builds = Seq.fill(n) {
@@ -164,7 +166,9 @@ object NativePlanCodec {
     } else {
       None
     }
-    StagePlan(probe, builds, probeFilters, groups, groupTypes, aggs, window, in.readBoolean())
+    val complete = in.readBoolean()
+    val expand = if (version >= 3) readExpand(in) else None
+    StagePlan(probe, builds, probeFilters, groups, groupTypes, aggs, window, complete, expand)
   }
 
   private def writeScan(out: DataOutputStream, s: ScanSpec): Unit = {
@@ -230,6 +234,43 @@ object NativePlanCodec {
     val n = in.readInt()
     Seq.fill(n) {
       AggCall(in.readInt(), readString(in), in.readInt(), DataType.fromJson(readString(in)))
+    }
+  }
+
+  private def writeExpand(out: DataOutputStream, expand: Option[ExpandSpec]): Unit = {
+    expand match {
+      case Some(e) =>
+        out.writeBoolean(true)
+        writeStrings(out, e.outCols)
+        out.writeInt(e.projections.length)
+        e.projections.foreach { row =>
+          out.writeInt(row.length)
+          row.foreach { s =>
+            out.writeInt(s.kind)
+            writeString(out, s.col)
+            out.writeLong(s.lvalue)
+            out.writeDouble(s.dvalue)
+            writeString(out, s.svalue)
+          }
+        }
+      case None =>
+        out.writeBoolean(false)
+    }
+  }
+
+  private def readExpand(in: DataInputStream): Option[ExpandSpec] = {
+    if (!in.readBoolean()) {
+      None
+    } else {
+      val names = readStrings(in)
+      val n = in.readInt()
+      val projs = Seq.fill(n) {
+        val w = in.readInt()
+        Seq.fill(w) {
+          ExpandSlot(in.readInt(), readString(in), in.readLong(), in.readDouble(), readString(in))
+        }
+      }
+      Some(ExpandSpec(names, projs))
     }
   }
 

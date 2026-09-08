@@ -20,12 +20,14 @@ package org.apache.spark.sql.vegam
 import org.apache.spark.sql.{SparkSessionExtensions, SparkSessionExtensionsProvider}
 
 /**
- * Registers the Vegam columnar rewrite. The rewrite is a no-op unless
- * spark.sql.vegam.enabled is true.
+ * Registers Vegam rewrite hooks. All are no-ops unless spark.sql.vegam.enabled.
  */
 class VegamExtensions extends SparkSessionExtensionsProvider {
   override def apply(extensions: SparkSessionExtensions): Unit = {
     VegamConf
+    extensions.injectOptimizerRule(_ => VegamSubqueryRewrite)
     extensions.injectColumnar(_ => new VegamColumnarRule)
+    extensions.injectQueryPostPlannerStrategyRule(_ => new VegamPlanRule)
+    extensions.injectQueryStagePrepRule(_ => new VegamPlanRule)
   }
 }

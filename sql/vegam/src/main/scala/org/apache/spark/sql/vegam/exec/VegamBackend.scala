@@ -88,7 +88,8 @@ object VegamBackend {
     case NATIVE if NativeTask.isLoaded =>
       plan match {
         case _: org.apache.spark.sql.vegam.plan.CountStar => true
-        case h: org.apache.spark.sql.vegam.plan.HashAgg if h.allFilters.isEmpty => true
+        case _: org.apache.spark.sql.vegam.plan.HashAgg => true
+        case _: org.apache.spark.sql.vegam.plan.StagePlan => true
         case _ => false
       }
     case _ => false

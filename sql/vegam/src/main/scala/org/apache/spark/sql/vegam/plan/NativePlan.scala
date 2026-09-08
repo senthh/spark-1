@@ -52,6 +52,12 @@ object NativePlan {
   val WIN_RANK: Int = 2
   val WIN_DENSE_RANK: Int = 3
   val WIN_SUM: Int = 4
+
+  val EXPAND_COL: Int = 1
+  val EXPAND_NULL: Int = 2
+  val EXPAND_LONG: Int = 3
+  val EXPAND_DOUBLE: Int = 4
+  val EXPAND_STR: Int = 5
 }
 
 case class FilterPred(
@@ -93,6 +99,17 @@ case class WinSpec(
     partitionBy: Seq[String],
     orderBy: Seq[(String, Boolean)],
     fns: Seq[WindowCall]) extends Serializable
+
+case class ExpandSlot(
+    kind: Int,
+    col: String = "",
+    lvalue: Long = 0L,
+    dvalue: Double = 0.0,
+    svalue: String = "") extends Serializable
+
+case class ExpandSpec(
+    outCols: Seq[String],
+    projections: Seq[Seq[ExpandSlot]]) extends Serializable
 
 case class CountStar(files: Seq[String]) extends NativePlan {
   override def withFiles(newFiles: Seq[String]): NativePlan = copy(files = newFiles)
@@ -151,7 +168,8 @@ case class StagePlan(
     groupTypes: Seq[DataType],
     aggs: Seq[AggCall],
     window: Option[WinSpec],
-    complete: Boolean) extends NativePlan {
+    complete: Boolean,
+    expand: Option[ExpandSpec] = None) extends NativePlan {
   override def files: Seq[String] = probe.paths
 
   override def withFiles(newFiles: Seq[String]): NativePlan = {

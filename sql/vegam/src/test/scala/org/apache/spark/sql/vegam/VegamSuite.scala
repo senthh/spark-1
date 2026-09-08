@@ -18,8 +18,12 @@
 package org.apache.spark.sql.vegam
 
 import org.apache.spark.SparkConf
+import org.apache.spark.sql.Row
 import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.sql.vegam.exec.NativeTask
 import org.apache.spark.sql.vegam.plan.{CountStar, HashAgg, NativePlanCodec}
 
 class VegamPathsSuite extends org.apache.spark.SparkFunSuite {
@@ -68,6 +72,43 @@ class NativePlanCodecSuite extends org.apache.spark.SparkFunSuite {
     assert(back.sumCol === agg.sumCol)
     assert(back.complete === agg.complete)
   }
+
+  test("round-trip StagePlan expand") {
+    val plan = org.apache.spark.sql.vegam.plan.StagePlan(
+      probe = org.apache.spark.sql.vegam.plan.ScanSpec(
+        Seq(org.apache.spark.sql.vegam.plan.FileRef("/tmp/a.parquet", Nil)), Seq("k", "v")),
+      builds = Nil,
+      probeFilters = Nil,
+      groups = Seq("k", "gid"),
+      groupTypes = Seq(org.apache.spark.sql.types.LongType, org.apache.spark.sql.types.IntegerType),
+      aggs = Seq(org.apache.spark.sql.vegam.plan.AggCall(
+        org.apache.spark.sql.vegam.plan.NativePlan.AGG_SUM, "v", 0,
+        org.apache.spark.sql.types.DoubleType)),
+      window = None,
+      complete = false,
+      expand = Some(org.apache.spark.sql.vegam.plan.ExpandSpec(
+        Seq("k", "v", "gid"),
+        Seq(
+          Seq(
+            org.apache.spark.sql.vegam.plan.ExpandSlot(
+              org.apache.spark.sql.vegam.plan.NativePlan.EXPAND_COL, "k"),
+            org.apache.spark.sql.vegam.plan.ExpandSlot(
+              org.apache.spark.sql.vegam.plan.NativePlan.EXPAND_COL, "v"),
+            org.apache.spark.sql.vegam.plan.ExpandSlot(
+              org.apache.spark.sql.vegam.plan.NativePlan.EXPAND_LONG, lvalue = 0L)),
+          Seq(
+            org.apache.spark.sql.vegam.plan.ExpandSlot(
+              org.apache.spark.sql.vegam.plan.NativePlan.EXPAND_NULL),
+            org.apache.spark.sql.vegam.plan.ExpandSlot(
+              org.apache.spark.sql.vegam.plan.NativePlan.EXPAND_COL, "v"),
+            org.apache.spark.sql.vegam.plan.ExpandSlot(
+              org.apache.spark.sql.vegam.plan.NativePlan.EXPAND_LONG, lvalue = 1L))))))
+    val back = NativePlanCodec.decode(NativePlanCodec.encode(plan))
+      .asInstanceOf[org.apache.spark.sql.vegam.plan.StagePlan]
+    assert(back.expand.isDefined)
+    assert(back.expand.get.projections.length === 2)
+    assert(back.groups === Seq("k", "gid"))
+  }
 }
 
 class VegamSuite extends SharedSparkSession {
@@ -80,14 +121,18 @@ class VegamSuite extends SharedSparkSession {
 
   private def withVegam[T](fn: => T): T = {
     withSQLConf(
-      VegamConf.VEGAM_ENABLED.key -> "true",
-      VegamConf.VEGAM_BACKEND.key -> "jvm") {
+        VegamConf.VEGAM_ENABLED.key -> "true",
+        VegamConf.VEGAM_BACKEND.key -> "jvm",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
       fn
     }
   }
 
-  private def hasNative(plan: SparkPlan): Boolean = {
-    plan.exists(_.isInstanceOf[NativeStageExec])
+  private def hasNative(plan: SparkPlan): Boolean = plan match {
+    case a: AdaptiveSparkPlanExec =>
+      hasNative(a.inputPlan) || hasNative(a.executedPlan)
+    case other =>
+      other.exists(_.isInstanceOf[NativeStageExec])
   }
 
   test("disabled by default") {
@@ -205,7 +250,144 @@ class VegamSuite extends SharedSparkSession {
     }
   }
 
+  test("exists and in become semi-join native stages") {
+    withTempPath { fact =>
+      withTempPath { dim =>
+        val fp = fact.getCanonicalPath
+        val dp = dim.getCanonicalPath
+        Seq((1L, 1.5), (2L, 3.0), (3L, 9.0)).toDF("k", "v").write.mode("overwrite").parquet(fp)
+        Seq(1L, 2L).toDF("k").write.mode("overwrite").parquet(dp)
+        withVegam {
+          val inn = sql(
+            s"SELECT k, SUM(v) FROM parquet.`$fp` WHERE k IN (SELECT k FROM parquet.`$dp`) " +
+              "GROUP BY k")
+          assert(hasNative(inn.queryExecution.executedPlan),
+            inn.queryExecution.executedPlan.toString)
+          checkAnswer(inn, Seq((1L, 1.5), (2L, 3.0)).toDF("k", "sum(v)"))
+
+          val ex = sql(
+            s"SELECT f.k, SUM(f.v) FROM parquet.`$fp` f WHERE EXISTS (" +
+              s"SELECT 1 FROM parquet.`$dp` d WHERE d.k = f.k) GROUP BY f.k")
+          assert(hasNative(ex.queryExecution.executedPlan),
+            ex.queryExecution.executedPlan.toString)
+          checkAnswer(ex, Seq((1L, 1.5), (2L, 3.0)).toDF("k", "sum(v)"))
+        }
+      }
+    }
+  }
+
+  test("union all of two parquet scans fuses") {
+    withTempPath { a =>
+      withTempPath { b =>
+        val ap = a.getCanonicalPath
+        val bp = b.getCanonicalPath
+        Seq((1L, 1.0)).toDF("k", "v").write.mode("overwrite").parquet(ap)
+        Seq((1L, 2.0), (2L, 3.0)).toDF("k", "v").write.mode("overwrite").parquet(bp)
+        withVegam {
+          val df = sql(
+            s"SELECT k, SUM(v) FROM (" +
+              s"SELECT k, v FROM parquet.`$ap` UNION ALL SELECT k, v FROM parquet.`$bp`" +
+              ") t GROUP BY k")
+          assert(hasNative(df.queryExecution.executedPlan), df.queryExecution.executedPlan.toString)
+          checkAnswer(df, Seq((1L, 3.0), (2L, 3.0)).toDF("k", "sum(v)"))
+        }
+      }
+    }
+  }
+
+  test("sort-merge join plus group-sum") {
+    withTempPath { fact =>
+      withTempPath { dim =>
+        val fp = fact.getCanonicalPath
+        val dp = dim.getCanonicalPath
+        Seq((1L, 1.5), (1L, 2.5), (2L, 3.0)).toDF("k", "v").write.mode("overwrite").parquet(fp)
+        Seq((1L, "a"), (2L, "b")).toDF("k", "n").write.mode("overwrite").parquet(dp)
+        withVegam {
+          withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1") {
+            val df = sql(
+              s"SELECT f.k, SUM(f.v) FROM parquet.`$fp` f " +
+                s"JOIN parquet.`$dp` d ON f.k = d.k GROUP BY f.k")
+            assert(hasNative(df.queryExecution.executedPlan),
+              df.queryExecution.executedPlan.toString)
+            checkAnswer(df, Seq((1L, 4.0), (2L, 3.0)).toDF("k", "sum(v)"))
+          }
+        }
+      }
+    }
+  }
+
+  test("rollup and grouping sets fuse expand") {
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      Seq((1L, 1.5), (1L, 2.5), (2L, 3.0)).toDF("k", "v").write.mode("overwrite").parquet(path)
+      withVegam {
+        val roll = sql(s"SELECT k, SUM(v) FROM parquet.`$path` GROUP BY ROLLUP(k)")
+        assert(hasNative(roll.queryExecution.executedPlan),
+          roll.queryExecution.executedPlan.toString)
+        checkAnswer(roll, Seq(Row(1L, 4.0), Row(2L, 3.0), Row(null, 7.0)))
+
+        val gs = sql(
+          s"SELECT k, SUM(v) FROM parquet.`$path` GROUP BY GROUPING SETS ((k), ())")
+        assert(hasNative(gs.queryExecution.executedPlan),
+          gs.queryExecution.executedPlan.toString)
+        checkAnswer(gs, Seq(Row(1L, 4.0), Row(2L, 3.0), Row(null, 7.0)))
+      }
+    }
+  }
+
+  test("AQE on still rewrites group-sum") {
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      Seq((1L, 1.5), (1L, 2.5)).toDF("k", "v").write.mode("overwrite").parquet(path)
+      withSQLConf(
+          VegamConf.VEGAM_ENABLED.key -> "true",
+          VegamConf.VEGAM_BACKEND.key -> "jvm",
+          SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true") {
+        val df = sql(s"SELECT k, SUM(v) FROM parquet.`$path` GROUP BY k")
+        assert(hasNative(df.queryExecution.executedPlan), df.queryExecution.executedPlan.toString)
+        checkAnswer(df, Seq((1L, 4.0)).toDF("k", "sum(v)"))
+      }
+    }
+  }
+
+  test("native HashAgg group-sum when libvegam is loaded") {
+    if (!NativeTask.isLoaded) {
+      cancel("libvegam not on java.library.path; this is the non-Velox native path")
+    }
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      Seq((1L, 1.5), (1L, 2.5), (2L, 3.0)).toDF("k", "v")
+        .write.mode("overwrite").parquet(path)
+      withSQLConf(
+          VegamConf.VEGAM_ENABLED.key -> "true",
+          VegamConf.VEGAM_BACKEND.key -> "native",
+          SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+        val df = sql(s"SELECT k, SUM(v) FROM parquet.`$path` GROUP BY k")
+        assert(hasNative(df.queryExecution.executedPlan),
+          df.queryExecution.executedPlan.toString)
+        assert(df.queryExecution.executedPlan.toString.contains("native"),
+          df.queryExecution.executedPlan.toString)
+        checkAnswer(df, Seq((1L, 4.0), (2L, 3.0)).toDF("k", "sum(v)"))
+
+        val joined = sql(
+          s"SELECT k, SUM(v) FROM parquet.`$path` WHERE k IN (SELECT k FROM parquet.`$path`) " +
+            "GROUP BY k")
+        assert(hasNative(joined.queryExecution.executedPlan),
+          joined.queryExecution.executedPlan.toString)
+        checkAnswer(joined, Seq((1L, 4.0), (2L, 3.0)).toDF("k", "sum(v)"))
+
+        val roll = sql(s"SELECT k, SUM(v) FROM parquet.`$path` GROUP BY ROLLUP(k)")
+        assert(hasNative(roll.queryExecution.executedPlan),
+          roll.queryExecution.executedPlan.toString)
+        checkAnswer(roll, Seq(Row(1L, 4.0), Row(2L, 3.0), Row(null, 7.0)))
+      }
+    }
+  }
+
   test("native backend without libvegam does not rewrite") {
+    if (NativeTask.isLoaded) {
+      cancel("libvegam is on the path; rewrite is expected")
+    }
     withTempPath { dir =>
       val path = dir.getCanonicalPath
       Seq((1L, 1.5)).toDF("k", "v").write.mode("overwrite").parquet(path)

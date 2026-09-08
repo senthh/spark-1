@@ -44,7 +44,15 @@ struct VegamTaskState {
   bool done = false;
 };
 
-VegamTaskState* vegam_create_task(JNIEnv* env, const uint8_t* bytes, int n);
+VegamTable vegam_load_table(
+    JNIEnv* env,
+    const std::string& path,
+    const std::vector<std::string>& cols,
+    const std::vector<std::pair<std::string, std::string>>& parts);
+long vegam_footer_rows(JNIEnv* env, const std::string& path);
+
+VegamTaskState* vegam_create_task(JNIEnv* env, const uint8_t* bytes, int n,
+                                  int threads);
 int vegam_next_page(VegamTaskState* task, double* values, uint8_t* nulls,
                     int* meta, int cap);
 void vegam_close_task(VegamTaskState* task);

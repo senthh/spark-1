@@ -23,10 +23,11 @@ import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight}
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.execution.{
-  ColumnarToRowExec, FileSourceScanExec, FilterExec, InputAdapter, ProjectExec, SparkPlan,
-  WholeStageCodegenExec}
+  ColumnarToRowExec, ExpandExec, FileSourceScanExec, FilterExec, InputAdapter, ProjectExec,
+  SortExec, SparkPlan, UnionExec, WholeStageCodegenExec}
+import org.apache.spark.sql.execution.exchange.Exchange
 import org.apache.spark.sql.execution.adaptive.QueryStageExec
-import org.apache.spark.sql.execution.aggregate.HashAggregateExec
+import org.apache.spark.sql.execution.aggregate.{BaseAggregateExec, HashAggregateExec, SortAggregateExec}
 import org.apache.spark.sql.execution.datasources.{FileIndex, PartitioningAwareFileIndex}
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
 import org.apache.spark.sql.execution.datasources.v2.{BatchScanExec, FileScan}
@@ -51,11 +52,12 @@ object NativeStageCutter {
 
   def cut(plan: SparkPlan): CutResult = unwrap(plan) match {
     case agg: HashAggregateExec => cutAgg(agg)
+    case agg: SortAggregateExec => cutAgg(agg)
     case w: WindowExec => cutWindow(w)
     case other => CutSkip("unsupported-root", other.nodeName)
   }
 
-  private def cutAgg(agg: HashAggregateExec): CutResult = {
+  private def cutAgg(agg: BaseAggregateExec): CutResult = {
     if (isCountStar(agg) && !hasJoin(agg) && !hasWindow(agg)) {
       cutCount(agg)
     } else {
@@ -63,7 +65,7 @@ object NativeStageCutter {
     }
   }
 
-  private def cutCount(agg: HashAggregateExec): CutResult = {
+  private def cutCount(agg: BaseAggregateExec): CutResult = {
     lowerPipeline(agg.child) match {
       case Left(skip) => skip
       case Right(pipe) if pipe.builds.nonEmpty || pipe.window.isDefined =>
@@ -80,7 +82,7 @@ object NativeStageCutter {
     }
   }
 
-  private def cutStage(agg: HashAggregateExec): CutResult = {
+  private def cutStage(agg: BaseAggregateExec): CutResult = {
     val parsed = parseAggs(agg)
     if (!parsed.ok) {
       return CutSkip(parsed.why, parsed.detail)
@@ -100,15 +102,16 @@ object NativeStageCutter {
         if (isSimpleGroupSum(agg, pipe)) {
           CutOk(toHashAgg(agg, pipe, complete))
         } else {
-          CutOk(StagePlan(
-            probe = pipe.probe,
-            builds = pipe.builds,
-            probeFilters = pipe.probeFilters ++ pipe.scanFilters,
-            groups = parsed.groups,
-            groupTypes = parsed.groupTypes,
-            aggs = parsed.aggs,
-            window = pipe.window,
-            complete = complete))
+            CutOk(StagePlan(
+              probe = pipe.probe,
+              builds = pipe.builds,
+              probeFilters = pipe.probeFilters ++ pipe.scanFilters,
+              groups = parsed.groups,
+              groupTypes = parsed.groupTypes,
+              aggs = parsed.aggs,
+              window = pipe.window,
+              complete = complete,
+              expand = pipe.expand))
         }
     }
   }
@@ -130,7 +133,8 @@ object NativeStageCutter {
               groupTypes = Nil,
               aggs = Nil,
               window = Some(spec),
-              complete = true))
+              complete = true,
+              expand = pipe.expand))
         }
     }
   }
@@ -140,14 +144,32 @@ object NativeStageCutter {
       builds: Seq[BuildJoin],
       probeFilters: Seq[FilterPred],
       scanFilters: Seq[FilterPred],
-      window: Option[WinSpec])
+      window: Option[WinSpec],
+      expand: Option[ExpandSpec] = None)
 
   private def lowerPipeline(plan: SparkPlan): Either[CutSkip, Pipe] = {
     unwrap(plan) match {
       case _: QueryStageExec =>
         Left(CutSkip("query-stage", "pipeline"))
-      case _: org.apache.spark.sql.execution.exchange.Exchange =>
-        Left(CutSkip("exchange", "pipeline"))
+      case e: Exchange =>
+        // Native stage re-reads parquet; ignore the shuffle wrapper.
+        lowerPipeline(e.child)
+      case s: SortExec =>
+        lowerPipeline(s.child)
+      case e: ExpandExec =>
+        parseExpand(e) match {
+          case Left(skip) => Left(skip)
+          case Right(spec) =>
+            lowerPipeline(e.child).flatMap { p =>
+              if (p.expand.isDefined) {
+                Left(CutSkip("nested-expand", "expand"))
+              } else {
+                Right(p.copy(expand = Some(spec)))
+              }
+            }
+        }
+      case u: UnionExec =>
+        lowerUnion(u)
       case j: BroadcastHashJoinExec =>
         lowerJoin(j)
       case j: SortMergeJoinExec =>
@@ -177,12 +199,33 @@ object NativeStageCutter {
           case None => Left(CutSkip("v2-scan", b.scan.getClass.getName))
           case Some(info) => scanToPipe(info)
         }
-      case a: HashAggregateExec =>
+      case a: BaseAggregateExec =>
         Left(CutSkip("nested-agg", a.nodeName))
       case other if other.children.size == 1 =>
         lowerPipeline(other.children.head)
       case other =>
         Left(CutSkip("unsupported-node", other.nodeName))
+    }
+  }
+
+  private def lowerUnion(u: UnionExec): Either[CutSkip, Pipe] = {
+    val kids = u.children.map(lowerPipeline)
+    kids.collectFirst { case Left(s) => s } match {
+      case Some(skip) => Left(skip)
+      case None =>
+        val pipes = kids.collect { case Right(p) => p }
+        if (pipes.exists(p => p.builds.nonEmpty || p.window.isDefined || p.expand.isDefined)) {
+          Left(CutSkip("union-join", "union"))
+        } else {
+          val files = pipes.flatMap(_.probe.files)
+          val cols = pipes.headOption.map(_.probe.columns).getOrElse(Nil)
+          Right(Pipe(
+            probe = ScanSpec(files, cols),
+            builds = Nil,
+            probeFilters = pipes.flatMap(_.probeFilters),
+            scanFilters = pipes.flatMap(_.scanFilters),
+            window = None))
+        }
     }
   }
 
@@ -372,7 +415,7 @@ object NativeStageCutter {
     }
   }
 
-  private def isCountStar(agg: HashAggregateExec): Boolean = {
+  private def isCountStar(agg: BaseAggregateExec): Boolean = {
     agg.groupingExpressions.isEmpty &&
       agg.aggregateExpressions.length == 1 && {
         val e = agg.aggregateExpressions.head
@@ -381,15 +424,16 @@ object NativeStageCutter {
       }
   }
 
-  private def isSimpleGroupSum(agg: HashAggregateExec, pipe: Pipe): Boolean = {
+  private def isSimpleGroupSum(agg: BaseAggregateExec, pipe: Pipe): Boolean = {
     pipe.builds.isEmpty &&
       pipe.window.isEmpty &&
+      pipe.expand.isEmpty &&
       agg.groupingExpressions.length == 1 &&
       agg.aggregateExpressions.length == 1 &&
       agg.aggregateExpressions.head.aggregateFunction.isInstanceOf[Sum]
   }
 
-  private def toHashAgg(agg: HashAggregateExec, pipe: Pipe, complete: Boolean): HashAgg = {
+  private def toHashAgg(agg: BaseAggregateExec, pipe: Pipe, complete: Boolean): HashAgg = {
     val e = agg.aggregateExpressions.head
     val filters = pipe.probeFilters ++ pipe.scanFilters
     HashAgg(
@@ -418,7 +462,7 @@ object NativeStageCutter {
       groupTypes: Seq[org.apache.spark.sql.types.DataType],
       aggs: Seq[AggCall])
 
-  private def parseAggs(agg: HashAggregateExec): AggParse = {
+  private def parseAggs(agg: BaseAggregateExec): AggParse = {
     val groups = agg.groupingExpressions.flatMap(leafName)
     if (groups.length != agg.groupingExpressions.length) {
       return AggParse(false, "group-expr", "", Nil, Nil, Nil)
@@ -462,6 +506,38 @@ object NativeStageCutter {
         leafName(a.child).map(n => AggCall(NativePlan.AGG_AVG, n, exprScale(a.child), dt))
       case _ => None
     }
+  }
+
+  private def parseExpand(e: ExpandExec): Either[CutSkip, ExpandSpec] = {
+    val names = e.output.map(_.name)
+    val projs = e.projections.map(_.map(parseExpandSlot))
+    if (projs.exists(_.exists(_.isEmpty))) {
+      Left(CutSkip("expand-expr", e.projections.flatten.map(_.prettyName).distinct.mkString(",")))
+    } else if (projs.exists(_.length != names.length)) {
+      Left(CutSkip("expand-width", e.nodeName))
+    } else {
+      Right(ExpandSpec(names, projs.map(_.flatten)))
+    }
+  }
+
+  private def parseExpandSlot(e: Expression): Option[ExpandSlot] = e match {
+    case a: Attribute => Some(ExpandSlot(NativePlan.EXPAND_COL, a.name))
+    case Alias(c, _) => parseExpandSlot(c)
+    case c: Cast => parseExpandSlot(c.child)
+    case Literal(null, _) => Some(ExpandSlot(NativePlan.EXPAND_NULL))
+    case Literal(v, _) => v match {
+      case i: java.lang.Integer => Some(ExpandSlot(NativePlan.EXPAND_LONG, lvalue = i.longValue()))
+      case l: java.lang.Long => Some(ExpandSlot(NativePlan.EXPAND_LONG, lvalue = l.longValue()))
+      case i: Int => Some(ExpandSlot(NativePlan.EXPAND_LONG, lvalue = i.toLong))
+      case l: Long => Some(ExpandSlot(NativePlan.EXPAND_LONG, lvalue = l))
+      case d: java.lang.Double => Some(ExpandSlot(NativePlan.EXPAND_DOUBLE, dvalue = d.doubleValue()))
+      case f: java.lang.Float => Some(ExpandSlot(NativePlan.EXPAND_DOUBLE, dvalue = f.doubleValue()))
+      case dec: Decimal => Some(ExpandSlot(NativePlan.EXPAND_DOUBLE, dvalue = dec.toDouble))
+      case s: UTF8String => Some(ExpandSlot(NativePlan.EXPAND_STR, svalue = s.toString))
+      case s: String => Some(ExpandSlot(NativePlan.EXPAND_STR, svalue = s))
+      case other => toLong(other).map(n => ExpandSlot(NativePlan.EXPAND_LONG, lvalue = n))
+    }
+    case _ => None
   }
 
   private def parseWindow(w: WindowExec): Either[CutSkip, WinSpec] = {
@@ -575,14 +651,14 @@ object NativeStageCutter {
     }
   }
 
-  private def sumScale(agg: HashAggregateExec): Int = {
+  private def sumScale(agg: BaseAggregateExec): Int = {
     agg.aggregateExpressions.head.aggregateFunction match {
       case s: Sum => exprScale(s.child)
       case _ => 0
     }
   }
 
-  private def sumName(agg: HashAggregateExec): Option[String] = {
+  private def sumName(agg: BaseAggregateExec): Option[String] = {
     agg.aggregateExpressions.head.aggregateFunction match {
       case s: Sum => leafName(s.child)
       case _ => None

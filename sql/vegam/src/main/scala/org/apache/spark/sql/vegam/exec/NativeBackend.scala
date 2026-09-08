@@ -33,7 +33,8 @@ object NativeBackend extends VegamBackend {
     if (!NativeTask.isLoaded) {
       throw SparkException.internalError("vegam native backend requested but libvegam is missing")
     }
-    val handle = NativeTask.createTask(NativePlanCodec.encode(plan), 0L, 0)
+    val threads = math.max(1, Runtime.getRuntime.availableProcessors())
+    val handle = NativeTask.createTask(NativePlanCodec.encode(plan), 0L, threads)
     if (handle == 0L) {
       throw SparkException.internalError("vegam createTask failed")
     }

@@ -22,7 +22,8 @@ import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark.SparkException
 import org.apache.spark.sql.vegam.plan.{
-  AggCall, BuildJoin, CountStar, FileRef, HashAgg, NativePlan, StagePlan, WinSpec}
+  AggCall, BuildJoin, CountStar, ExpandSlot, ExpandSpec, FileRef, HashAgg, NativePlan,
+  StagePlan, WinSpec}
 
 /**
  * IR interpreter used when libvegam is not loaded. Same [[NativePlan]] as
@@ -75,11 +76,15 @@ object JvmBackend extends VegamBackend {
         s.probeFilters.map(_.col) ++
         s.builds.flatMap(_.probeKeys) ++
         s.window.toSeq.flatMap(w => w.partitionBy ++ w.orderBy.map(_._1) ++ w.fns.map(_.col)) ++
+        s.expand.toSeq.flatMap(_.projections.flatten.map(_.col)) ++
         s.probe.columns
       ).filter(_.nonEmpty).distinct
     var table = readAll(s.probe.files, probeWant, s.probeFilters)
     s.builds.foreach { b =>
       table = join(table, b)
+    }
+    s.expand.foreach { e =>
+      table = expand(table, e)
     }
     s.window.foreach { w =>
       table = window(table, w)
@@ -205,6 +210,35 @@ object JvmBackend extends VegamBackend {
       i += 1
     }
     b.toString
+  }
+
+  private def expand(table: ParquetIO.Table, spec: ExpandSpec): ParquetIO.Table = {
+    val out = new ArrayBuffer[Array[Any]]()
+    table.rows.foreach { row =>
+      spec.projections.foreach { proj =>
+        val n = new Array[Any](spec.outCols.length)
+        var i = 0
+        while (i < proj.length && i < n.length) {
+          n(i) = expandSlot(table, row, proj(i))
+          i += 1
+        }
+        out += n
+      }
+    }
+    new ParquetIO.Table(spec.outCols.toArray, out)
+  }
+
+  private def expandSlot(table: ParquetIO.Table, row: Array[Any], s: ExpandSlot): Any = {
+    s.kind match {
+      case NativePlan.EXPAND_COL =>
+        val i = table.colIndex(s.col)
+        if (i >= 0) row(i) else null
+      case NativePlan.EXPAND_NULL => null
+      case NativePlan.EXPAND_LONG => s.lvalue
+      case NativePlan.EXPAND_DOUBLE => s.dvalue
+      case NativePlan.EXPAND_STR => s.svalue
+      case _ => null
+    }
   }
 
   private def window(table: ParquetIO.Table, w: WinSpec): ParquetIO.Table = {

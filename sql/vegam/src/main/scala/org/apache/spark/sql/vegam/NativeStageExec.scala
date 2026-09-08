@@ -81,7 +81,11 @@ object NativeStageExec {
     case CountStar(files) => Seq(files)
     case h: HashAgg if h.complete => Seq(h.files)
     case h: HashAgg => h.files.map(f => Seq(f))
-    case s: StagePlan if s.complete || s.window.isDefined => Seq(s.files)
+    // Joins re-read both sides. A file-per-task split would drop the SMJ
+    // Exchange that Spark omitted (join key == group key) and skip Final merge.
+    case s: StagePlan if s.complete || s.window.isDefined ||
+        s.builds.nonEmpty || s.expand.isDefined =>
+      Seq(s.files)
     case s: StagePlan => s.files.map(f => Seq(f))
     case other => Seq(other.files)
   }

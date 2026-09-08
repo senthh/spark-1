@@ -37,14 +37,14 @@ Java_org_apache_spark_sql_vegam_exec_NativeTask_createTask(
     jclass,
     jbyteArray plan_bytes,
     jlong,
-    jint) {
+    jint threads) {
   if (plan_bytes == nullptr) {
     return 0;
   }
   jsize n = env->GetArrayLength(plan_bytes);
   std::vector<uint8_t> buf(static_cast<size_t>(n));
   env->GetByteArrayRegion(plan_bytes, 0, n, reinterpret_cast<jbyte*>(buf.data()));
-  VegamTaskState* task = vegam_create_task(env, buf.data(), n);
+  VegamTaskState* task = vegam_create_task(env, buf.data(), n, threads);
   return reinterpret_cast<jlong>(task);
 }
 

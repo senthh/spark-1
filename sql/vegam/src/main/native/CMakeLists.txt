@@ -22,7 +22,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(JNI REQUIRED)
 
-set(VEGAM_SRC vegam_jni.cpp vegam_engine.cpp)
+set(VEGAM_SRC vegam_jni.cpp vegam_engine.cpp vegam_pipeline.cpp)
 
 if(DEFINED ENV{VELOX_HOME})
   add_compile_definitions(VEGAM_HAS_VELOX)

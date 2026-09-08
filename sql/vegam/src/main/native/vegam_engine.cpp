@@ -16,11 +16,13 @@
  */
 
 #include "vegam_engine.h"
+#include "vegam_pipeline.h"
+#include "vegam_scheduler.h"
 
 #include <cmath>
 #include <cstring>
-#include <sstream>
-#include <unordered_map>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -36,7 +38,18 @@ std::string jstring_to_std(JNIEnv* env, jstring js) {
   return s;
 }
 
-long footer_rows(JNIEnv* env, const std::string& path) {
+}  // namespace
+
+int VegamTable::col_index(const std::string& name) const {
+  for (size_t i = 0; i < names.size(); i++) {
+    if (names[i] == name) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+long vegam_footer_rows(JNIEnv* env, const std::string& path) {
   jclass cls = env->FindClass("org/apache/spark/sql/vegam/exec/HadoopBytes");
   if (cls == nullptr) {
     return 0;
@@ -52,9 +65,11 @@ long footer_rows(JNIEnv* env, const std::string& path) {
   return static_cast<long>(n);
 }
 
-VegamTable load_table(JNIEnv* env, const std::string& path,
-                      const std::vector<std::string>& cols,
-                      const std::vector<std::pair<std::string, std::string>>& parts) {
+VegamTable vegam_load_table(
+    JNIEnv* env,
+    const std::string& path,
+    const std::vector<std::string>& cols,
+    const std::vector<std::pair<std::string, std::string>>& parts) {
   VegamTable t;
   jclass cls = env->FindClass("org/apache/spark/sql/vegam/exec/HadoopBytes");
   if (cls == nullptr) {
@@ -118,7 +133,8 @@ VegamTable load_table(JNIEnv* env, const std::string& path,
         t.cols[c].values[r] = v[i];
         t.cols[c].nulls[r] = nuls[i] ? 1 : 0;
         if (texts != nullptr) {
-          auto ts = reinterpret_cast<jstring>(env->GetObjectArrayElement(texts, static_cast<jsize>(i)));
+          auto ts = reinterpret_cast<jstring>(
+              env->GetObjectArrayElement(texts, static_cast<jsize>(i)));
           if (ts != nullptr) {
             t.cols[c].texts[r] = jstring_to_std(env, ts);
             t.cols[c].text = true;
@@ -130,159 +146,30 @@ VegamTable load_table(JNIEnv* env, const std::string& path,
   return t;
 }
 
-int32_t read_i32(const uint8_t*& p, const uint8_t* end) {
-  if (p + 4 > end) {
-    return 0;
-  }
-  int32_t v = (static_cast<int32_t>(p[0]) << 24) | (static_cast<int32_t>(p[1]) << 16) |
-      (static_cast<int32_t>(p[2]) << 8) | static_cast<int32_t>(p[3]);
-  p += 4;
-  return v;
-}
-
-int64_t read_i64(const uint8_t*& p, const uint8_t* end) {
-  if (p + 8 > end) {
-    return 0;
-  }
-  int64_t v = (static_cast<int64_t>(p[0]) << 56) | (static_cast<int64_t>(p[1]) << 48) |
-      (static_cast<int64_t>(p[2]) << 40) | (static_cast<int64_t>(p[3]) << 32) |
-      (static_cast<int64_t>(p[4]) << 24) | (static_cast<int64_t>(p[5]) << 16) |
-      (static_cast<int64_t>(p[6]) << 8) | static_cast<int64_t>(p[7]);
-  p += 8;
-  return v;
-}
-
-std::string read_str(const uint8_t*& p, const uint8_t* end) {
-  int32_t n = read_i32(p, end);
-  if (n < 0 || p + n > end) {
-    return "";
-  }
-  std::string s(reinterpret_cast<const char*>(p), static_cast<size_t>(n));
-  p += n;
-  return s;
-}
-
-std::vector<std::string> read_strs(const uint8_t*& p, const uint8_t* end) {
-  int32_t n = read_i32(p, end);
-  std::vector<std::string> o;
-  o.reserve(n);
-  for (int i = 0; i < n; i++) {
-    o.push_back(read_str(p, end));
-  }
-  return o;
-}
-
-VegamTable count_star(JNIEnv* env, const std::vector<std::string>& files) {
-  double total = 0;
-  for (const auto& f : files) {
-    total += static_cast<double>(footer_rows(env, f));
-  }
-  VegamTable t;
-  t.num_rows = 1;
-  t.names = {"count"};
-  t.cols.resize(1);
-  t.cols[0].values = {total};
-  t.cols[0].nulls = {0};
-  t.cols[0].texts = {""};
-  return t;
-}
-
-void hash_agg_sum(const VegamTable& in, int gcol, int scol, VegamTable* out) {
-  std::unordered_map<long, double> sums;
-  std::unordered_map<long, char> seen;
-  if (gcol < 0 || scol < 0) {
-    return;
-  }
-  for (int r = 0; r < in.num_rows; r++) {
-    if (in.cols[gcol].nulls[r]) {
-      continue;
-    }
-    long k = static_cast<long>(in.cols[gcol].values[r]);
-    seen[k] = 1;
-    if (!in.cols[scol].nulls[r]) {
-      sums[k] += in.cols[scol].values[r];
-    }
-  }
-  out->num_rows = static_cast<int>(seen.size());
-  out->names = {in.names[gcol], in.names[scol]};
-  out->cols.resize(2);
-  out->cols[0].values.resize(out->num_rows);
-  out->cols[0].nulls.resize(out->num_rows, 0);
-  out->cols[1].values.resize(out->num_rows);
-  out->cols[1].nulls.resize(out->num_rows, 0);
-  int i = 0;
-  for (const auto& kv : seen) {
-    out->cols[0].values[i] = static_cast<double>(kv.first);
-    auto it = sums.find(kv.first);
-    if (it == sums.end()) {
-      out->cols[1].nulls[i] = 1;
-      out->cols[1].values[i] = NAN;
-    } else {
-      out->cols[1].values[i] = it->second;
-    }
-    i++;
-  }
-}
-
-}  // namespace
-
-int VegamTable::col_index(const std::string& name) const {
-  for (size_t i = 0; i < names.size(); i++) {
-    if (names[i] == name) {
-      return static_cast<int>(i);
-    }
-  }
-  return -1;
-}
-
-VegamTaskState* vegam_create_task(JNIEnv* env, const uint8_t* bytes, int n) {
+VegamTaskState* vegam_create_task(JNIEnv* env, const uint8_t* bytes, int n, int threads) {
   auto* task = new VegamTaskState();
-  const uint8_t* p = bytes;
-  const uint8_t* end = bytes + n;
-  int version = read_i32(p, end);
-  (void)version;
-  int kind = read_i32(p, end);
-  if (kind == 1) {
-    task->page = count_star(env, read_strs(p, end));
-  } else if (kind == 2) {
-    auto files = read_strs(p, end);
-    auto group = read_str(p, end);
-    auto sumc = read_str(p, end);
-#ifdef VEGAM_HAS_VELOX
-    if (!vegam_velox_scan_hash_agg(env, files, group, sumc, &task->page)) {
-      fprintf(stderr, "vegam: native HashAgg requires Velox scan+hashagg\n");
-    }
-#else
-    VegamTable acc;
-    bool first = true;
-    for (const auto& f : files) {
-      VegamTable part = load_table(env, f, {group, sumc}, {});
-      if (first) {
-        acc = std::move(part);
-        first = false;
-      } else {
-        int g = acc.col_index(group);
-        int s = acc.col_index(sumc);
-        int pg = part.col_index(group);
-        int ps = part.col_index(sumc);
-        if (g >= 0 && s >= 0 && pg >= 0 && ps >= 0) {
-          for (int r = 0; r < part.num_rows; r++) {
-            acc.cols[g].values.push_back(part.cols[pg].values[r]);
-            acc.cols[g].nulls.push_back(part.cols[pg].nulls[r]);
-            acc.cols[s].values.push_back(part.cols[ps].values[r]);
-            acc.cols[s].nulls.push_back(part.cols[ps].nulls[r]);
-            acc.num_rows++;
-          }
-        }
-      }
-    }
-    VegamTable out;
-    hash_agg_sum(acc, acc.col_index(group), acc.col_index(sumc), &out);
-    task->page = out;
-#endif
-  } else {
-    task->page.num_rows = 0;
+  VegamDecoded plan;
+  if (!vegam_decode_plan(bytes, n, &plan)) {
+    return task;
   }
+#ifdef VEGAM_HAS_VELOX
+  if (plan.kind == 2 && plan.filters.empty() && plan.builds.empty() &&
+      !plan.has_window && plan.groups.size() == 1 && plan.aggs.size() == 1) {
+    std::vector<std::string> files;
+    for (const auto& f : plan.probe.files) {
+      files.push_back(f.path);
+    }
+    if (vegam_velox_scan_hash_agg(env, files, plan.groups[0], plan.aggs[0].col,
+                                  &task->page)) {
+      return task;
+    }
+    fprintf(stderr, "vegam: velox scan+hashagg missed, fused pipeline fallback\n");
+  }
+#endif
+  int nthreads = threads > 0 ? threads : 1;
+  fprintf(stderr, "vegam: fused-stage kind=%d threads=%d morsel=%d\n",
+          plan.kind, nthreads, vegam::kMorselRows);
+  task->page = vegam_run_decoded(env, plan, nthreads);
   return task;
 }
 
