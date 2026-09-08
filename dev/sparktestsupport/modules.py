@@ -284,6 +284,15 @@ sql = Module(
     ),
 )
 
+vegam = Module(
+    name="vegam",
+    dependencies=[sql],
+    source_file_regexes=["sql/vegam"],
+    sbt_test_goals=[
+        "vegam/test",
+    ],
+)
+
 hive = Module(
     name="hive",
     dependencies=[sql],

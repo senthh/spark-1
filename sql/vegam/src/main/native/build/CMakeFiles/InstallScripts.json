@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/senthilkumar/Documents/Senthilkumar/OpenSource/spark-vegam/sql/vegam/src/main/native/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

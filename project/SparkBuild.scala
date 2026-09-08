@@ -64,10 +64,10 @@ object BuildCommons {
 
   val allProjects@Seq(
     core, graphx, mllib, mllibLocal, repl, networkCommon, networkShuffle, launcher, unsafe, tags, sketch, kvstore,
-    commonUtils, commonUtilsJava, variant, pipelines, _*
+    commonUtils, commonUtilsJava, variant, pipelines, vegam, _*
   ) = Seq(
     "core", "graphx", "mllib", "mllib-local", "repl", "network-common", "network-shuffle", "launcher", "unsafe",
-    "tags", "sketch", "kvstore", "common-utils", "common-utils-java", "variant", "pipelines"
+    "tags", "sketch", "kvstore", "common-utils", "common-utils-java", "variant", "pipelines", "vegam"
   ).map(ProjectRef(buildLocation, _)) ++ sqlProjects ++ streamingProjects ++ connectProjects ++
     udfWorkerProjects
 
@@ -379,6 +379,7 @@ object SparkBuild extends PomBuild {
         "org.apache.spark.sql.avro",
         "org.apache.spark.sql.metricview",
         "org.apache.spark.sql.pipelines",
+        "org.apache.spark.sql.vegam",
         "org.apache.spark.sql.scripting",
         "org.apache.spark.types.variant",
         "org.apache.spark.ui.flamegraph",
@@ -414,7 +415,7 @@ object SparkBuild extends PomBuild {
   val mimaProjects = allProjects.filterNot { x =>
     Seq(
       spark, hive, hiveThriftServer, repl, networkCommon, networkShuffle, networkYarn,
-      unsafe, tags, tokenProviderKafka010, sqlKafka010, pipelines, connectCommon, connect,
+      unsafe, tags, tokenProviderKafka010, sqlKafka010, pipelines, vegam, connectCommon, connect,
       connectJdbc, connectClient, variant, connectShims, profiler, commonUtilsJava,
       udfWorkerProto, udfWorkerCore
     ).contains(x)
