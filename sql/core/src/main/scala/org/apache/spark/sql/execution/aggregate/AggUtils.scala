@@ -128,6 +128,40 @@ object AggUtils {
     }
   }
 
+  /**
+   * Plans a single partial (pre-shuffle) aggregation phase, used to lower a logical
+   * [[org.apache.spark.sql.catalyst.plans.logical.PartialAggregate]] pushed below a `Union`.
+   *
+   * The resulting physical aggregate is a Partial-mode [[HashAggregateExec]] (or the suitable
+   * fallback) whose output is exactly `groupingAttributes ++ aggBufferAttributes`, matching the
+   * `output` of the logical [[org.apache.spark.sql.catalyst.plans.logical.PartialAggregate]] it
+   * lowers. The merge aggregate above re-groups on the same grouping attributes and reads the
+   * same aggregate-buffer columns, so the standard Partial -> shuffle -> Final execution path
+   * applies unchanged.
+   */
+  def planPartialAggregate(
+      groupingExpressions: Seq[NamedExpression],
+      aggregateExpressions: Seq[AggregateExpression],
+      child: SparkPlan): SparkPlan = {
+    // The partial emits the grouping keys followed by the immutable aggregation buffers.
+    val groupingAttributes = groupingExpressions.map(_.toAttribute)
+    val aggregateAttributes =
+      aggregateExpressions.flatMap(_.aggregateFunction.aggBufferAttributes)
+    val resultExpressions =
+      groupingAttributes ++
+        aggregateExpressions.flatMap(_.aggregateFunction.aggBufferAttributes)
+
+    createAggregate(
+      requiredChildDistributionExpressions = None,
+      isStreaming = false,
+      groupingExpressions = groupingExpressions,
+      aggregateExpressions = aggregateExpressions.map(_.copy(mode = Partial)),
+      aggregateAttributes = aggregateAttributes,
+      initialInputBufferOffset = 0,
+      resultExpressions = resultExpressions,
+      child = child)
+  }
+
   def planAggregateWithoutDistinct(
       groupingExpressions: Seq[NamedExpression],
       aggregateExpressions: Seq[AggregateExpression],

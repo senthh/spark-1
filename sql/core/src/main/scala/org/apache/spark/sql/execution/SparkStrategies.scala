@@ -1099,6 +1099,14 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
       case logical.ResolvedHint(child, hints) =>
         throw SparkException.internalError(
           "ResolvedHint operator should have been replaced by join hint in the optimizer")
+      case partial: logical.PartialAggregate =>
+        // A partial (pre-)aggregate pushed below a Union. We lower it directly to the existing
+        // physical partial aggregate so native (Gluten/Velox) execution is reused unchanged.
+        // AQE/EnsureRequirements will insert the shuffle before the merge aggregate just above.
+        AggUtils.planPartialAggregate(
+          partial.groupingExpressions,
+          partial.aggregateExpressions,
+          planLater(partial.child)) :: Nil
       case Deduplicate(_, child, _) if !child.isStreaming =>
         throw SparkException.internalError(
           "Deduplicate operator for non streaming data source should have been replaced " +

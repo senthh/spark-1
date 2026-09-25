@@ -68,6 +68,16 @@ object SizeInBytesOnlyStatsPlanVisitor extends LogicalPlanVisitor[Statistics] {
     }
   }
 
+  override def visitPartialAggregate(p: PartialAggregate): Statistics = {
+    if (p.groupingExpressions.isEmpty) {
+      Statistics(
+        sizeInBytes = EstimationUtils.getOutputSize(p.output, outputRowCount = 1),
+        rowCount = Some(1))
+    } else {
+      visitUnaryNode(p)
+    }
+  }
+
   override def visitDistinct(p: Distinct): Statistics = visitUnaryNode(p)
 
   override def visitExcept(p: Except): Statistics = p.left.stats.copy()

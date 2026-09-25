@@ -4408,6 +4408,31 @@ object SQLConf {
     .booleanConf
     .createWithDefault(false)
 
+  val OPTIMIZER_PARTIAL_AGGREGATE_PUSHDOWN_ENABLED =
+    buildConf("spark.sql.optimizer.partialAggregatePushdown.enabled")
+      .doc("When true, the Catalyst optimizer seeds first-class partial (pre-)aggregates from " +
+        "group-bys and pushes them down through operators that are safe to re-group (currently " +
+        "Union) so that inputs are collapsed before expensive boundaries. The merge aggregate " +
+        "above still recomputes the fully aggregated value, so results are always correct. " +
+        "Affects the amount of data exposed to shuffles and native (Gluten/Velox) execution.")
+      .version("5.0.0")
+      .withBindingPolicy(ConfigBindingPolicy.SESSION)
+      .booleanConf
+      .createWithDefault(true)
+
+  val OPTIMIZER_PARTIAL_AGGREGATE_PUSHDOWN_THRESHOLD =
+    buildConf("spark.sql.optimizer.partialAggregatePushdown.reductionThreshold")
+      .doc("Maximum reduction ratio (rows after partial aggregation / rows before) under which " +
+        "a pushed-down partial aggregate is retained. A partial aggregate is kept only if it is " +
+        "estimated to collapse the input rows to at most this fraction, since each partial needs " +
+        "its own aggregation map. Set to >= 1.0 to always keep the partial when estimated " +
+        "statistics are available.")
+      .version("5.0.0")
+      .withBindingPolicy(ConfigBindingPolicy.SESSION)
+      .doubleConf
+      .checkValue(_ >= 0.0, "The reduction ratio threshold must not be negative.")
+      .createWithDefault(0.5)
+
   val ADAPTIVE_PARTIAL_AGGREGATION_ENABLED =
     buildConf("spark.sql.execution.aggregate.adaptivePartialAggregation.enabled")
       .doc("When true, hash aggregation adaptively bypasses the pre-shuffle partial aggregation " +

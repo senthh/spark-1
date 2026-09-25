@@ -171,6 +171,7 @@ object RuleIdCollection {
       "org.apache.spark.sql.catalyst.optimizer.PushExtraPredicateThroughJoin" ::
       "org.apache.spark.sql.catalyst.optimizer.PushFoldableIntoBranches" ::
       "org.apache.spark.sql.catalyst.optimizer.PushLeftSemiLeftAntiThroughJoin" ::
+      "org.apache.spark.sql.catalyst.optimizer.PushPartialAggregateOverUnion" ::
       "org.apache.spark.sql.catalyst.optimizer.ReassignLambdaVariableID" ::
       "org.apache.spark.sql.catalyst.optimizer.RemoveLiteralFromGroupExpressions" ::
       "org.apache.spark.sql.catalyst.optimizer.RemoveNoopOperators" ::

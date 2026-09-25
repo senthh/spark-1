@@ -43,6 +43,13 @@ object BasicStatsPlanVisitor extends LogicalPlanVisitor[Statistics] {
     AggregateEstimation.estimate(p).getOrElse(fallback(p))
   }
 
+  override def visitPartialAggregate(p: PartialAggregate): Statistics = {
+    // A partial aggregate groups on the same keys as its final merge, so its output cardinality
+    // is the number of distinct groups - the same estimate a group-by on those keys would produce.
+    AggregateEstimation.estimate(Aggregate(
+      p.groupingExpressions, p.groupingExpressions, p.child)).getOrElse(fallback(p))
+  }
+
   override def visitDistinct(p: Distinct): Statistics = {
     val child = p.child
     visitAggregate(Aggregate(child.output, child.output, child))
