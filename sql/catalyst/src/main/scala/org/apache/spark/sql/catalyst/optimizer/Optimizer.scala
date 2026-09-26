@@ -2758,6 +2758,11 @@ object DecimalAggregates extends Rule[LogicalPlan] {
 
   def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
     _.containsAnyPattern(SUM, AVERAGE, MIN, MAX), ruleId) {
+    // A PartialAggregate's aggregate functions are pre-aggregation passes whose emitted buffer
+    // columns are consumed by the Final merge above. Rewriting a decimal Sum inside it (to
+    // MakeDecimal(Sum(UnscaledValue))) would change the buffer attributes/types the merge depends
+    // on, so leave it opaque.
+    case q @ (_: PartialAggregate) => q
     case q: LogicalPlan => q.transformExpressionsDownWithPruning(
       _.containsAnyPattern(SUM, AVERAGE, MIN, MAX), ruleId) {
       case we @ WindowExpression(ae @ AggregateExpression(af, _, _, _, _), _) => af match {

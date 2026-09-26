@@ -56,7 +56,9 @@ case class PartialAggregate(
     // tied to the function objects, so the Final merge above - which redirects the equivalent
     // Complete-mode functions to read these exact buffer columns - binds by construction. This is
     // the same buffer-contract the physical pre-shuffle partial aggregate produces.
-    val bufferAttributes = aggregateExpressions.flatMap(_.aggregateFunction.aggBufferAttributes)
+    val bufferAttributes = aggregateExpressions.collect {
+      case ae: AggregateExpression => ae.aggregateFunction.aggBufferAttributes
+    }.flatten
     groupingAttributes ++ bufferAttributes
   }
 

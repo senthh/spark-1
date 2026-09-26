@@ -22,6 +22,7 @@ import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.execution.aggregate.HashAggregateExec
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
+import org.apache.spark.util.Utils
 
 /**
  * Validates the partial (pre-)aggregation push-down below a Union.
@@ -39,6 +40,18 @@ class PushPartialAggregateOverUnionSuite
 
   private def withOptimization[A](enabled: Boolean)(f: => A): A =
     withSQLConf(SQLConf.OPTIMIZER_PARTIAL_AGGREGATE_PUSHDOWN_ENABLED.key -> enabled.toString)(f)
+
+  /** Registers `data` as a scan-backed temp view (parquet) so the partial push-down actually fires.
+   *  LocalRelation-backed views (toDF) are skipped by the rule by design (ConvertToLocalRelation
+   *  would collapse the tiny in-memory data and regenerate the partial's buffer exprIds). */
+  private def withScan(viewName: String, dir: java.io.File, df: DataFrame)(f: => Unit): Unit = {
+    val path = new java.io.File(dir, viewName).getAbsolutePath
+    df.write.mode("overwrite").parquet(path)
+    spark.read.parquet(path).createOrReplaceTempView(viewName)
+    f
+  }
+
+  private def scanDir(): java.io.File = Utils.createTempDir(namePrefix = "pa_scan")
 
   /** Runs `query` with the optimization on and off and asserts the results agree. */
   private def assertCorrectness(query: String, name: String): Unit = {
@@ -80,65 +93,110 @@ class PushPartialAggregateOverUnionSuite
     plan.exists(_.isInstanceOf[PartialAggregate])
 
   test("SUM over UNION ALL - results equal with optimization on/off, partial pushed") {
-    withTempView("t1", "t2") {
-      Seq((1, 5), (1, 7), (2, 1), (3, 0)).toDF("k", "v").createOrReplaceTempView("t1")
-      Seq((1, 9), (2, 4), (2, 6), (4, 2)).toDF("k", "v").createOrReplaceTempView("t2")
-      val q = """SELECT k, SUM(v) AS s FROM (SELECT * FROM t1 UNION ALL SELECT * FROM t2)
-                |GROUP BY k ORDER BY k""".stripMargin
-      assertCorrectness(q, "sum union")
-      assertPartialBelowUnion(sql(q))
-    }
+    val dir = scanDir()
+    try {
+      val t1 = Seq((1, 5), (1, 7), (2, 1), (3, 0)).toDF("k", "v")
+      val t2 = Seq((1, 9), (2, 4), (2, 6), (4, 2)).toDF("k", "v")
+      withScan("t1", dir, t1) { withScan("t2", dir, t2) {
+        val q = """SELECT k, SUM(v) AS s FROM (SELECT * FROM t1 UNION ALL SELECT * FROM t2)
+                  |GROUP BY k ORDER BY k""".stripMargin
+        assertCorrectness(q, "sum union")
+        assertPartialBelowUnion(sql(q))
+      }}
+    } finally { Utils.deleteRecursively(dir) }
   }
 
   test("MIN/MAX/COUNT over UNION ALL") {
-    withTempView("t1", "t2") {
-      Seq((1, 5), (1, 7), (2, 1), (3, 0)).toDF("k", "v").createOrReplaceTempView("t1")
-      Seq((1, 9), (2, 4), (2, 6), (4, 2)).toDF("k", "v").createOrReplaceTempView("t2")
-      val q = """SELECT k, MIN(v) AS mn, MAX(v) AS mx, COUNT(*) AS c
-                |FROM (SELECT * FROM t1 UNION ALL SELECT * FROM t2)
-                |GROUP BY k ORDER BY k""".stripMargin
-      assertCorrectness(q, "min max count union")
-      assertPartialBelowUnion(sql(q))
-    }
+    val dir = scanDir()
+    try {
+      val t1 = Seq((1, 5), (1, 7), (2, 1), (3, 0)).toDF("k", "v")
+      val t2 = Seq((1, 9), (2, 4), (2, 6), (4, 2)).toDF("k", "v")
+      withScan("t1", dir, t1) { withScan("t2", dir, t2) {
+        val q = """SELECT k, MIN(v) AS mn, MAX(v) AS mx, COUNT(*) AS c
+                  |FROM (SELECT * FROM t1 UNION ALL SELECT * FROM t2)
+                  |GROUP BY k ORDER BY k""".stripMargin
+        assertCorrectness(q, "min max count union")
+        assertPartialBelowUnion(sql(q))
+      }}
+    } finally { Utils.deleteRecursively(dir) }
   }
 
   test("all-null group stays NULL under partial SUM merge") {
-    withTempView("t1", "t2") {
+    val dir = scanDir()
+    try {
       // t1 has a group k=1 with all-null v; t2 has no row for k=1. Original result must be NULL.
-      Seq((1, None), (2, Some(3))).toDF("k", "v").createOrReplaceTempView("t1")
-      Seq((2, Some(4)), (3, Some(1))).toDF("k", "v").createOrReplaceTempView("t2")
-      val q = """SELECT k, SUM(v) AS s FROM (SELECT * FROM t1 UNION ALL SELECT * FROM t2)
-                |GROUP BY k ORDER BY k""".stripMargin
-      assertCorrectness(q, "all-null sum union")
-    }
+      val t1 = Seq((1, None), (2, Some(3))).toDF("k", "v")
+      val t2 = Seq((2, Some(4)), (3, Some(1))).toDF("k", "v")
+      withScan("t1", dir, t1) { withScan("t2", dir, t2) {
+        val q = """SELECT k, SUM(v) AS s FROM (SELECT * FROM t1 UNION ALL SELECT * FROM t2)
+                  |GROUP BY k ORDER BY k""".stripMargin
+        assertCorrectness(q, "all-null sum union")
+      }}
+    } finally { Utils.deleteRecursively(dir) }
   }
 
   test("UNION ALL of overlapping groups with all functions") {
-    withTempView("t1", "t2") {
-      Seq((1, None), (1, Some(5)), (2, Some(3)), (3, None)).toDF("k", "v")
-        .createOrReplaceTempView("t1")
-      Seq((1, Some(2)), (3, Some(7)), (3, Some(0)), (4, None)).toDF("k", "v")
-        .createOrReplaceTempView("t2")
-      val q = """SELECT k, SUM(v) AS s, COUNT(v) AS c, MIN(v) AS mn, MAX(v) AS mx
-                |FROM (SELECT * FROM t1 UNION ALL SELECT * FROM t2)
-                |GROUP BY k ORDER BY k""".stripMargin
-      assertCorrectness(q, "overlapping groups union")
-      assertPartialBelowUnion(sql(q))
-    }
+    val dir = scanDir()
+    try {
+      val t1 = Seq((1, None), (1, Some(5)), (2, Some(3)), (3, None)).toDF("k", "v")
+      val t2 = Seq((1, Some(2)), (3, Some(7)), (3, Some(0)), (4, None)).toDF("k", "v")
+      withScan("t1", dir, t1) { withScan("t2", dir, t2) {
+        val q = """SELECT k, SUM(v) AS s, COUNT(v) AS c, MIN(v) AS mn, MAX(v) AS mx
+                  |FROM (SELECT * FROM t1 UNION ALL SELECT * FROM t2)
+                  |GROUP BY k ORDER BY k""".stripMargin
+        assertCorrectness(q, "overlapping groups union")
+        assertPartialBelowUnion(sql(q))
+      }}
+    } finally { Utils.deleteRecursively(dir) }
   }
 
   test("DECIMAL SUM over UNION ALL - all-empty group stays NULL, partial fired") {
-    withTempView("t1", "t2") {
+    val dir = scanDir()
+    try {
       // t1 has a group with all-null decimal v (must stay NULL, not 0); t2 contributes to it too.
-      Seq((1, Some(BigDecimal("10.50"))), (2, None), (2, Some(BigDecimal("3.25")))).toDF("k", "v")
-        .createOrReplaceTempView("t1")
-      Seq((1, Some(BigDecimal("4.00"))), (2, None), (3, Some(BigDecimal("1.10")))).toDF("k", "v")
-        .createOrReplaceTempView("t2")
-      val q = """SELECT k, SUM(CAST(v AS DECIMAL(12,2))) AS s
-                |FROM (SELECT * FROM t1 UNION ALL SELECT * FROM t2)
-                |GROUP BY k ORDER BY k""".stripMargin
-      assertCorrectness(q, "decimal sum union")
+      val t1 = Seq((1, Some(BigDecimal("10.50"))), (2, None), (2, Some(BigDecimal("3.25")))).toDF("k", "v")
+      val t2 = Seq((1, Some(BigDecimal("4.00"))), (2, None), (3, Some(BigDecimal("1.10")))).toDF("k", "v")
+      withScan("t1", dir, t1) { withScan("t2", dir, t2) {
+        val q = """SELECT k, SUM(CAST(v AS DECIMAL(12,2))) AS s
+                  |FROM (SELECT * FROM t1 UNION ALL SELECT * FROM t2)
+                  |GROUP BY k ORDER BY k""".stripMargin
+        assertCorrectness(q, "decimal sum union")
+        assertPartialBelowUnion(sql(q))
+      }}
+    } finally { Utils.deleteRecursively(dir) }
+  }
+
+  test("q76 shape: stored decimal SUM column + COUNT over 3-way union (DecimalAggregates guard)") {
+    val dir = Utils.createTempDir(namePrefix = "pa_q76")
+    try {
+      def mkd(name: String, v: Seq[(String, String, Int, Int, String, java.math.BigDecimal)]) = {
+        v.toDF("channel", "col", "yr", "qoy", "cat", "ext")
+          .withColumn("ext2", $"ext".cast("decimal(7,2)")).drop("ext").withColumnRenamed("ext2", "ext")
+          .write.mode("overwrite").parquet(new java.io.File(dir, name).getAbsolutePath)
+      }
+      mkd("s", Seq(
+        ("store", "a", 1999, 1, "c1", new java.math.BigDecimal("10.50")),
+        ("store", "b", 2000, 2, "c1", new java.math.BigDecimal("1.25"))))
+      mkd("w", Seq(("web", "x", 1999, 1, "c1", new java.math.BigDecimal("5.00"))))
+      mkd("c", Seq(("catalog", "y", 2000, 2, "c2", new java.math.BigDecimal("9.90"))))
+      def read(n: String) = spark.read.parquet(new java.io.File(dir, n).getAbsolutePath)
+      read("s").createOrReplaceTempView("s")
+      read("w").createOrReplaceTempView("w")
+      read("c").createOrReplaceTempView("c")
+      val q = """SELECT channel, col, yr, qoy, cat,
+                |       COUNT(*) AS sales_cnt, SUM(ext) AS sales_amt
+                |FROM (SELECT * FROM s UNION ALL SELECT * FROM w UNION ALL SELECT * FROM c) t
+                |GROUP BY channel, col, yr, qoy, cat
+                |ORDER BY channel, col, yr, qoy, cat LIMIT 100""".stripMargin
+      // Correctness: on/off must agree; and the stored-decimal SUM column must not be clobbered by
+      // Spark's DecimalAggregates (which historically rewrote inside the partial and broke it).
+      assertCorrectness(q, "q76 shape")
       assertPartialBelowUnion(sql(q))
+      // Type of the SUM column is preserved.
+      val amtType = withOptimization(enabled = true) { sql(q).schema("sales_amt").dataType.typeName }
+      assert(amtType == "decimal(17,2)", s"unexpected sales_amt type: $amtType")
+    } finally {
+      Utils.deleteRecursively(dir)
     }
   }
 

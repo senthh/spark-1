@@ -20,7 +20,7 @@ package org.apache.spark.sql.catalyst.optimizer
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, Cast, If, Literal, NamedExpression, Not}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, AggregateFunction, Count, Max, Min, Partial, Sum}
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, LogicalPlan, PartialAggregate, Project, Union}
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, LogicalPlan, PartialAggregate, Project, Range, Union}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern.{AGGREGATE, UNION}
 import org.apache.spark.sql.internal.SQLConf
@@ -74,8 +74,23 @@ object PushPartialAggregateOverUnion extends Rule[LogicalPlan] with Logging {
           // Do not re-fire in the fixed-point batch: once we push partials into a union's arms,
           // the new merge Aggregate above still has a Union child and would otherwise match again,
           // nesting partial aggregates indefinitely. Skip if any arm is already a partial.
-          !child.children.exists(_.isInstanceOf[PartialAggregate]) =>
+          !child.children.exists(_.isInstanceOf[PartialAggregate]) &&
+          // A pre-aggregate pays for itself only on real (scan-backed) input. In-memory data
+          // (LocalRelation/Range from toDF/range) is collapsed into a single LocalRelation by the
+          // optimizer's "LocalRelation" batch (ConvertToLocalRelation, UpdateAttributeNullability).
+          // which rebuilds our PartialAggregate's aggregate-expressions and thereby regenerates
+          // its aggBufferAttributes exprIds - orphaning the merge references. Skip such arms: the
+          // tiny local input makes a partial pointless anyway.
+          !isLocallyBacked(child) =>
       constructPartial(agg)
+  }
+
+  /** True if any union arm is backed by in-memory (Range/LocalRelation) data. */
+  private def isLocallyBacked(union: Union): Boolean = union.children.exists { arm =>
+    arm.exists { n =>
+      n.isInstanceOf[Range] ||
+      n.isInstanceOf[org.apache.spark.sql.catalyst.plans.logical.LocalRelation]
+    }
   }
 
   /**
