@@ -89,6 +89,12 @@ cmake -S "${VELOX_HOME}" -B "${BUILD_DIR}" -GNinja \
 
 cmake --build "${BUILD_DIR}" --target velox -j "${JOBS}"
 
+# The bundled gflags is static only, and both libglog.so and libvelox.so
+# absorb a copy; loaded together they abort on duplicate flag registration.
+# Relink libvelox.so without it so it uses the copy libglog.so exports.
+(cd "${BUILD_DIR}" && ninja -t commands lib/libvelox.so | tail -1 \
+  | sed "s# _deps/gflags-build/libgflags_nothreads.a##g" | bash)
+
 export VELOX_HOME
 export VELOX_LIB="${BUILD_DIR}/lib/libvelox.so"
 if [ ! -f "${VELOX_LIB}" ]; then
