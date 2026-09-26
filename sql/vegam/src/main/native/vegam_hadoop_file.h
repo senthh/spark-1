@@ -29,11 +29,13 @@ namespace facebook::velox {
 /**
  * Velox ReadFile that pulls byte ranges through HadoopBytes JNI.
  * No libhdfs. POSIX, hdfs://, and s3a:// use the same Java Hadoop client.
+ * pread attaches the calling thread to the JVM so Velox drivers can
+ * run off the JNI entry thread.
  */
 class HadoopReadFile : public ReadFile {
  public:
-  HadoopReadFile(JNIEnv* env, std::string path);
-  ~HadoopReadFile() override;
+  explicit HadoopReadFile(std::string path);
+  ~HadoopReadFile() override = default;
 
   std::string_view pread(
       uint64_t offset,
@@ -62,11 +64,14 @@ class HadoopReadFile : public ReadFile {
   }
 
  private:
-  JNIEnv* env_;
   std::string path_;
   uint64_t size_;
 };
 
-} // namespace facebook::velox
+}  // namespace facebook::velox
+
+void vegam_set_javavm(JavaVM* vm);
+JNIEnv* vegam_jni_env();
+void vegam_register_hadoop_fs();
 
 #endif

@@ -24,7 +24,9 @@ import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.vegam.exec.NativeTask
-import org.apache.spark.sql.vegam.plan.{CountStar, HashAgg, NativePlanCodec}
+import org.apache.spark.sql.types.{DecimalType, LongType}
+import org.apache.spark.sql.vegam.plan.{AggCall, BuildJoin, CountStar, FileRef, HashAgg,
+  NativePlan, NativePlanCodec, ScanSpec, StagePlan}
 
 class VegamPathsSuite extends org.apache.spark.SparkFunSuite {
   test("isPosix accepts local and file URIs only") {
@@ -108,6 +110,39 @@ class NativePlanCodecSuite extends org.apache.spark.SparkFunSuite {
     assert(back.expand.isDefined)
     assert(back.expand.get.projections.length === 2)
     assert(back.groups === Seq("k", "gid"))
+  }
+
+  test("round-trip StagePlan file ranges, scan types, build mode and agg input") {
+    val plan = StagePlan(
+      probe = ScanSpec(
+        Seq(FileRef("/tmp/a.parquet", Seq("d" -> "1"), 0L, 128L),
+          FileRef("/tmp/a.parquet", Seq("d" -> "1"), 128L, 64L)),
+        Seq("k", "v"),
+        Seq("bigint", "decimal(7,2)")),
+      builds = Seq(BuildJoin(
+        ScanSpec(Seq(FileRef("/tmp/b.parquet", Nil)), Seq("bk"), Seq("bigint")),
+        probeKeys = Seq("k"),
+        buildKeys = Seq("bk"),
+        joinType = NativePlan.JOIN_INNER,
+        filters = Nil,
+        broadcast = false)),
+      probeFilters = Nil,
+      groups = Seq("k"),
+      groupTypes = Seq(LongType),
+      aggs = Seq(AggCall(NativePlan.AGG_SUM, "v", 2, DecimalType(17, 2),
+        NativePlan.INPUT_UNSCALED)),
+      window = None,
+      complete = false)
+    assert(NativePlanCodec.decode(NativePlanCodec.encode(plan)) === plan)
+  }
+
+  test("wholeFiles keeps one whole-file ref per file") {
+    val refs = Seq(
+      FileRef("/tmp/a.parquet", Nil, 0L, 100L),
+      FileRef("/tmp/a.parquet", Nil, 100L, 100L),
+      FileRef("/tmp/b.parquet", Nil, 0L, 50L))
+    assert(FileRef.wholeFiles(refs) ===
+      Seq(FileRef("/tmp/a.parquet", Nil), FileRef("/tmp/b.parquet", Nil)))
   }
 }
 
@@ -227,6 +262,48 @@ class VegamSuite extends SharedSparkSession {
               df.queryExecution.executedPlan.toString)
             checkAnswer(df, Seq((2001, "b1", 1.5)).toDF("year", "brand", "sum(price)"))
           }
+        }
+      }
+    }
+  }
+
+  test("the same dim joined twice stays on Spark") {
+    withTempPath { fact =>
+      withTempPath { dim =>
+        val fp = fact.getCanonicalPath
+        val dp = dim.getCanonicalPath
+        Seq((1L, 2L, 1.5), (2L, 1L, 2.5)).toDF("a", "b", "v").write.parquet(fp)
+        Seq((1L, "x"), (2L, "y")).toDF("sk", "name").write.parquet(dp)
+        withVegam {
+          val df = sql(
+            s"SELECT d1.name, d2.name, SUM(f.v) FROM parquet.`$fp` f " +
+              s"JOIN parquet.`$dp` d1 ON f.a = d1.sk " +
+              s"JOIN parquet.`$dp` d2 ON f.b = d2.sk " +
+              "GROUP BY d1.name, d2.name")
+          assert(!hasNative(df.queryExecution.executedPlan),
+            df.queryExecution.executedPlan.toString)
+          checkAnswer(df, Seq(Row("x", "y", 1.5), Row("y", "x", 2.5)))
+        }
+      }
+    }
+  }
+
+  test("a file split into many ranges is read once") {
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      spark.range(0, 20000).selectExpr("id % 7 AS k", "CAST(id AS DOUBLE) AS v")
+        .coalesce(1).write.parquet(path)
+      withVegam {
+        withSQLConf(
+            SQLConf.FILES_MAX_PARTITION_BYTES.key -> "4096",
+            SQLConf.FILES_OPEN_COST_IN_BYTES.key -> "0") {
+          val df = sql(s"SELECT k, COUNT(*), SUM(v) FROM parquet.`$path` GROUP BY k")
+          assert(hasNative(df.queryExecution.executedPlan),
+            df.queryExecution.executedPlan.toString)
+          val expected = (0L until 20000L).groupBy(_ % 7).map { case (k, ids) =>
+            Row(k, ids.length.toLong, ids.sum.toDouble)
+          }.toSeq
+          checkAnswer(df, expected)
         }
       }
     }

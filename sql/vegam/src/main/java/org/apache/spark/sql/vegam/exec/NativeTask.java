@@ -57,5 +57,18 @@ public final class NativeTask {
       boolean[] nulls,
       int[] meta);
 
+  /**
+   * True when the task streams Arrow batches through {@link #nextBatch} rather
+   * than double pages through {@link #nextPage}.
+   */
+  public static native boolean isArrow(long handle);
+
+  /**
+   * Exports the next batch into caller-allocated Arrow C Data Interface structs
+   * (ArrowArray / ArrowSchema at the given addresses). Returns the row count,
+   * or -1 at EOF. Throws RuntimeException if the native stage failed.
+   */
+  public static native int nextBatch(long handle, long arrowArray, long arrowSchema);
+
   public static native void close(long handle);
 }

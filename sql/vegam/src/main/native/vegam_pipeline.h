@@ -36,17 +36,26 @@ struct VegamFilter {
 struct VegamFileRef {
   std::string path;
   std::vector<std::pair<std::string, std::string>> parts;
+  // Byte range. length < 0 means the whole file.
+  int64_t start = 0;
+  int64_t length = -1;
 };
 
 struct VegamScan {
   std::vector<VegamFileRef> files;
   std::vector<std::string> columns;
+  // Spark DataType.simpleString per column; empty for old plans.
+  std::vector<std::string> types;
 };
 
 struct VegamAgg {
   int kind = 0;
   std::string col;
   int scale = 0;
+  // Spark result type as DataType.json, e.g. {"type":"decimal(17,2)"...}.
+  std::string type_json;
+  // "", "unscaled", "cast:<spark type>" or "?" (see AggCall.input).
+  std::string input;
 };
 
 struct VegamBuild {
@@ -55,6 +64,7 @@ struct VegamBuild {
   std::vector<std::string> build_keys;
   int join_type = 1;
   std::vector<VegamFilter> filters;
+  bool broadcast = true;
 };
 
 struct VegamWinFn {
@@ -88,6 +98,7 @@ struct VegamDecoded {
   std::vector<VegamBuild> builds;
   std::vector<VegamFilter> filters;
   std::vector<std::string> groups;
+  std::vector<std::string> group_types;
   std::vector<VegamAgg> aggs;
   bool has_window = false;
   VegamWin window;

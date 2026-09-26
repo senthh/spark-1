@@ -17,10 +17,21 @@
 
 package org.apache.spark.sql.vegam.exec
 
+import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.sql.vegam.plan.NativePlan
 
 trait VegamTask extends Serializable {
   def nextPage(): Option[VegamPage]
+
+  /** True when results come from [[nextBatch]] instead of [[nextPage]]. */
+  def isColumnar: Boolean = false
+
+  /**
+   * Next typed batch. The batch is valid until the next call or [[close]];
+   * callers must copy what they keep.
+   */
+  def nextBatch(): Option[ColumnarBatch] = None
+
   def close(): Unit
 }
 

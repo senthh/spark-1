@@ -26,6 +26,8 @@ import org.apache.spark.sql.types.DataType
 sealed trait NativePlan extends Serializable {
   def files: Seq[String]
   def withFiles(newFiles: Seq[String]): NativePlan
+  /** Replaces the probe-side file ranges with one task's split. */
+  def withProbeRefs(refs: Seq[FileRef]): NativePlan
 }
 
 object NativePlan {
@@ -58,6 +60,11 @@ object NativePlan {
   val EXPAND_LONG: Int = 3
   val EXPAND_DOUBLE: Int = 4
   val EXPAND_STR: Int = 5
+
+  // AggCall.input: how the aggregate input is derived from AggCall.col.
+  val INPUT_UNSCALED: String = "unscaled"
+  val INPUT_CAST_PREFIX: String = "cast:"
+  val INPUT_UNSUPPORTED: String = "?"
 }
 
 case class FilterPred(
@@ -70,28 +77,58 @@ case class FilterPred(
   def isString: Boolean = strValue != null && strValue.nonEmpty
 }
 
+/**
+ * `input` is empty when the aggregate reads `col` as is, [[NativePlan.INPUT_UNSCALED]]
+ * for UnscaledValue(col), `cast:<type>` for Cast(col as type), and
+ * [[NativePlan.INPUT_UNSUPPORTED]] for anything else (exact backends must reject it).
+ */
 case class AggCall(
     kind: Int,
     col: String,
     scale: Int,
-    dataType: DataType) extends Serializable
+    dataType: DataType,
+    input: String = "") extends Serializable
 
+/**
+ * One file range to read. `length < 0` means the whole file. Spark may split a
+ * large file into several ranges; only readers that honor ranges may be given
+ * ranges with `start > 0` (see [[FileRef.wholeFiles]]).
+ */
 case class FileRef(
     path: String,
-    parts: Seq[(String, String)]) extends Serializable
+    parts: Seq[(String, String)],
+    start: Long = 0L,
+    length: Long = -1L) extends Serializable
 
+object FileRef {
+  /** Keeps one whole-file ref per path, for readers that ignore ranges. */
+  def wholeFiles(refs: Seq[FileRef]): Seq[FileRef] =
+    refs.filter(_.start == 0L).map(_.copy(length = -1L))
+}
+
+/**
+ * `types` holds the Spark type of each entry of `columns` as
+ * `DataType.simpleString` (e.g. "int", "decimal(7,2)", "string"); it is empty
+ * for plans built before types were carried.
+ */
 case class ScanSpec(
     files: Seq[FileRef],
-    columns: Seq[String]) extends Serializable {
+    columns: Seq[String],
+    types: Seq[String] = Nil) extends Serializable {
   def paths: Seq[String] = files.map(_.path)
 }
 
+/**
+ * `broadcast` is true when the build side came from a BroadcastHashJoin, so
+ * every task may read the whole build side next to its own probe split.
+ */
 case class BuildJoin(
     scan: ScanSpec,
     probeKeys: Seq[String],
     buildKeys: Seq[String],
     joinType: Int,
-    filters: Seq[FilterPred]) extends Serializable
+    filters: Seq[FilterPred],
+    broadcast: Boolean = true) extends Serializable
 
 case class WindowCall(kind: Int, col: String, alias: String) extends Serializable
 
@@ -113,6 +150,9 @@ case class ExpandSpec(
 
 case class CountStar(files: Seq[String]) extends NativePlan {
   override def withFiles(newFiles: Seq[String]): NativePlan = copy(files = newFiles)
+
+  override def withProbeRefs(refs: Seq[FileRef]): NativePlan =
+    copy(files = FileRef.wholeFiles(refs).map(_.path))
 }
 
 case class HashAgg(
@@ -133,6 +173,11 @@ case class HashAgg(
     copy(
       files = newFiles,
       fileRefs = newFiles.map(p => byPath.getOrElse(p, FileRef(p, Nil))))
+  }
+
+  override def withProbeRefs(refs: Seq[FileRef]): NativePlan = {
+    val whole = FileRef.wholeFiles(refs)
+    copy(files = whole.map(_.path), fileRefs = whole)
   }
 
   def groups: Seq[String] = if (groupCols.nonEmpty) groupCols else Seq(groupCol)
@@ -177,4 +222,7 @@ case class StagePlan(
     val next = newFiles.map(p => byPath.getOrElse(p, FileRef(p, Nil)))
     copy(probe = probe.copy(files = next))
   }
+
+  override def withProbeRefs(refs: Seq[FileRef]): NativePlan =
+    copy(probe = probe.copy(files = refs))
 }

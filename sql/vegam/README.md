@@ -1,8 +1,20 @@
 # Vegam native engine
 
+Spark-Vegam is Spark's native SQL engine. Spark talks to Vegam only.
+
+```
+Spark-Gluten-Velox:  Spark -> Substrait (Gluten) -> Velox
+Spark-Vegam:         Spark -> NativePlan (Vegam) -> fused native stage
+```
+
+There is no Gluten plugin and no Substrait. That conversion layer is the
+tax we skip. Velox, when `VELOX_HOME` is set, is a **kernel library
+inside libvegam** (TableScan, HashAggregation, expr). It is not the
+engine Spark sees.
+
 Vegam rewrites a **whole physical stage** to `NativeStageExec` and runs a
-closed IR (`NativePlan`). No Substrait. If the stage cannot lower, Spark
-keeps the original plan.
+closed IR (`NativePlan`). If the stage cannot lower, Spark keeps the
+original plan.
 
 ## Enable
 
@@ -46,10 +58,18 @@ cmake --build build
 # libvegam.so / libvegam.dylib on java.library.path
 ```
 
-C++ owns `createTask` / `nextPage` / `close`. With `VELOX_HOME`, HashAgg
-is Velox TableScan (parquet) plus Velox HashAggregation. Byte ranges come
-from `HadoopBytes.pread` (Java Hadoop FS). No libhdfs. Vectors stay in
-Velox until the stage edge (`nextPage`).
+C++ owns `createTask` / `nextBatch` / `close`. With `VELOX_HOME`, a
+partial-aggregation stage (scan, filters, broadcast hash joins, partial
+agg) is one Velox Task: Hive TableScan over the task's Spark file ranges,
+HashJoin, and a Spark-semantics partial AggregationNode whose output
+matches Spark's buffer layout. Batches cross to the JVM once, as Arrow C
+Data. Window / expand / complete aggregation and shuffle-side joins fall
+back to the fused C++ pipeline.
+
+Velox is pinned by `dev/build_velox_centos.sh`; `dev/bundle_libs.sh`
+packs libvegam and its shared libraries for `--archives`, and
+`dev/run_tpcds_yarn.sh` runs the value-compare TPC-DS gate
+(`dev/run_tpcds.py`) for Vegam or Gluten with the same resources.
 
 Without `VELOX_HOME` the in-process hash table is used (local/Mac builds).
 

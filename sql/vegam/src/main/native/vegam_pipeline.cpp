@@ -140,7 +140,7 @@ std::vector<VegamFilter> read_filters(const uint8_t*& p, const uint8_t* end) {
   return o;
 }
 
-std::vector<VegamAgg> read_aggs(const uint8_t*& p, const uint8_t* end) {
+std::vector<VegamAgg> read_aggs(const uint8_t*& p, const uint8_t* end, int version) {
   int32_t n = read_i32(p, end);
   std::vector<VegamAgg> o;
   o.reserve(n);
@@ -149,13 +149,16 @@ std::vector<VegamAgg> read_aggs(const uint8_t*& p, const uint8_t* end) {
     a.kind = read_i32(p, end);
     a.col = read_str(p, end);
     a.scale = read_i32(p, end);
-    read_str(p, end);
+    a.type_json = read_str(p, end);
+    if (version >= 4) {
+      a.input = read_str(p, end);
+    }
     o.push_back(a);
   }
   return o;
 }
 
-std::vector<VegamFileRef> read_refs(const uint8_t*& p, const uint8_t* end) {
+std::vector<VegamFileRef> read_refs(const uint8_t*& p, const uint8_t* end, int version) {
   int32_t n = read_i32(p, end);
   std::vector<VegamFileRef> o;
   o.reserve(n);
@@ -168,15 +171,22 @@ std::vector<VegamFileRef> read_refs(const uint8_t*& p, const uint8_t* end) {
       auto v = read_str(p, end);
       r.parts.emplace_back(k, v);
     }
+    if (version >= 4) {
+      r.start = read_i64(p, end);
+      r.length = read_i64(p, end);
+    }
     o.push_back(r);
   }
   return o;
 }
 
-VegamScan read_scan(const uint8_t*& p, const uint8_t* end) {
+VegamScan read_scan(const uint8_t*& p, const uint8_t* end, int version) {
   VegamScan s;
-  s.files = read_refs(p, end);
+  s.files = read_refs(p, end, version);
   s.columns = read_strs(p, end);
+  if (version >= 4) {
+    s.types = read_strs(p, end);
+  }
   return s;
 }
 
@@ -882,8 +892,8 @@ bool vegam_decode_plan(const uint8_t* bytes, int n, VegamDecoded* out) {
       read_str(p, end);
       out->complete = read_bool(p, end);
       out->groups = read_strs(p, end);
-      out->aggs = read_aggs(p, end);
-      out->probe.files = read_refs(p, end);
+      out->aggs = read_aggs(p, end, version);
+      out->probe.files = read_refs(p, end, version);
     } else {
       for (const auto& f : files) {
         out->probe.files.push_back(VegamFileRef{f, {}});
@@ -903,21 +913,24 @@ bool vegam_decode_plan(const uint8_t* bytes, int n, VegamDecoded* out) {
     return true;
   }
   if (kind == 3) {
-    out->probe = read_scan(p, end);
+    out->probe = read_scan(p, end, version);
     int nb = read_i32(p, end);
     for (int i = 0; i < nb; i++) {
       VegamBuild b;
-      b.scan = read_scan(p, end);
+      b.scan = read_scan(p, end, version);
       b.probe_keys = read_strs(p, end);
       b.build_keys = read_strs(p, end);
       b.join_type = read_i32(p, end);
       b.filters = read_filters(p, end);
+      if (version >= 4) {
+        b.broadcast = read_bool(p, end);
+      }
       out->builds.push_back(b);
     }
     out->filters = read_filters(p, end);
     out->groups = read_strs(p, end);
-    read_strs(p, end);
-    out->aggs = read_aggs(p, end);
+    out->group_types = read_strs(p, end);
+    out->aggs = read_aggs(p, end, version);
     out->has_window = read_bool(p, end);
     if (out->has_window) {
       out->window.partition = read_strs(p, end);

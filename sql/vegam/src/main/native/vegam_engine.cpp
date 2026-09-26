@@ -38,6 +38,19 @@ std::string jstring_to_std(JNIEnv* env, jstring js) {
   return s;
 }
 
+// The fused pipeline reads whole files: keep one ref per file, the range that
+// starts at 0, so a file Spark split into several ranges is read once.
+void keep_whole_files(VegamScan* scan) {
+  std::vector<VegamFileRef> kept;
+  for (auto& f : scan->files) {
+    if (f.start == 0) {
+      f.length = -1;
+      kept.push_back(f);
+    }
+  }
+  scan->files = std::move(kept);
+}
+
 }  // namespace
 
 int VegamTable::col_index(const std::string& name) const {
@@ -153,19 +166,12 @@ VegamTaskState* vegam_create_task(JNIEnv* env, const uint8_t* bytes, int n, int 
     return task;
   }
 #ifdef VEGAM_HAS_VELOX
-  if (plan.kind == 2 && plan.filters.empty() && plan.builds.empty() &&
-      !plan.has_window && plan.groups.size() == 1 && plan.aggs.size() == 1) {
-    std::vector<std::string> files;
-    for (const auto& f : plan.probe.files) {
-      files.push_back(f.path);
-    }
-    if (vegam_velox_scan_hash_agg(env, files, plan.groups[0], plan.aggs[0].col,
-                                  &task->page)) {
-      return task;
-    }
-    fprintf(stderr, "vegam: velox scan+hashagg missed, fused pipeline fallback\n");
+  task->velox = vegam_velox_start(env, plan, threads > 0 ? threads : 1);
+  if (task->velox != nullptr) {
+    return task;
   }
 #endif
+  keep_whole_files(&plan.probe);
   int nthreads = threads > 0 ? threads : 1;
   fprintf(stderr, "vegam: fused-stage kind=%d threads=%d morsel=%d\n",
           plan.kind, nthreads, vegam::kMorselRows);
@@ -209,5 +215,11 @@ int vegam_next_page(VegamTaskState* task, double* values, uint8_t* nulls, int* m
 }
 
 void vegam_close_task(VegamTaskState* task) {
+#ifdef VEGAM_HAS_VELOX
+  if (task != nullptr && task->velox != nullptr) {
+    vegam_velox_close(task->velox);
+    task->velox = nullptr;
+  }
+#endif
   delete task;
 }

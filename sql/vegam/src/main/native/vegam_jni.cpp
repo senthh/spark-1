@@ -17,9 +17,14 @@
 
 #include <jni.h>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "vegam_engine.h"
+
+#ifdef VEGAM_HAS_VELOX
+#include "vegam_hadoop_file.h"
+#endif
 
 /*
  * JNI surface for org.apache.spark.sql.vegam.exec.NativeTask.
@@ -30,6 +35,13 @@
  */
 
 extern "C" {
+
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+#ifdef VEGAM_HAS_VELOX
+  vegam_set_javavm(vm);
+#endif
+  return JNI_VERSION_1_8;
+}
 
 JNIEXPORT jlong JNICALL
 Java_org_apache_spark_sql_vegam_exec_NativeTask_createTask(
@@ -72,6 +84,46 @@ Java_org_apache_spark_sql_vegam_exec_NativeTask_nextPage(
   env->SetBooleanArrayRegion(nulls, 0, cap, reinterpret_cast<const jboolean*>(nuls.data()));
   env->SetIntArrayRegion(meta, 0, 4, m);
   return rows;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_org_apache_spark_sql_vegam_exec_NativeTask_isArrow(
+    JNIEnv*,
+    jclass,
+    jlong handle) {
+  auto* task = reinterpret_cast<VegamTaskState*>(handle);
+  return task != nullptr && task->velox != nullptr ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jint JNICALL
+Java_org_apache_spark_sql_vegam_exec_NativeTask_nextBatch(
+    JNIEnv* env,
+    jclass,
+    jlong handle,
+    jlong arrow_array,
+    jlong arrow_schema) {
+  auto* task = reinterpret_cast<VegamTaskState*>(handle);
+  if (task == nullptr || arrow_array == 0 || arrow_schema == 0) {
+    return -1;
+  }
+#ifdef VEGAM_HAS_VELOX
+  if (task->velox == nullptr) {
+    return -1;
+  }
+  try {
+    return vegam_velox_next(task->velox, reinterpret_cast<void*>(arrow_array),
+                            reinterpret_cast<void*>(arrow_schema));
+  } catch (const std::exception& e) {
+    if (!env->ExceptionCheck()) {
+      jclass rte = env->FindClass("java/lang/RuntimeException");
+      env->ThrowNew(rte, (std::string("vegam velox stage failed: ") + e.what()).c_str());
+    }
+    return -1;
+  }
+#else
+  (void)env;
+  return -1;
+#endif
 }
 
 JNIEXPORT void JNICALL

@@ -25,9 +25,11 @@ import org.apache.spark.sql.types.DataType
  * Stable binary encoding of [[NativePlan]] for the JNI task API.
  * This is not Substrait. Version 2 adds StagePlan and richer HashAgg.
  * Version 3 adds ExpandSpec (rollup / grouping sets) on StagePlan.
+ * Version 4 adds the byte range (start, length) of every FileRef, the Spark
+ * column types of every ScanSpec, BuildJoin.broadcast and AggCall.input.
  */
 object NativePlanCodec {
-  private val VERSION: Int = 3
+  private val VERSION: Int = 4
   private val KIND_COUNT: Int = 1
   private val KIND_HASHAGG: Int = 2
   private val KIND_STAGE: Int = 3
@@ -63,6 +65,7 @@ object NativePlanCodec {
           writeStrings(out, b.buildKeys)
           out.writeInt(b.joinType)
           writeFilters(out, b.filters)
+          out.writeBoolean(b.broadcast)
         }
         writeFilters(out, s.probeFilters)
         writeStrings(out, s.groups)
@@ -96,7 +99,7 @@ object NativePlanCodec {
   def decode(bytes: Array[Byte]): NativePlan = {
     val in = new DataInputStream(new ByteArrayInputStream(bytes))
     val version = in.readInt()
-    if (version < 1 || version > 3) {
+    if (version < 1 || version > VERSION) {
       throw new IllegalArgumentException(s"unsupported NativePlan version $version")
     }
     in.readInt() match {
@@ -133,8 +136,8 @@ object NativePlanCodec {
         files, groupCol, sumCol, filters.headOption, sumScale, groupType, sumType, complete)
     } else {
       val groupCols = readStrings(in)
-      val aggs = readAggs(in)
-      val refs = readFileRefs(in)
+      val aggs = readAggs(in, version)
+      val refs = readFileRefs(in, version)
       HashAgg(
         files, groupCol, sumCol, filters.headOption, sumScale, groupType, sumType, complete,
         groupCols, aggs, filters, refs)
@@ -142,20 +145,21 @@ object NativePlanCodec {
   }
 
   private def decodeStage(in: DataInputStream, version: Int): StagePlan = {
-    val probe = readScan(in)
+    val probe = readScan(in, version)
     val n = in.readInt()
     val builds = Seq.fill(n) {
       BuildJoin(
-        scan = readScan(in),
+        scan = readScan(in, version),
         probeKeys = readStrings(in),
         buildKeys = readStrings(in),
         joinType = in.readInt(),
-        filters = readFilters(in))
+        filters = readFilters(in),
+        broadcast = version < 4 || in.readBoolean())
     }
     val probeFilters = readFilters(in)
     val groups = readStrings(in)
     val groupTypes = readStrings(in).map(DataType.fromJson)
-    val aggs = readAggs(in)
+    val aggs = readAggs(in, version)
     val window = if (in.readBoolean()) {
       val part = readStrings(in)
       val on = in.readInt()
@@ -174,10 +178,13 @@ object NativePlanCodec {
   private def writeScan(out: DataOutputStream, s: ScanSpec): Unit = {
     writeFileRefs(out, s.files)
     writeStrings(out, s.columns)
+    writeStrings(out, s.types)
   }
 
-  private def readScan(in: DataInputStream): ScanSpec = {
-    ScanSpec(readFileRefs(in), readStrings(in))
+  private def readScan(in: DataInputStream, version: Int): ScanSpec = {
+    val refs = readFileRefs(in, version)
+    val columns = readStrings(in)
+    ScanSpec(refs, columns, if (version >= 4) readStrings(in) else Nil)
   }
 
   private def writeFileRefs(out: DataOutputStream, refs: Seq[FileRef]): Unit = {
@@ -189,16 +196,22 @@ object NativePlanCodec {
         writeString(out, k)
         writeString(out, v)
       }
+      out.writeLong(r.start)
+      out.writeLong(r.length)
     }
   }
 
-  private def readFileRefs(in: DataInputStream): Seq[FileRef] = {
+  private def readFileRefs(in: DataInputStream, version: Int): Seq[FileRef] = {
     val n = in.readInt()
     Seq.fill(n) {
       val path = readString(in)
       val pn = in.readInt()
       val parts = Seq.fill(pn)((readString(in), readString(in)))
-      FileRef(path, parts)
+      if (version >= 4) {
+        FileRef(path, parts, in.readLong(), in.readLong())
+      } else {
+        FileRef(path, parts)
+      }
     }
   }
 
@@ -227,13 +240,18 @@ object NativePlanCodec {
       writeString(out, a.col)
       out.writeInt(a.scale)
       writeString(out, a.dataType.json)
+      writeString(out, a.input)
     }
   }
 
-  private def readAggs(in: DataInputStream): Seq[AggCall] = {
+  private def readAggs(in: DataInputStream, version: Int): Seq[AggCall] = {
     val n = in.readInt()
     Seq.fill(n) {
-      AggCall(in.readInt(), readString(in), in.readInt(), DataType.fromJson(readString(in)))
+      val kind = in.readInt()
+      val col = readString(in)
+      val scale = in.readInt()
+      val dt = DataType.fromJson(readString(in))
+      AggCall(kind, col, scale, dt, if (version >= 4) readString(in) else "")
     }
   }
 

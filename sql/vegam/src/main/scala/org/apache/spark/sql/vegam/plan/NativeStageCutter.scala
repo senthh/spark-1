@@ -47,7 +47,12 @@ import scala.util.{Either, Left, Right}
 object NativeStageCutter {
 
   sealed trait CutResult
-  case class CutOk(plan: NativePlan) extends CutResult
+  /**
+   * `probeScan` is the Spark scan feeding the probe side, when there is exactly one.
+   * NativeStageExec keeps it as a child and takes its task splits from it, so
+   * static partition pruning, DPP and Spark's split sizing all apply.
+   */
+  case class CutOk(plan: NativePlan, probeScan: Option[SparkPlan] = None) extends CutResult
   case class CutSkip(why: String, detail: String) extends CutResult
 
   def cut(plan: SparkPlan): CutResult = unwrap(plan) match {
@@ -77,7 +82,7 @@ object NativeStageCutter {
         } else if (pipe.probe.files.isEmpty) {
           CutSkip("no-files", "count")
         } else {
-          CutOk(CountStar(pipe.probe.paths.map(VegamPaths.clean)))
+          CutOk(CountStar(pipe.probe.paths.map(VegamPaths.clean)), pipe.probeNode)
         }
     }
   }
@@ -97,10 +102,12 @@ object NativeStageCutter {
     }
     lowerPipeline(agg.child) match {
       case Left(skip) => skip
+      case Right(pipe) if ambiguous(pipe).nonEmpty =>
+        CutSkip("ambiguous-column", ambiguous(pipe).mkString(","))
       case Right(pipe) =>
         val complete = agg.aggregateExpressions.headOption.exists(_.mode == Complete)
         if (isSimpleGroupSum(agg, pipe)) {
-          CutOk(toHashAgg(agg, pipe, complete))
+          CutOk(toHashAgg(agg, pipe, complete), pipe.probeNode)
         } else {
             CutOk(StagePlan(
               probe = pipe.probe,
@@ -111,7 +118,7 @@ object NativeStageCutter {
               aggs = parsed.aggs,
               window = pipe.window,
               complete = complete,
-              expand = pipe.expand))
+              expand = pipe.expand), pipe.probeNode)
         }
     }
   }
@@ -124,6 +131,8 @@ object NativeStageCutter {
           case Left(skip) => skip
           case Right(pipe) if pipe.window.isDefined =>
             CutSkip("nested-window", "window")
+          case Right(pipe) if ambiguous(pipe).nonEmpty =>
+            CutSkip("ambiguous-column", ambiguous(pipe).mkString(","))
           case Right(pipe) =>
             CutOk(StagePlan(
               probe = pipe.probe,
@@ -134,7 +143,7 @@ object NativeStageCutter {
               aggs = Nil,
               window = Some(spec),
               complete = true,
-              expand = pipe.expand))
+              expand = pipe.expand), pipe.probeNode)
         }
     }
   }
@@ -145,7 +154,27 @@ object NativeStageCutter {
       probeFilters: Seq[FilterPred],
       scanFilters: Seq[FilterPred],
       window: Option[WinSpec],
-      expand: Option[ExpandSpec] = None)
+      expand: Option[ExpandSpec] = None,
+      probeNode: Option[SparkPlan] = None)
+
+  /**
+   * Column names are the only join-side identity in the IR, so a name that
+   * appears on more than one joined scan (e.g. date_dim joined twice) is
+   * ambiguous. Such stages stay on Spark. Semi and anti builds emit no
+   * columns, and an inner-join key named the same on both sides carries the
+   * same value on either side, so neither makes a name ambiguous.
+   */
+  private def ambiguous(pipe: Pipe): Seq[String] = {
+    val emitting = pipe.builds.filter(b =>
+      b.joinType == NativePlan.JOIN_INNER || b.joinType == NativePlan.JOIN_LEFT)
+    val sharedKeys = emitting.filter(_.joinType == NativePlan.JOIN_INNER).flatMap { b =>
+      b.probeKeys.zip(b.buildKeys).collect { case (p, q) if p == q => p }
+    }.toSet
+    val scans = pipe.probe +: emitting.map(_.scan)
+    scans.flatMap(_.columns.distinct).filterNot(sharedKeys).groupBy(identity).collect {
+      case (name, seen) if seen.length > 1 => name
+    }.toSeq.sorted
+  }
 
   private def lowerPipeline(plan: SparkPlan): Either[CutSkip, Pipe] = {
     unwrap(plan) match {
@@ -193,7 +222,7 @@ object NativeStageCutter {
           Left(CutSkip("project-expr", p.projectList.map(_.prettyName).mkString(",")))
         }
       case s: FileSourceScanExec =>
-        scanToPipe(v1Scan(s))
+        scanToPipe(v1Scan(s)).map(_.copy(probeNode = Some(s)))
       case b: BatchScanExec =>
         v2Scan(b) match {
           case None => Left(CutSkip("v2-scan", b.scan.getClass.getName))
@@ -224,7 +253,8 @@ object NativeStageCutter {
             builds = Nil,
             probeFilters = pipes.flatMap(_.probeFilters),
             scanFilters = pipes.flatMap(_.scanFilters),
-            window = None))
+            window = None,
+            probeNode = None))
         }
     }
   }
@@ -232,6 +262,9 @@ object NativeStageCutter {
   private def lowerJoin(j: BroadcastHashJoinExec): Either[CutSkip, Pipe] = {
     if (j.condition.isDefined) {
       return Left(CutSkip("join-cond", j.joinType.sql))
+    }
+    if (j.isNullAwareAntiJoin) {
+      return Left(CutSkip("null-aware-anti", j.joinType.sql))
     }
     joinKind(j.joinType) match {
       case None => Left(CutSkip("join-type", j.joinType.sql))
@@ -281,7 +314,8 @@ object NativeStageCutter {
             probeKeys = pk,
             buildKeys = bk,
             joinType = kind,
-            filters = right.probeFilters ++ right.scanFilters)
+            filters = right.probeFilters ++ right.scanFilters,
+            broadcast = false)
           left.copy(builds = left.builds ++ right.builds :+ bj)
         }
     }
@@ -298,12 +332,12 @@ object NativeStageCutter {
   private def scanToPipe(scan: ScanInfo): Either[CutSkip, Pipe] = {
     parquetFiles(scan) match {
       case CutSkip(why, detail) => Left(CutSkip(why, detail))
-      case CutOk(_) =>
+      case CutOk(_, _) =>
         parseFilters(scan.dataFilters.flatMap(flattenFilters)) match {
           case Left(skip) => Left(skip)
           case Right(preds) =>
             Right(Pipe(
-              probe = ScanSpec(scan.refs, scan.columns),
+              probe = ScanSpec(scan.refs, scan.columns, scan.types),
               builds = Nil,
               probeFilters = Nil,
               scanFilters = preds,
@@ -320,7 +354,8 @@ object NativeStageCutter {
       parquet: Boolean,
       dataFilters: Seq[Expression],
       columns: Seq[String],
-      detail: String)
+      detail: String,
+      types: Seq[String] = Nil)
 
   private def unwrap(plan: SparkPlan): SparkPlan = plan match {
     case w: WholeStageCodegenExec => unwrap(w.child)
@@ -339,13 +374,14 @@ object NativeStageCutter {
       parquet = scan.relation.fileFormat.isInstanceOf[ParquetFileFormat],
       dataFilters = scan.dataFilters,
       columns = scan.output.map(_.name),
-      detail = index.toString)
+      detail = index.toString,
+      types = scan.output.map(_.dataType.simpleString))
   }
 
   private def v2Scan(scan: BatchScanExec): Option[ScanInfo] = scan.scan match {
     case p: ParquetScan =>
       Some(fromFileIndex(p.fileIndex, p.dataFilters, parquet = true, scan.output.map(_.name),
-        "parquet-v2"))
+        "parquet-v2").copy(types = scan.output.map(_.dataType.simpleString)))
     case f: FileScan =>
       Some(fromFileIndex(f.fileIndex, f.dataFilters, parquet = false, scan.output.map(_.name),
         f.getClass.getName))
@@ -486,26 +522,41 @@ object NativeStageCutter {
         if (star) {
           Some(AggCall(NativePlan.AGG_COUNT_STAR, "", 0, LongType))
         } else {
-          leafName(e.aggregateFunction.children.head)
-            .map(n => AggCall(NativePlan.AGG_COUNT, n, 0, LongType))
+          val c = e.aggregateFunction.children.head
+          leafName(c).map(n => AggCall(NativePlan.AGG_COUNT, n, 0, LongType, aggInput(c)))
         }
       case c: Count =>
         val child = c.children.headOption
         if (child.exists(_.isInstanceOf[Literal])) {
           Some(AggCall(NativePlan.AGG_COUNT_STAR, "", 0, LongType))
         } else {
-          child.flatMap(leafName).map(n => AggCall(NativePlan.AGG_COUNT, n, 0, LongType))
+          child.flatMap(c => leafName(c).map(n =>
+            AggCall(NativePlan.AGG_COUNT, n, 0, LongType, aggInput(c))))
         }
       case s: Sum =>
-        leafName(s.child).map(n => AggCall(NativePlan.AGG_SUM, n, exprScale(s.child), dt))
+        leafName(s.child).map(n =>
+          AggCall(NativePlan.AGG_SUM, n, exprScale(s.child), dt, aggInput(s.child)))
       case m: Min =>
-        leafName(m.child).map(n => AggCall(NativePlan.AGG_MIN, n, exprScale(m.child), dt))
+        leafName(m.child).map(n =>
+          AggCall(NativePlan.AGG_MIN, n, exprScale(m.child), dt, aggInput(m.child)))
       case m: Max =>
-        leafName(m.child).map(n => AggCall(NativePlan.AGG_MAX, n, exprScale(m.child), dt))
+        leafName(m.child).map(n =>
+          AggCall(NativePlan.AGG_MAX, n, exprScale(m.child), dt, aggInput(m.child)))
       case a: Average =>
-        leafName(a.child).map(n => AggCall(NativePlan.AGG_AVG, n, exprScale(a.child), dt))
+        leafName(a.child).map(n =>
+          AggCall(NativePlan.AGG_AVG, n, exprScale(a.child), dt, aggInput(a.child)))
       case _ => None
     }
+  }
+
+  /** How the aggregate input is derived from its column; see AggCall.input. */
+  private def aggInput(e: Expression): String = e match {
+    case Alias(c, _) => aggInput(c)
+    case _: Attribute => ""
+    case UnscaledValue(_: Attribute) => NativePlan.INPUT_UNSCALED
+    case c: Cast if c.child.isInstanceOf[Attribute] =>
+      NativePlan.INPUT_CAST_PREFIX + c.dataType.simpleString
+    case _ => NativePlan.INPUT_UNSUPPORTED
   }
 
   private def parseExpand(e: ExpandExec): Either[CutSkip, ExpandSpec] = {

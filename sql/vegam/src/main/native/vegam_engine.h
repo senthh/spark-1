@@ -43,6 +43,8 @@ struct VegamTaskState {
   VegamTable page;
   int row_off = 0;
   bool done = false;
+  // Velox run streaming Arrow batches; null when the fused pipeline ran.
+  void* velox = nullptr;
 };
 
 VegamTable vegam_load_table(
@@ -59,16 +61,17 @@ int vegam_next_page(VegamTaskState* task, double* values, uint8_t* nulls,
 void vegam_close_task(VegamTaskState* task);
 
 #ifdef VEGAM_HAS_VELOX
-bool vegam_velox_scan_hash_agg(
-    JNIEnv* env,
-    const std::vector<std::string>& files,
-    const std::string& group,
-    const std::string& sum,
-    VegamTable* out);
+struct VegamDecoded;
 
-void vegam_velox_hash_agg(VegamTable* in, const std::vector<int>& groups,
-                          const std::vector<int>& agg_kinds,
-                          const std::vector<int>& agg_cols, VegamTable* out);
+// Plans and starts a Velox run for the stage, or returns null when the stage
+// shape is not covered (the caller then runs the fused C++ pipeline).
+void* vegam_velox_start(JNIEnv* env, const VegamDecoded& plan, int threads);
+
+// Exports the next batch into ArrowArray / ArrowSchema structs. Returns the
+// row count, or -1 at end. Throws std::exception on failure.
+int vegam_velox_next(void* run, void* arrow_array, void* arrow_schema);
+
+void vegam_velox_close(void* run);
 #endif
 
 #endif
