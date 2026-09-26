@@ -14,13 +14,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Pin and build Velox on CentOS 8 (node 160), then libvegam.
-# Uses gcc-toolset-12. No libhdfs. Bundled third-party deps.
+# Pin and build Velox on Rocky/CentOS 8 (node 160), then libvegam.
+# Uses gcc-toolset-12. No libhdfs. Bundled third-party deps, system snappy.
+#
+# VELOX_COMMIT is the last commit before Velox moved Parquet to FBThrift
+# (904df4b67b), which the bundled build cannot resolve on this host.
 
 set -euo pipefail
 
-VELOX_HOME="${VELOX_HOME:-/home/acceldata/velox-src/velox}"
-VEGAM_NATIVE="${VEGAM_NATIVE:-/tmp/vegam-native}"
+VELOX_COMMIT="${VELOX_COMMIT:-f68e7ae9f04d7d36225e615e8c5c4e6ca045c438}"
+VELOX_HOME="${VELOX_HOME:-/home/acceldata/velox-src/velox-f68e}"
+VEGAM_NATIVE="${VEGAM_NATIVE:-/home/acceldata/vegam/native}"
 BUILD_DIR="${VELOX_HOME}/_build"
 JOBS="${JOBS:-$(nproc)}"
 
@@ -28,9 +32,35 @@ source /opt/rh/gcc-toolset-12/enable
 export CC=gcc CXX=g++
 export VELOX_DEPENDENCY_SOURCE=BUNDLED
 
+if [ ! -d "${VELOX_HOME}/.git" ]; then
+  git clone https://github.com/facebookincubator/velox.git "${VELOX_HOME}"
+fi
+if [ "$(git -C "${VELOX_HOME}" rev-parse HEAD)" != "${VELOX_COMMIT}" ]; then
+  git -C "${VELOX_HOME}" fetch origin "${VELOX_COMMIT}"
+  git -C "${VELOX_HOME}" checkout --detach "${VELOX_COMMIT}"
+  git -C "${VELOX_HOME}" submodule update --init --recursive
+fi
+
+# GooglePolylineFunctions.cpp needs geos even with VELOX_ENABLE_GEO=OFF.
+sed -i "/^  GooglePolylineFunctions.cpp$/d" \
+  "${VELOX_HOME}/velox/functions/prestosql/CMakeLists.txt"
+
+# The bundled snappy lookup fails on this host; point Velox at the system lib.
+SNAPPY_DIR="${VELOX_HOME}/../cmake/Snappy"
+mkdir -p "${SNAPPY_DIR}"
+cat > "${SNAPPY_DIR}/SnappyConfig.cmake" <<'EOF'
+if(NOT TARGET Snappy::snappy)
+  add_library(Snappy::snappy SHARED IMPORTED)
+  set_target_properties(Snappy::snappy PROPERTIES
+    IMPORTED_LOCATION /usr/lib64/libsnappy.so
+    INTERFACE_INCLUDE_DIRECTORIES /usr/include)
+endif()
+set(Snappy_FOUND TRUE)
+set(SNAPPY_FOUND TRUE)
+EOF
+
 echo "g++=$(g++ --version | head -1)"
 echo "VELOX_HOME=${VELOX_HOME}"
-git -C "${VELOX_HOME}" rev-parse --short HEAD
 git -C "${VELOX_HOME}" log -1 --oneline
 
 mkdir -p "${BUILD_DIR}"
@@ -43,6 +73,7 @@ cmake -S "${VELOX_HOME}" -B "${BUILD_DIR}" -GNinja \
   -DVELOX_ENABLE_BENCHMARKS=OFF \
   -DVELOX_ENABLE_BENCHMARKS_BASIC=OFF \
   -DVELOX_ENABLE_PARQUET=ON \
+  -DVELOX_ENABLE_HIVE_CONNECTOR=ON \
   -DVELOX_ENABLE_HDFS=OFF \
   -DVELOX_ENABLE_S3=OFF \
   -DVELOX_ENABLE_GEO=OFF \
@@ -52,12 +83,14 @@ cmake -S "${VELOX_HOME}" -B "${BUILD_DIR}" -GNinja \
   -DVELOX_ENABLE_FAISS=OFF \
   -DVELOX_MONO_LIBRARY=ON \
   -DVELOX_BUILD_SHARED=ON \
-  -DVELOX_DEPENDENCY_SOURCE=BUNDLED
+  -DVELOX_DEPENDENCY_SOURCE=BUNDLED \
+  -DBoost_SOURCE=BUNDLED \
+  -DSnappy_DIR="${SNAPPY_DIR}"
 
 cmake --build "${BUILD_DIR}" --target velox -j "${JOBS}"
 
 export VELOX_HOME
-export VELOX_LIB="${BUILD_DIR}/libvelox.so"
+export VELOX_LIB="${BUILD_DIR}/lib/libvelox.so"
 if [ ! -f "${VELOX_LIB}" ]; then
   echo "libvelox.so missing after build" >&2
   ls -l "${BUILD_DIR}"/*.so || true
