@@ -127,6 +127,21 @@ class PushPartialAggregateOverUnionSuite
     }
   }
 
+  test("DECIMAL SUM over UNION ALL - all-empty group stays NULL, partial fired") {
+    withTempView("t1", "t2") {
+      // t1 has a group with all-null decimal v (must stay NULL, not 0); t2 contributes to it too.
+      Seq((1, Some(BigDecimal("10.50"))), (2, None), (2, Some(BigDecimal("3.25")))).toDF("k", "v")
+        .createOrReplaceTempView("t1")
+      Seq((1, Some(BigDecimal("4.00"))), (2, None), (3, Some(BigDecimal("1.10")))).toDF("k", "v")
+        .createOrReplaceTempView("t2")
+      val q = """SELECT k, SUM(CAST(v AS DECIMAL(12,2))) AS s
+                |FROM (SELECT * FROM t1 UNION ALL SELECT * FROM t2)
+                |GROUP BY k ORDER BY k""".stripMargin
+      assertCorrectness(q, "decimal sum union")
+      assertPartialBelowUnion(sql(q))
+    }
+  }
+
   test("with optimization disabled, no PartialAggregate is introduced") {
     withTempView("t1", "t2") {
       Seq((1, 5)).toDF("k", "v").createOrReplaceTempView("t1")
