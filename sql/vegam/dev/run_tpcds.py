@@ -57,7 +57,9 @@ ENGINES = {
 
 
 def query_files(qdir, only, limit):
-    names = [fn for fn in sorted(os.listdir(qdir)) if fn.endswith(".sql")]
+    # Reject AppleDouble companions (._q1.sql) macOS leaves behind.
+    names = [fn for fn in sorted(os.listdir(qdir))
+             if fn.endswith(".sql") and not fn.startswith("._")]
     if only:
         want = set(q.strip() for q in only.split(",") if q.strip())
         names = [fn for fn in names if fn[:-4] in want]
@@ -190,7 +192,8 @@ def main():
         len(files), args.db, args.engine, args.runs), flush=True)
     for fn in files:
         name = fn[:-4]
-        sql = open(os.path.join(args.queries, fn)).read()
+        sql = open(os.path.join(args.queries, fn), encoding="utf-8",
+                   errors="replace").read()
         off_s = on_s = float("inf")
         off_rows = on_rows = None
         frac, native = 0.0, False
