@@ -141,3 +141,6 @@ tpcds-kit/
 .github/instructions/
 .github/prompts/
 .github/skills/
+
+# vegam native build output
+sql/vegam/src/main/native/build/

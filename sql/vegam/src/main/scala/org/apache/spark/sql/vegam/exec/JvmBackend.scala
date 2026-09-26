@@ -71,17 +71,18 @@ object JvmBackend extends VegamBackend {
 
   private def stage(s: StagePlan): VegamPage = {
     val probeWant = (
-      s.groups ++
+      s.probe.columns ++
         s.aggs.map(_.col) ++
-        s.probeFilters.map(_.col) ++
-        s.builds.flatMap(_.probeKeys) ++
-        s.window.toSeq.flatMap(w => w.partitionBy ++ w.orderBy.map(_._1) ++ w.fns.map(_.col)) ++
-        s.expand.toSeq.flatMap(_.projections.flatten.map(_.col)) ++
-        s.probe.columns
+        s.builds.flatMap(_.probeKeys)
       ).filter(_.nonEmpty).distinct
-    var table = readAll(s.probe.files, probeWant, s.probeFilters)
+    // Residual FilterExec preds (dim columns) must not run on the fact
+    // scan. Same rule as vegam_run_decoded: filter after joins.
+    var table = readAll(s.probe.files, probeWant, Nil)
     s.builds.foreach { b =>
       table = join(table, b)
+    }
+    if (s.probeFilters.nonEmpty) {
+      table = filterTable(table, s.probeFilters)
     }
     s.expand.foreach { e =>
       table = expand(table, e)
@@ -117,6 +118,17 @@ object JvmBackend extends VegamBackend {
       }
     }
     new ParquetIO.Table(names, rows)
+  }
+
+  private def filterTable(
+      table: ParquetIO.Table,
+      filters: Seq[org.apache.spark.sql.vegam.plan.FilterPred]): ParquetIO.Table = {
+    if (filters.isEmpty) {
+      table
+    } else {
+      val kept = table.rows.filter(r => ParquetIO.keep(r, table.names, filters))
+      new ParquetIO.Table(table.names, kept)
+    }
   }
 
   private def join(probe: ParquetIO.Table, b: BuildJoin): ParquetIO.Table = {

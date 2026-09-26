@@ -178,24 +178,34 @@ int vegam_next_page(VegamTaskState* task, double* values, uint8_t* nulls, int* m
   if (task == nullptr || task->done) {
     return -1;
   }
-  task->done = true;
   int rows = task->page.num_rows;
   int cols = static_cast<int>(task->page.cols.size());
-  if (rows * cols > cap) {
-    rows = cols == 0 ? 0 : cap / cols;
+  int max_rows = cols == 0 ? 0 : cap / cols;
+  if (task->row_off >= rows) {
+    task->done = true;
+    return -1;
+  }
+  int n = rows - task->row_off;
+  if (n > max_rows) {
+    n = max_rows;
   }
   meta[0] = cols;
   for (int c = 0; c < cols && c < 3; c++) {
     meta[1 + c] = task->page.cols[c].scale;
   }
-  for (int r = 0; r < rows; r++) {
+  for (int r = 0; r < n; r++) {
+    int src = task->row_off + r;
     for (int c = 0; c < cols; c++) {
       int i = r * cols + c;
-      values[i] = task->page.cols[c].values[r];
-      nulls[i] = task->page.cols[c].nulls[r] ? 1 : 0;
+      values[i] = task->page.cols[c].values[src];
+      nulls[i] = task->page.cols[c].nulls[src] ? 1 : 0;
     }
   }
-  return rows;
+  task->row_off += n;
+  if (task->row_off >= rows) {
+    task->done = true;
+  }
+  return n;
 }
 
 void vegam_close_task(VegamTaskState* task) {

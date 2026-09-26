@@ -41,6 +41,7 @@ struct VegamTable {
 
 struct VegamTaskState {
   VegamTable page;
+  int row_off = 0;
   bool done = false;
 };
 

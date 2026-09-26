@@ -1003,41 +1003,34 @@ VegamTable vegam_run_decoded(JNIEnv* env, const VegamDecoded& plan, int threads)
     t.cols[0].texts = {""};
     return t;
   }
-  std::vector<std::string> want = plan.groups;
+  // Only columns that live on the probe scan. Group / dim names in
+  // want would be loaded as nulls and then hash_join would skip the
+  // real dim columns of the same name (TPC-DS q3: 1 null group).
+  std::vector<std::string> want = plan.probe.columns;
   for (const auto& a : plan.aggs) {
     want.push_back(a.col);
-  }
-  for (const auto& f : plan.filters) {
-    want.push_back(f.col);
   }
   for (const auto& b : plan.builds) {
     want.insert(want.end(), b.probe_keys.begin(), b.probe_keys.end());
   }
-  if (plan.has_window) {
-    want.insert(want.end(), plan.window.partition.begin(), plan.window.partition.end());
-    for (const auto& o : plan.window.order) {
-      want.push_back(o.first);
-    }
-    for (const auto& f : plan.window.fns) {
+  // HashAgg and join-free StagePlan encode groups but leave probe.columns
+  // empty. Do not add group names when there is a join: they belong on
+  // the dim and would shadow the real columns (TPC-DS q3).
+  if (plan.builds.empty()) {
+    want.insert(want.end(), plan.groups.begin(), plan.groups.end());
+    for (const auto& f : plan.filters) {
       want.push_back(f.col);
     }
   }
-  if (plan.has_expand) {
-    for (const auto& proj : plan.expand.projections) {
-      for (const auto& s : proj) {
-        if (!s.col.empty()) {
-          want.push_back(s.col);
-        }
-      }
-    }
-  }
-  want.insert(want.end(), plan.probe.columns.begin(), plan.probe.columns.end());
   VegamScan probe = plan.probe;
   if (probe.columns.empty()) {
     probe.columns = want;
   }
-  VegamTable table = vegam_load_scan(env, probe, want, plan.filters);
-  table = filter_table(table, plan.filters, nthreads);
+  VegamTable table = vegam_load_scan(env, probe, want, {});
+  // Dim filters (d_moy, i_manufact_id, ...) arrive as probeFilters even
+  // when FilterExec sits above the join. Applying them on the fact scan
+  // drops every row (missing column) or collapses groups. Build-side
+  // predicates stay on b.filters. Residual preds run after the joins.
   for (const auto& b : plan.builds) {
     VegamTable build = vegam_load_scan(env, b.scan, b.build_keys, b.filters);
     build = filter_table(build, b.filters, nthreads);
@@ -1061,6 +1054,7 @@ VegamTable vegam_run_decoded(JNIEnv* env, const VegamDecoded& plan, int threads)
       table = hash_join(table, build, b, nthreads);
     }
   }
+  table = filter_table(table, plan.filters, nthreads);
   if (plan.has_expand) {
     table = expand_table(table, plan.expand);
   }

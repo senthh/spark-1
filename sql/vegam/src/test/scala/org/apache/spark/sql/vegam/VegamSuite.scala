@@ -203,6 +203,35 @@ class VegamSuite extends SharedSparkSession {
     }
   }
 
+  test("dim filters above a join stay on the dim") {
+    withTempPath { fact =>
+      withTempPath { date =>
+        withTempPath { item =>
+          val fp = fact.getCanonicalPath
+          val dp = date.getCanonicalPath
+          val ip = item.getCanonicalPath
+          Seq((1L, 10L, 1.5), (1L, 20L, 2.5), (2L, 10L, 9.0))
+            .toDF("date_sk", "item_sk", "price").write.mode("overwrite").parquet(fp)
+          Seq((1L, 11, 2001), (2L, 12, 2001))
+            .toDF("date_sk", "moy", "year").write.mode("overwrite").parquet(dp)
+          Seq((10L, 128, "b1"), (20L, 129, "b2"))
+            .toDF("item_sk", "manufact_id", "brand").write.mode("overwrite").parquet(ip)
+          withVegam {
+            val df = sql(
+              s"SELECT d.year, i.brand, SUM(f.price) FROM parquet.`$fp` f " +
+                s"JOIN parquet.`$dp` d ON f.date_sk = d.date_sk " +
+                s"JOIN parquet.`$ip` i ON f.item_sk = i.item_sk " +
+                "WHERE i.manufact_id = 128 AND d.moy = 11 " +
+                "GROUP BY d.year, i.brand")
+            assert(hasNative(df.queryExecution.executedPlan),
+              df.queryExecution.executedPlan.toString)
+            checkAnswer(df, Seq((2001, "b1", 1.5)).toDF("year", "brand", "sum(price)"))
+          }
+        }
+      }
+    }
+  }
+
   test("broadcast join plus group-sum") {
     withTempPath { fact =>
       withTempPath { dim =>
