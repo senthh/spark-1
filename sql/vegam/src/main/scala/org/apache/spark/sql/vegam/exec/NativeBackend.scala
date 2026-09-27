@@ -54,9 +54,12 @@ object NativeBackend extends VegamBackend {
 
   private class NativeJniTask(handle: Long, plan: NativePlan) extends VegamTask {
     private var closed = false
+    private var eof = false
     private lazy val arrow = NativeTask.isArrow(handle)
     private var allocator: BufferAllocator = _
     private var root: VectorSchemaRoot = _
+
+    override def isDone: Boolean = closed || eof
 
     override def isColumnar: Boolean = !closed && arrow
 
@@ -69,6 +72,7 @@ object NativeBackend extends VegamBackend {
       val meta = new Array[Int](4)
       val n = NativeTask.nextPage(handle, values, nulls, meta)
       if (n < 0) {
+        eof = true
         None
       } else {
         val cols = if (meta(META_COLS) > 0) meta(META_COLS) else defaultCols
@@ -91,6 +95,7 @@ object NativeBackend extends VegamBackend {
       try {
         val n = NativeTask.nextBatch(handle, array.memoryAddress(), schema.memoryAddress())
         if (n < 0) {
+          eof = true
           None
         } else {
           root = Data.importVectorSchemaRoot(allocator, array, schema, null)

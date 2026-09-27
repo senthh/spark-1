@@ -32,6 +32,13 @@ trait VegamTask extends Serializable {
    */
   def nextBatch(): Option[ColumnarBatch] = None
 
+  /**
+   * True once the native task reached end-of-stream. A consumer that stops
+   * earlier must treat the output as incomplete and fail rather than return
+   * a partial result.
+   */
+  def isDone: Boolean = true
+
   def close(): Unit
 }
 

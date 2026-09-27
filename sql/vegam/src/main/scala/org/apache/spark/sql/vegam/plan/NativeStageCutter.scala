@@ -95,6 +95,13 @@ object NativeStageCutter {
     if (agg.aggregateExpressions.exists(e => e.mode != Partial && e.mode != Complete)) {
       return CutSkip("agg-mode", agg.aggregateExpressions.map(_.mode).mkString(","))
     }
+    // A distinct (no aggregate functions) has no mode to reject on. The
+    // reduce-side aggregate sits on the shuffle and must stay Spark; rewriting
+    // it walks through the exchange and drops the joins below (q38: every
+    // group key was missing, so each task emitted one empty group).
+    if (shuffledChild(agg.child)) {
+      return CutSkip("shuffled-agg", agg.nodeName)
+    }
     // Partial Average is two buffers (sum, count). Do not emit a final avg.
     if (agg.aggregateExpressions.exists(e =>
         e.mode == Partial && e.aggregateFunction.isInstanceOf[Average])) {
@@ -230,6 +237,8 @@ object NativeStageCutter {
         }
       case a: BaseAggregateExec =>
         Left(CutSkip("nested-agg", a.nodeName))
+      case other if other.nodeName.startsWith("NativeStage") =>
+        Left(CutSkip("nested-native", other.nodeName))
       case other if other.children.size == 1 =>
         lowerPipeline(other.children.head)
       case other =>
@@ -319,6 +328,14 @@ object NativeStageCutter {
           left.copy(builds = left.builds ++ right.builds :+ bj)
         }
     }
+  }
+
+  private def shuffledChild(plan: SparkPlan): Boolean = unwrap(plan) match {
+    case _: Exchange => true
+    case p: ProjectExec => shuffledChild(p.child)
+    case f: FilterExec => shuffledChild(f.child)
+    case s: SortExec => shuffledChild(s.child)
+    case _ => false
   }
 
   private def joinKind(t: JoinType): Option[Int] = t match {

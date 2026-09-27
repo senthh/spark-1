@@ -45,6 +45,8 @@ object JvmBackend extends VegamBackend {
       }
     }
 
+    override def isDone: Boolean = done
+
     override def close(): Unit = {
       done = true
     }

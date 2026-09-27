@@ -657,12 +657,21 @@ VegamTable emit_agg(
   return out;
 }
 
-VegamTable hash_agg(const VegamTable& in, const std::vector<std::string>& groups,
-                    const std::vector<VegamAgg>& aggs, int threads) {
+std::vector<int> group_indexes(const VegamTable& in, const std::vector<std::string>& groups) {
   std::vector<int> gidx;
   for (const auto& g : groups) {
-    gidx.push_back(in.col_index(g));
+    int c = in.col_index(g);
+    if (c < 0) {
+      throw std::runtime_error("vegam: group column missing: " + g);
+    }
+    gidx.push_back(c);
   }
+  return gidx;
+}
+
+VegamTable hash_agg(const VegamTable& in, const std::vector<std::string>& groups,
+                    const std::vector<VegamAgg>& aggs, int threads) {
+  std::vector<int> gidx = group_indexes(in, groups);
   if (threads > 1 && in.num_rows > vegam::kMorselRows) {
     std::vector<std::unordered_map<std::string, AggAcc>> locals(static_cast<size_t>(threads));
     std::atomic<int> slot{0};
@@ -692,10 +701,7 @@ VegamTable hash_agg(const VegamTable& in, const std::vector<std::string>& groups
 
 VegamTable sort_agg(const VegamTable& in, const std::vector<std::string>& groups,
                     const std::vector<VegamAgg>& aggs) {
-  std::vector<int> gidx;
-  for (const auto& g : groups) {
-    gidx.push_back(in.col_index(g));
-  }
+  std::vector<int> gidx = group_indexes(in, groups);
   std::vector<int> ord(in.num_rows);
   for (int i = 0; i < in.num_rows; i++) {
     ord[i] = i;
@@ -1076,10 +1082,7 @@ VegamTable vegam_run_decoded(JNIEnv* env, const VegamDecoded& plan, int threads)
   }
   if (!plan.aggs.empty() || !plan.groups.empty()) {
     bool sorted = false;
-    std::vector<int> gidx;
-    for (const auto& g : plan.groups) {
-      gidx.push_back(table.col_index(g));
-    }
+    std::vector<int> gidx = group_indexes(table, plan.groups);
     sorted = monotonic_on(table, gidx);
     if (sorted) {
       return sort_agg(table, plan.groups, plan.aggs);

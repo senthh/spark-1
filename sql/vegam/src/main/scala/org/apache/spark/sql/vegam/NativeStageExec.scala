@@ -28,7 +28,8 @@ import org.apache.spark.sql.execution.{
   ColumnarToRowExec, FileSourceScanExec, InputAdapter, SparkPlan, WholeStageCodegenExec}
 import org.apache.spark.sql.execution.datasources.{FilePartition, FileScanRDD}
 import org.apache.spark.sql.execution.metric.SQLMetrics
-import org.apache.spark.sql.types._
+import org.apache.spark.sql.types.{DataType, DateType, Decimal, DecimalType, DoubleType,
+  FloatType, IntegerType, LongType, StringType, StructType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.sql.vegam.exec.{VegamBackend, VegamPage, VegamTask}
 import org.apache.spark.sql.vegam.plan.{CountStar, FileRef, HashAgg, NativePlan, StagePlan}
@@ -90,7 +91,7 @@ case class NativeStageExec(
       nativeTime += System.nanoTime() - t0
       Option(TaskContext.get()).foreach(_.addTaskCompletionListener[Unit](_ => task.close()))
       val rows = if (task.isColumnar) {
-        NativeStageExec.batchRows(task, targetTypes, tz, nativeTime)
+        NativeStageExec.batchRows(task, () => task.isDone, targetTypes, tz, nativeTime)
       } else {
         // Legacy double pages: materialize before close, as before.
         val proj = UnsafeProjection.create(targetTypes)
@@ -99,6 +100,12 @@ case class NativeStageExec(
             proj(NativeStageExec.toRow(page, i, schema)).copy()
           }
         }.toArray
+        val rowsToReturn = all.length
+        if (!task.isDone) {
+          throw new RuntimeException(
+            s"vegam: native stage ended without EOF after $rowsToReturn rows" +
+              " (set spark.sql.vegam.enabled=false to compare)")
+        }
         task.close()
         all.iterator
       }
@@ -229,6 +236,7 @@ object NativeStageExec {
    */
   private def batchRows(
       task: VegamTask,
+      taskGuard: () => Boolean,
       targetTypes: Array[DataType],
       tz: String,
       nativeTime: org.apache.spark.sql.execution.metric.SQLMetric): Iterator[InternalRow] = {
@@ -237,6 +245,7 @@ object NativeStageExec {
       private var row = 0
       private var proj: UnsafeProjection = _
       private var done = false
+      private var consumed = 0
 
       private def advance(): Unit = {
         while (!done && (batch == null || row >= batch.numRows())) {
@@ -265,6 +274,11 @@ object NativeStageExec {
 
       override def hasNext: Boolean = {
         advance()
+        if (done && !task.isDone) {
+          throw new RuntimeException(
+            s"vegam: native stage ended without EOF after $consumed rows" +
+              " (set spark.sql.vegam.enabled=false to compare)")
+        }
         !done
       }
 
@@ -275,6 +289,7 @@ object NativeStageExec {
         }
         val r = proj(batch.getRow(row))
         row += 1
+        consumed += 1
         r
       }
     }
@@ -322,6 +337,7 @@ object NativeStageExec {
     case LongType => value.toLong
     case FloatType => value.toFloat
     case DoubleType => value
+    case DateType => value.toInt
     case d: DecimalType =>
       Decimal(BigDecimal(value), d.precision, d.scale)
     case StringType =>

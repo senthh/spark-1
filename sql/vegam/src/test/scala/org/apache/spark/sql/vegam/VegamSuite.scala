@@ -309,6 +309,31 @@ class VegamSuite extends SharedSparkSession {
     }
   }
 
+  test("distinct over a join is not collapsed") {
+    withTempPath { fact =>
+      withTempPath { dim =>
+        val fp = fact.getCanonicalPath
+        val dp = dim.getCanonicalPath
+        Seq((1L, 10L), (1L, 10L), (2L, 11L), (3L, 10L))
+          .toDF("k", "id").write.parquet(fp)
+        Seq(
+          (10L, "ann", java.sql.Date.valueOf("1998-12-01")),
+          (11L, "bob", java.sql.Date.valueOf("1998-12-02")))
+          .toDF("id", "name", "d").write.parquet(dp)
+        withVegam {
+          val df = sql(
+            s"SELECT DISTINCT name, d FROM parquet.`$fp` f " +
+              s"JOIN parquet.`$dp` d ON f.id = d.id")
+          assert(hasNative(df.queryExecution.executedPlan),
+            df.queryExecution.executedPlan.toString)
+          checkAnswer(df, Seq(
+            Row("ann", java.sql.Date.valueOf("1998-12-01")),
+            Row("bob", java.sql.Date.valueOf("1998-12-02"))))
+        }
+      }
+    }
+  }
+
   test("broadcast join plus group-sum") {
     withTempPath { fact =>
       withTempPath { dim =>
