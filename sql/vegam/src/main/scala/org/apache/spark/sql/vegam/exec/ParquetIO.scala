@@ -138,12 +138,53 @@ object ParquetIO {
   }
 
   def keep(row: Array[Any], names: Array[String], filters: Seq[FilterPred]): Boolean = {
-    filters.forall { f =>
-      val i = names.indexOf(f.col)
-      if (i < 0) {
-        false
-      } else {
-        cmp(row(i), f)
+    if (filters.isEmpty) {
+      true
+    } else {
+      filters.groupBy(_.orGroup).values.exists { group =>
+        group.forall(f => oneFilter(row, names, f))
+      }
+    }
+  }
+
+  private def oneFilter(row: Array[Any], names: Array[String], f: FilterPred): Boolean = {
+    val i = names.indexOf(f.col)
+    if (i < 0) {
+      false
+    } else if (f.rightCol != null && f.rightCol.nonEmpty) {
+      val j = names.indexOf(f.rightCol)
+      j >= 0 && cmpCells(row(i), row(j), f.op)
+    } else {
+      cmp(row(i), f)
+    }
+  }
+
+  private def cmpCells(a: Any, b: Any, op: Int): Boolean = {
+    if (a == null || b == null) {
+      false
+    } else {
+      (toDouble(a), toDouble(b)) match {
+        case (Some(x), Some(y)) =>
+          op match {
+            case NativePlan.FILTER_EQ => x == y
+            case NativePlan.FILTER_NE => x != y
+            case NativePlan.FILTER_GT => x > y
+            case NativePlan.FILTER_GTE => x >= y
+            case NativePlan.FILTER_LT => x < y
+            case NativePlan.FILTER_LTE => x <= y
+            case _ => false
+          }
+        case _ =>
+          val c = a.toString.compareTo(b.toString)
+          op match {
+            case NativePlan.FILTER_EQ => c == 0
+            case NativePlan.FILTER_NE => c != 0
+            case NativePlan.FILTER_GT => c > 0
+            case NativePlan.FILTER_LT => c < 0
+            case NativePlan.FILTER_GTE => c >= 0
+            case NativePlan.FILTER_LTE => c <= 0
+            case _ => false
+          }
       }
     }
   }
@@ -184,6 +225,7 @@ object ParquetIO {
     case l: java.lang.Long => Some(l.doubleValue())
     case i: java.lang.Integer => Some(i.doubleValue())
     case f: java.lang.Float => Some(f.doubleValue())
+    case d: org.apache.spark.sql.types.Decimal => Some(d.toDouble)
     case s: String =>
       try {
         Some(s.toDouble)

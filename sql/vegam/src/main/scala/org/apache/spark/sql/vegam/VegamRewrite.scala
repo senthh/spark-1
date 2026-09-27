@@ -48,10 +48,10 @@ object VegamRewrite extends Logging {
           node.isInstanceOf[SortAggregateExec] ||
           node.isInstanceOf[WindowExec] =>
         NativeStageCutter.cut(node) match {
-          case CutOk(native, probeScan) =>
+          case CutOk(native, probeScan, rowChild) =>
             VegamBackend.pick(requested, native) match {
               case Some(name) =>
-                NativeStageExec(native, node.output, name, probeScan)
+                NativeStageExec(native, node.output, name, probeScan, rowChild)
               case None =>
                 skip("backend-unsupported", native.getClass.getSimpleName)
                 node

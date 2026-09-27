@@ -21,9 +21,10 @@ import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark.SparkException
+import org.apache.spark.sql.types.Decimal
 import org.apache.spark.sql.vegam.plan.{
   AggCall, BuildJoin, CountStar, ExpandSlot, ExpandSpec, FileRef, HashAgg, NativePlan,
-  StagePlan, WinSpec}
+  StagePlan, VExpr, WinSpec}
 
 /**
  * IR interpreter used when libvegam is not loaded. Same [[NativePlan]] as
@@ -71,17 +72,36 @@ object JvmBackend extends VegamBackend {
     aggTable(table, h.groups, h.aggCalls)
   }
 
+  /**
+   * Aggregate or window over rows already produced by Spark (a shuffle).
+   * `rows` are positional against `plan.probe.columns`.
+   */
+  def rowStage(plan: StagePlan, rows: Seq[Array[Any]]): VegamPage = {
+    if (plan.window.isDefined && plan.aggs.isEmpty) {
+      val names = plan.probe.columns.toArray
+      val table = new ParquetIO.Table(names, ArrayBuffer.from(rows))
+      toPage(window(table, plan.window.get))
+    } else {
+      mergeRows(plan, rows)
+    }
+  }
+
   private def stage(s: StagePlan): VegamPage = {
     val probeWant = (
       s.probe.columns ++
         s.aggs.map(_.col) ++
-        s.builds.flatMap(_.probeKeys)
+        s.aggs.flatMap(a => VExpr.colNames(a.input)) ++
+        s.projects.flatMap(p => p.name +: VExpr.colNames(p.expr)) ++
+        s.builds.flatMap(_.probeKeys).flatMap(keyCols)
       ).filter(_.nonEmpty).distinct
     // Residual FilterExec preds (dim columns) must not run on the fact
     // scan. Same rule as vegam_run_decoded: filter after joins.
     var table = readAll(s.probe.files, probeWant, Nil)
     s.builds.foreach { b =>
       table = join(table, b)
+    }
+    if (s.projects.nonEmpty) {
+      table = projectTable(table, s.projects)
     }
     if (s.probeFilters.nonEmpty) {
       table = filterTable(table, s.probeFilters)
@@ -92,11 +112,12 @@ object JvmBackend extends VegamBackend {
     s.window.foreach { w =>
       table = window(table, w)
     }
-    if (s.aggs.nonEmpty || s.groups.nonEmpty) {
+    val page = if (s.aggs.nonEmpty || s.groups.nonEmpty) {
       aggTable(table, s.groups, s.aggs)
     } else {
       toPage(table)
     }
+    relayout(page, s.resultAt, s.resultDiv)
   }
 
   private def readAll(
@@ -137,11 +158,12 @@ object JvmBackend extends VegamBackend {
     val buildWant = (b.buildKeys ++ b.filters.map(_.col) ++ b.scan.columns)
       .filter(_.nonEmpty).distinct
     val build = readAll(b.scan.files, buildWant, b.filters)
+    val exprKeys = (b.probeKeys ++ b.buildKeys).exists(_.startsWith("("))
     val pIdx = b.probeKeys.map(probe.colIndex)
     val bIdx = b.buildKeys.map(build.colIndex)
     val index = new mutable.HashMap[String, ArrayBuffer[Array[Any]]]()
     build.rows.foreach { row =>
-      val k = keyOf(row, bIdx)
+      val k = if (exprKeys) joinKey(b.buildKeys, row, build.names) else keyOf(row, bIdx)
       if (k != null) {
         index.getOrElseUpdate(k, new ArrayBuffer[Array[Any]]()) += row
       }
@@ -152,7 +174,7 @@ object JvmBackend extends VegamBackend {
     val outNames = probe.names ++ extra.map(_._1)
     val out = new ArrayBuffer[Array[Any]]()
     probe.rows.foreach { prow =>
-      val k = keyOf(prow, pIdx)
+      val k = if (exprKeys) joinKey(b.probeKeys, prow, probe.names) else keyOf(prow, pIdx)
       val hits = if (k == null) None else index.get(k)
       b.joinType match {
         case NativePlan.JOIN_INNER =>
@@ -226,6 +248,84 @@ object JvmBackend extends VegamBackend {
     b.toString
   }
 
+  private def keyCols(key: String): Seq[String] = {
+    if (key.startsWith("(")) VExpr.colNames(key) else Seq(key)
+  }
+
+  private def joinKey(keys: Seq[String], row: Array[Any], names: Array[String]): String = {
+    val b = new StringBuilder
+    var i = 0
+    while (i < keys.length) {
+      val k = keys(i)
+      val v = if (k.startsWith("(")) {
+        VExpr.evalEncoded(k, names, row)
+      } else {
+        val idx = names.indexOf(k)
+        if (idx < 0) null else row(idx)
+      }
+      if (v == null) {
+        return null
+      }
+      if (i > 0) b.append('\u0001')
+      b.append(cellKey(v))
+      i += 1
+    }
+    b.toString
+  }
+
+  private def cellKey(v: Any): String = v match {
+    case d: java.lang.Double if d == d.longValue().toDouble => d.longValue().toString
+    case d: Double if d == d.toLong.toDouble => d.toLong.toString
+    case b: java.lang.Boolean => b.toString
+    case other => other.toString
+  }
+
+  private def projectTable(
+      table: ParquetIO.Table,
+      projects: Seq[org.apache.spark.sql.vegam.plan.NamedExpr]): ParquetIO.Table = {
+    val grown = ArrayBuffer.empty[String]
+    grown ++= table.names
+    val plan = projects.map { p =>
+      val i = grown.indexOf(p.name)
+      if (i >= 0) {
+        (i, p.expr)
+      } else {
+        val at = grown.length
+        grown += p.name
+        (at, p.expr)
+      }
+    }
+    val width = grown.length
+    val nameArr = grown.toArray
+    val out = new ArrayBuffer[Array[Any]]()
+    table.rows.foreach { row =>
+      val cur = Array.ofDim[Any](width)
+      Array.copy(row, 0, cur, 0, row.length)
+      plan.foreach { case (i, expr) =>
+        cur(i) = VExpr.evalEncoded(expr, nameArr, cur)
+      }
+      out += cur
+    }
+    new ParquetIO.Table(nameArr, out)
+  }
+
+  private def outWidth(a: AggCall): Int = {
+    if (a.mode == NativePlan.MODE_FINAL) 1 else math.max(a.buffers, 1)
+  }
+
+  private def outCells(st: AggState, a: AggCall, i: Int): Seq[Any] = {
+    if (a.mode != NativePlan.MODE_FINAL && a.buffers >= 2 &&
+        a.kind == NativePlan.AGG_AVG) {
+      val sum = if (st.seen(i)) st.sumAt(i) else 0.0
+      Seq(sum, st.countAt(i).toDouble)
+    } else if (a.mode != NativePlan.MODE_FINAL && a.buffers >= 2 &&
+        a.kind == NativePlan.AGG_SUM) {
+      if (st.seen(i)) Seq(st.sumAt(i), 0.0) else Seq(0.0, 1.0)
+    } else {
+      Seq(st.result(i, a.kind))
+    }
+  }
+
   private def expand(table: ParquetIO.Table, spec: ExpandSpec): ParquetIO.Table = {
     val out = new ArrayBuffer[Array[Any]]()
     table.rows.foreach { row =>
@@ -264,18 +364,14 @@ object JvmBackend extends VegamBackend {
     val out = new ArrayBuffer[Array[Any]]()
     groups.foreach { buf =>
       val sorted = buf.sortInPlace()(ord(orderIdx))
-      val sums = w.fns.map { f =>
-        if (f.kind == NativePlan.WIN_SUM) {
-          val i = table.colIndex(f.col)
-          var s = 0.0
-          sorted.foreach { r =>
-            ParquetIO.toDouble(if (i >= 0) r(i) else null).foreach(s += _)
-          }
-          s
+      val partVal = w.fns.map { f =>
+        if (f.frame == NativePlan.FRAME_RUNNING) {
+          null
         } else {
-          0.0
+          partAgg(sorted, table.colIndex(f.col), f.kind)
         }
       }
+      val run = Array.fill(w.fns.length)(null: Any)
       var i = 0
       var prevKey: String = null
       var rank = 0
@@ -289,12 +385,22 @@ object JvmBackend extends VegamBackend {
           prevKey = ok
         }
         val extra = w.fns.zipWithIndex.map { case (f, fi) =>
+          val ci = if (f.col.isEmpty) -1 else table.colIndex(f.col)
+          val cell = if (ci >= 0) row(ci) else null
           f.kind match {
             case NativePlan.WIN_ROW_NUMBER => (i + 1).toLong
             case NativePlan.WIN_RANK => rank.toLong
             case NativePlan.WIN_DENSE_RANK => dense.toLong
-            case NativePlan.WIN_SUM => sums(fi)
-            case _ => null
+            case NativePlan.WIN_SUM if f.frame == NativePlan.FRAME_RUNNING =>
+              run(fi) = addNum(run(fi), cell)
+              run(fi)
+            case NativePlan.WIN_MIN if f.frame == NativePlan.FRAME_RUNNING =>
+              run(fi) = extreme(run(fi), cell, less = true)
+              run(fi)
+            case NativePlan.WIN_MAX if f.frame == NativePlan.FRAME_RUNNING =>
+              run(fi) = extreme(run(fi), cell, less = false)
+              run(fi)
+            case _ => partVal(fi)
           }
         }
         val n = new Array[Any](names.length)
@@ -309,6 +415,42 @@ object JvmBackend extends VegamBackend {
       }
     }
     new ParquetIO.Table(names, out)
+  }
+
+  private def partAgg(rows: ArrayBuffer[Array[Any]], idx: Int, kind: Int): Any = {
+    var acc: Any = null
+    rows.foreach { r =>
+      val cell = if (idx >= 0 && idx < r.length) r(idx) else null
+      kind match {
+        case NativePlan.WIN_SUM => acc = addNum(acc, cell)
+        case NativePlan.WIN_MIN => acc = extreme(acc, cell, less = true)
+        case NativePlan.WIN_MAX => acc = extreme(acc, cell, less = false)
+        case _ =>
+      }
+    }
+    acc
+  }
+
+  private def addNum(prev: Any, cell: Any): Any = {
+    ParquetIO.toDouble(cell) match {
+      case Some(d) =>
+        val p = if (prev == null) 0.0 else prev.asInstanceOf[Double]
+        p + d
+      case None => prev
+    }
+  }
+
+  private def extreme(prev: Any, cell: Any, less: Boolean): Any = {
+    ParquetIO.toDouble(cell) match {
+      case Some(d) =>
+        if (prev == null) {
+          d
+        } else {
+          val p = prev.asInstanceOf[Double]
+          if (less && d < p) d else if (!less && d > p) d else p
+        }
+      case None => prev
+    }
   }
 
   private def ord(order: Seq[(Int, Boolean)]): Ordering[Array[Any]] = {
@@ -354,7 +496,11 @@ object JvmBackend extends VegamBackend {
       var i = 0
       while (i < aggs.length) {
         val a = aggs(i)
-        val cell = if (a.col.isEmpty) null else {
+        val cell = if (a.input.startsWith("(")) {
+          VExpr.evalEncoded(a.input, table.names, row)
+        } else if (a.col.isEmpty) {
+          null
+        } else {
           val idx = table.colIndex(a.col)
           if (idx >= 0) row(idx) else null
         }
@@ -363,7 +509,8 @@ object JvmBackend extends VegamBackend {
       }
     }
     val n = state.size
-    val cols = groups.length + aggs.length
+    val widths = aggs.map(outWidth)
+    val cols = groups.length + widths.sum
     val values = new Array[Double](n * cols)
     val nulls = new Array[Boolean](n * cols)
     val texts = new Array[String](n * cols)
@@ -373,9 +520,15 @@ object JvmBackend extends VegamBackend {
       scales(c) = 0
       c += 1
     }
-    while (c < cols) {
-      scales(c) = aggs(c - groups.length).scale
-      c += 1
+    var ai = 0
+    while (ai < aggs.length) {
+      var k = 0
+      while (k < widths(ai)) {
+        scales(c) = if (k == 0) aggs(ai).scale else 0
+        c += 1
+        k += 1
+      }
+      ai += 1
     }
     var r = 0
     state.values.foreach { st =>
@@ -385,9 +538,15 @@ object JvmBackend extends VegamBackend {
         writeCell(values, nulls, texts, r, col, cols, cell)
         col += 1
       }
-      var ai = 0
+      ai = 0
       while (ai < aggs.length) {
-        writeCell(values, nulls, texts, r, groups.length + ai, cols, st.result(ai, aggs(ai).kind))
+        val cells = outCells(st, aggs(ai), ai)
+        var k = 0
+        while (k < cells.length) {
+          writeCell(values, nulls, texts, r, col, cols, cells(k))
+          col += 1
+          k += 1
+        }
         ai += 1
       }
       r += 1
@@ -442,6 +601,233 @@ object JvmBackend extends VegamBackend {
     }
   }
 
+  private def mergeRows(plan: StagePlan, rows: Seq[Array[Any]]): VegamPage = {
+    val gOrds = plan.groupOrdinals
+    val calls = plan.aggs
+    val ords = plan.aggOrdinals
+    val state = new mutable.LinkedHashMap[String, (Array[Any], Array[Array[Any]])]()
+    rows.foreach { row =>
+      val k = if (gOrds.isEmpty) "" else gOrds.map { i =>
+        if (i < 0 || i >= row.length || row(i) == null) "\u0000" else cellKey(row(i))
+      }.mkString("\u0001")
+      val (gs, bufs) = state.getOrElseUpdate(k, {
+        val g = gOrds.map(i => if (i >= 0 && i < row.length) row(i) else null).toArray
+        (g, calls.map(initBuf).toArray)
+      })
+      var i = 0
+      while (i < calls.length) {
+        val ins = if (i < ords.length) ords(i) else Nil
+        absorb(bufs(i), calls(i), ins, row, plan.probe.columns.toArray)
+        i += 1
+      }
+      state.update(k, (gs, bufs))
+    }
+    val finished = calls.nonEmpty && calls.forall(_.mode == NativePlan.MODE_FINAL)
+    val entries = if (state.isEmpty && gOrds.isEmpty && finished) {
+      Seq((Array.empty[Any], calls.map(initBuf).toArray))
+    } else {
+      state.values.toSeq
+    }
+    val n = entries.length
+    val spec = if (plan.resultAt.isEmpty) {
+      val w = gOrds.length + calls.map(outWidth).sum
+      (0 until w).map(i => (i, 0))
+    } else {
+      plan.resultAt.zip(plan.resultDiv)
+    }
+    val cols = math.max(spec.length, 1)
+    val values = new Array[Double](math.max(n, 0) * cols)
+    val nulls = new Array[Boolean](math.max(n, 0) * cols)
+    val texts = new Array[String](math.max(n, 0) * cols)
+    val scales = Array.fill(cols)(0)
+    var r = 0
+    entries.foreach { case (gs, bufs) =>
+      val raw = new ArrayBuffer[Any]()
+      raw ++= gs
+      var ai = 0
+      while (ai < calls.length) {
+        raw ++= finishBuf(bufs(ai), calls(ai))
+        ai += 1
+      }
+      var c = 0
+      spec.foreach { case (src, div) =>
+        val cell = if (src >= 0 && src < raw.length) raw(src) else null
+        writeCell(values, nulls, texts, r, c, cols, divideScale(cell, div))
+        c += 1
+      }
+      r += 1
+    }
+    VegamPage(n, spec.length, values, nulls, scales, texts)
+  }
+
+  /** Reorder a groups-then-aggs page into the aggregate's result list. */
+  private def relayout(page: VegamPage, at: Seq[Int], div: Seq[Int]): VegamPage = {
+    if (at.isEmpty) {
+      return page
+    }
+    val n = page.numRows
+    val cols = at.length
+    val values = new Array[Double](math.max(n, 0) * math.max(cols, 1))
+    val nulls = new Array[Boolean](math.max(n, 0) * math.max(cols, 1))
+    val texts = new Array[String](math.max(n, 0) * math.max(cols, 1))
+    var r = 0
+    while (r < n) {
+      var c = 0
+      while (c < cols) {
+        val src = at(c)
+        val d = if (c < div.length) div(c) else 0
+        val cell = if (src < 0 || src >= page.numCols || page.isNull(r, src)) {
+          null
+        } else if (page.isText(r, src)) {
+          page.getText(r, src)
+        } else {
+          divideScale(page.getDouble(r, src), d)
+        }
+        writeCell(values, nulls, texts, r, c, cols, cell)
+        c += 1
+      }
+      r += 1
+    }
+    VegamPage(n, cols, values, nulls, Array.fill(math.max(cols, 1))(0), texts)
+  }
+
+  /** Unscaled long to decimal: divide by 10^scale. scale 0 leaves the cell. */
+  private def divideScale(cell: Any, scale: Int): Any = {
+    if (cell == null || scale <= 0) {
+      cell
+    } else {
+      val unscaled = cell match {
+        case n: java.lang.Long => BigDecimal(n.longValue())
+        case n: java.lang.Integer => BigDecimal(n.intValue())
+        case n: java.lang.Double => BigDecimal(n.doubleValue())
+        case n: Decimal => n.toBigDecimal
+        case _ =>
+          ParquetIO.toDouble(cell).map(d => BigDecimal(d)).orNull
+      }
+      if (unscaled == null) null
+      else unscaled / BigDecimal(10).pow(scale)
+    }
+  }
+
+  private def initBuf(a: AggCall): Array[Any] = {
+    a.kind match {
+      case NativePlan.AGG_AVG => Array(null, Long.box(0L))
+      case NativePlan.AGG_SUM if a.buffers >= 2 => Array(null, java.lang.Boolean.TRUE)
+      case NativePlan.AGG_COUNT | NativePlan.AGG_COUNT_STAR => Array(Long.box(0L))
+      case _ => Array(null)
+    }
+  }
+
+  private def absorb(
+      buf: Array[Any],
+      a: AggCall,
+      ins: Seq[Int],
+      row: Array[Any],
+      names: Array[String]): Unit = {
+    val merging = a.mode == NativePlan.MODE_FINAL || a.mode == NativePlan.MODE_MERGE
+    if (merging) {
+      absorbMerge(buf, a, ins, row)
+    } else {
+      val cell = if (a.input.startsWith("(")) {
+        VExpr.evalEncoded(a.input, names, row)
+      } else if (ins.nonEmpty && ins.head >= 0 && ins.head < row.length) {
+        row(ins.head)
+      } else {
+        null
+      }
+      absorbRaw(buf, a, cell)
+    }
+  }
+
+  private def absorbRaw(buf: Array[Any], a: AggCall, cell: Any): Unit = {
+    a.kind match {
+      case NativePlan.AGG_COUNT_STAR =>
+        buf(0) = Long.box(buf(0).asInstanceOf[Long] + 1L)
+      case NativePlan.AGG_COUNT =>
+        if (cell != null) buf(0) = Long.box(buf(0).asInstanceOf[Long] + 1L)
+      case NativePlan.AGG_AVG =>
+        ParquetIO.toDouble(cell).foreach { d =>
+          val s = if (buf(0) == null) 0.0 else buf(0).asInstanceOf[Double]
+          buf(0) = s + d
+          buf(1) = Long.box(buf(1).asInstanceOf[Long] + 1L)
+        }
+      case NativePlan.AGG_MIN =>
+        buf(0) = extreme(buf(0), cell, less = true)
+      case NativePlan.AGG_MAX =>
+        buf(0) = extreme(buf(0), cell, less = false)
+      case _ =>
+        ParquetIO.toDouble(cell).foreach { d =>
+          val s = if (buf(0) == null) 0.0 else buf(0).asInstanceOf[Double]
+          buf(0) = s + d
+          if (buf.length > 1) buf(1) = java.lang.Boolean.FALSE
+        }
+    }
+  }
+
+  private def absorbMerge(buf: Array[Any], a: AggCall, ins: Seq[Int], row: Array[Any]): Unit = {
+    def at(j: Int): Any = {
+      if (j < ins.length && ins(j) >= 0 && ins(j) < row.length) row(ins(j)) else null
+    }
+    a.kind match {
+      case NativePlan.AGG_COUNT | NativePlan.AGG_COUNT_STAR =>
+        val n = ParquetIO.toLong(at(0)).getOrElse(0L)
+        buf(0) = Long.box(buf(0).asInstanceOf[Long] + n)
+      case NativePlan.AGG_AVG =>
+        val cnt = ParquetIO.toLong(at(1)).getOrElse(0L)
+        if (cnt != 0L) {
+          val s = if (buf(0) == null) 0.0 else buf(0).asInstanceOf[Double]
+          ParquetIO.toDouble(at(0)).foreach(d => buf(0) = s + d)
+          buf(1) = Long.box(buf(1).asInstanceOf[Long] + cnt)
+        }
+      case NativePlan.AGG_SUM if a.buffers >= 2 =>
+        val empty = at(1) == true || at(1) == java.lang.Boolean.TRUE
+        if (!empty) {
+          ParquetIO.toDouble(at(0)).foreach { d =>
+            val s = if (buf(0) == null) 0.0 else buf(0).asInstanceOf[Double]
+            buf(0) = s + d
+            buf(1) = java.lang.Boolean.FALSE
+          }
+        }
+      case NativePlan.AGG_MIN =>
+        buf(0) = extreme(buf(0), at(0), less = true)
+      case NativePlan.AGG_MAX =>
+        buf(0) = extreme(buf(0), at(0), less = false)
+      case _ =>
+        ParquetIO.toDouble(at(0)).foreach { d =>
+          val s = if (buf(0) == null) 0.0 else buf(0).asInstanceOf[Double]
+          buf(0) = s + d
+        }
+    }
+  }
+
+  private def finishBuf(buf: Array[Any], a: AggCall): Seq[Any] = {
+    if (a.mode == NativePlan.MODE_FINAL) {
+      a.kind match {
+        case NativePlan.AGG_AVG =>
+          val c = buf(1).asInstanceOf[Long]
+          if (c == 0L) Seq(null) else Seq(buf(0).asInstanceOf[Double] / c.toDouble)
+        case NativePlan.AGG_SUM if a.buffers >= 2 =>
+          if (buf(1) == java.lang.Boolean.TRUE) Seq(null) else Seq(buf(0))
+        case NativePlan.AGG_COUNT | NativePlan.AGG_COUNT_STAR =>
+          Seq(buf(0).asInstanceOf[Long].toDouble)
+        case _ =>
+          Seq(buf(0))
+      }
+    } else {
+      a.kind match {
+        case NativePlan.AGG_AVG =>
+          Seq(if (buf(0) == null) 0.0 else buf(0), buf(1).asInstanceOf[Long].toDouble)
+        case NativePlan.AGG_SUM if buf.length > 1 =>
+          val empty = buf(1) == java.lang.Boolean.TRUE
+          if (empty) Seq(0.0, 1.0) else Seq(buf(0), 0.0)
+        case NativePlan.AGG_COUNT | NativePlan.AGG_COUNT_STAR =>
+          Seq(buf(0).asInstanceOf[Long].toDouble)
+        case _ =>
+          Seq(buf(0))
+      }
+    }
+  }
+
   private class AggState(nGroup: Int, nAgg: Int, first: Array[Any], gIdx: Seq[Int]) {
     val groupVals: Array[Any] = Array.tabulate(nGroup) { i =>
       val j = gIdx(i)
@@ -452,6 +838,10 @@ object JvmBackend extends VegamBackend {
     private val maxs = new Array[Double](nAgg)
     private val counts = new Array[Long](nAgg)
     private val has = new Array[Boolean](nAgg)
+
+    def sumAt(i: Int): Double = sums(i)
+    def countAt(i: Int): Long = counts(i)
+    def seen(i: Int): Boolean = has(i)
 
     def add(i: Int, kind: Int, cell: Any): Unit = {
       kind match {

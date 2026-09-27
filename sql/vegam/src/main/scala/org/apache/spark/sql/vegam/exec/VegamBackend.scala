@@ -107,7 +107,7 @@ object VegamBackend {
       plan match {
         case _: org.apache.spark.sql.vegam.plan.CountStar => true
         case _: org.apache.spark.sql.vegam.plan.HashAgg => true
-        case _: org.apache.spark.sql.vegam.plan.StagePlan => true
+        case s: org.apache.spark.sql.vegam.plan.StagePlan if !s.jvmOnly => true
         case _ => false
       }
     case _ => false

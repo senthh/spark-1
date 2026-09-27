@@ -280,8 +280,16 @@ class VegamSuite extends SharedSparkSession {
               s"JOIN parquet.`$dp` d1 ON f.a = d1.sk " +
               s"JOIN parquet.`$dp` d2 ON f.b = d2.sk " +
               "GROUP BY d1.name, d2.name")
-          assert(!hasNative(df.queryExecution.executedPlan),
-            df.queryExecution.executedPlan.toString)
+          val plan = df.queryExecution.executedPlan
+          val fused = plan.exists {
+            case n: NativeStageExec =>
+              n.nativePlan match {
+                case s: StagePlan => s.builds.length >= 2
+                case _ => false
+              }
+            case _ => false
+          }
+          assert(!fused, plan.toString)
           checkAnswer(df, Seq(Row("x", "y", 1.5), Row("y", "x", 2.5)))
         }
       }
@@ -475,7 +483,8 @@ class VegamSuite extends SharedSparkSession {
           VegamConf.VEGAM_BACKEND.key -> "jvm",
           SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true") {
         val df = sql(s"SELECT k, SUM(v) FROM parquet.`$path` GROUP BY k")
-        assert(hasNative(df.queryExecution.executedPlan), df.queryExecution.executedPlan.toString)
+        val plan = df.queryExecution.executedPlan
+        assert(nativeCount(plan) >= 2, plan.toString)
         checkAnswer(df, Seq((1L, 4.0)).toDF("k", "sum(v)"))
       }
     }
@@ -528,6 +537,120 @@ class VegamSuite extends SharedSparkSession {
         val df = sql(s"SELECT COUNT(*) FROM parquet.`$path`")
         assert(!hasNative(df.queryExecution.executedPlan), df.queryExecution.executedPlan.toString)
         checkAnswer(df, Seq(1L).toDF("count(1)"))
+      }
+    }
+  }
+
+  private def nativeCount(plan: SparkPlan): Int = plan match {
+    case a: AdaptiveSparkPlanExec =>
+      math.max(nativeCount(a.inputPlan), nativeCount(a.executedPlan))
+    case other => other.collect { case _: NativeStageExec => 1 }.sum
+  }
+
+  test("partial average matches Spark") {
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      Seq((1L, 1.0), (1L, 3.0), (2L, 5.0)).toDF("k", "v")
+        .write.mode("overwrite").parquet(path)
+      withVegam {
+        val df = sql(s"SELECT k, AVG(v) FROM parquet.`$path` GROUP BY k")
+        assert(hasNative(df.queryExecution.executedPlan), df.queryExecution.executedPlan.toString)
+        checkAnswer(df, Seq((1L, 2.0), (2L, 5.0)).toDF("k", "avg(v)"))
+      }
+    }
+  }
+
+  test("sum of an arithmetic expression is native") {
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      Seq((1L, 5L, 2L), (1L, 4L, 1L), (2L, 9L, 3L)).toDF("k", "a", "b")
+        .write.mode("overwrite").parquet(path)
+      withVegam {
+        val df = sql(s"SELECT k, SUM(a - b), SUM(a * b) FROM parquet.`$path` GROUP BY k")
+        assert(hasNative(df.queryExecution.executedPlan), df.queryExecution.executedPlan.toString)
+        checkAnswer(df, Seq(Row(1L, 6L, 14L), Row(2L, 6L, 27L)))
+      }
+    }
+  }
+
+  test("column equality and OR filters stay native") {
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      Seq((1L, 1L, 10.0), (2L, 3L, 4.0), (3L, 3L, 5.0)).toDF("k", "a", "v")
+        .write.mode("overwrite").parquet(path)
+      withVegam {
+        val eq = sql(s"SELECT SUM(v) FROM parquet.`$path` WHERE k = a")
+        assert(hasNative(eq.queryExecution.executedPlan), eq.queryExecution.executedPlan.toString)
+        checkAnswer(eq, Seq(15.0).toDF("sum(v)"))
+        val either = sql(s"SELECT SUM(v) FROM parquet.`$path` WHERE k = 1 OR k = 2")
+        assert(hasNative(either.queryExecution.executedPlan),
+          either.queryExecution.executedPlan.toString)
+        checkAnswer(either, Seq(14.0).toDF("sum(v)"))
+      }
+    }
+  }
+
+  test("final aggregate over the shuffle is native") {
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      Seq((1L, 1.5), (1L, 2.5), (2L, 3.0)).toDF("k", "v")
+        .write.mode("overwrite").parquet(path)
+      withVegam {
+        val df = sql(s"SELECT k, SUM(v) FROM parquet.`$path` GROUP BY k")
+        val plan = df.queryExecution.executedPlan
+        assert(nativeCount(plan) >= 2, plan.toString)
+        checkAnswer(df, Seq((1L, 4.0), (2L, 3.0)).toDF("k", "sum(v)"))
+      }
+    }
+  }
+
+  test("decimal sum over the shuffle keeps scale and column order") {
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      Seq(
+        (1L, "a", BigDecimal("1.50")),
+        (1L, "a", BigDecimal("2.54")),
+        (2L, "b", BigDecimal("3.00")))
+        .toDF("k", "name", "v")
+        .write.mode("overwrite").parquet(path)
+      withVegam {
+        val df = sql(
+          s"SELECT SUM(v), name, k FROM parquet.`$path` GROUP BY name, k")
+        val plan = df.queryExecution.executedPlan
+        assert(nativeCount(plan) >= 2, plan.toString)
+        checkAnswer(df, Seq(
+          (BigDecimal("4.04"), "a", 1L),
+          (BigDecimal("3.00"), "b", 2L)).toDF("sum(v)", "name", "k"))
+      }
+    }
+  }
+
+  test("tinyint group key round-trips through a native stage") {
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      Seq((1.toByte, 1.5), (1.toByte, 2.5), (2.toByte, 3.0)).toDF("k", "v")
+        .write.mode("overwrite").parquet(path)
+      withVegam {
+        val df = sql(s"SELECT k, SUM(v) FROM parquet.`$path` GROUP BY k")
+        assert(hasNative(df.queryExecution.executedPlan),
+          df.queryExecution.executedPlan.toString)
+        checkAnswer(df, Seq((1.toByte, 4.0), (2.toByte, 3.0)).toDF("k", "sum(v)"))
+      }
+    }
+  }
+
+  test("running sum window over ordered rows") {
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      Seq((1L, 1L, 10.0), (1L, 2L, 5.0), (2L, 1L, 7.0)).toDF("k", "d", "v")
+        .write.mode("overwrite").parquet(path)
+      withVegam {
+        val df = sql(
+          "SELECT k, d, SUM(v) OVER (PARTITION BY k ORDER BY d " +
+            "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS c " +
+            s"FROM parquet.`$path`")
+        assert(hasNative(df.queryExecution.executedPlan), df.queryExecution.executedPlan.toString)
+        checkAnswer(df, Seq((1L, 1L, 10.0), (1L, 2L, 15.0), (2L, 1L, 7.0)).toDF("k", "d", "c"))
       }
     }
   }

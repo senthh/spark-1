@@ -54,6 +54,19 @@ object NativePlan {
   val WIN_RANK: Int = 2
   val WIN_DENSE_RANK: Int = 3
   val WIN_SUM: Int = 4
+  val WIN_MIN: Int = 5
+  val WIN_MAX: Int = 6
+
+  // WindowCall.frame. PARTITION is the whole partition; RUNNING is
+  // rows between unbounded preceding and current row.
+  val FRAME_PARTITION: Int = 0
+  val FRAME_RUNNING: Int = 1
+
+  // AggCall.mode. UPDATE is a file-stage partial (raw column in, buffer out).
+  val MODE_UPDATE: Int = 0
+  val MODE_PARTIAL: Int = 1
+  val MODE_MERGE: Int = 2
+  val MODE_FINAL: Int = 3
 
   val EXPAND_COL: Int = 1
   val EXPAND_NULL: Int = 2
@@ -72,7 +85,9 @@ case class FilterPred(
     value: Long,
     op: Int,
     strValue: String = "",
-    dvalue: Double = Double.NaN) extends Serializable {
+    dvalue: Double = Double.NaN,
+    rightCol: String = "",
+    orGroup: Int = 0) extends Serializable {
   def numValue: Double = if (dvalue.isNaN) value.toDouble else dvalue
   def isString: Boolean = strValue != null && strValue.nonEmpty
 }
@@ -87,7 +102,9 @@ case class AggCall(
     col: String,
     scale: Int,
     dataType: DataType,
-    input: String = "") extends Serializable
+    input: String = "",
+    mode: Int = NativePlan.MODE_UPDATE,
+    buffers: Int = 1) extends Serializable
 
 /**
  * One file range to read. `length < 0` means the whole file. Spark may split a
@@ -130,7 +147,14 @@ case class BuildJoin(
     filters: Seq[FilterPred],
     broadcast: Boolean = true) extends Serializable
 
-case class WindowCall(kind: Int, col: String, alias: String) extends Serializable
+case class WindowCall(
+    kind: Int,
+    col: String,
+    alias: String,
+    frame: Int = NativePlan.FRAME_PARTITION) extends Serializable
+
+/** A computed column. `expr` is a [[VExpr]] encoding. */
+case class NamedExpr(name: String, expr: String) extends Serializable
 
 case class WinSpec(
     partitionBy: Seq[String],
@@ -214,7 +238,28 @@ case class StagePlan(
     aggs: Seq[AggCall],
     window: Option[WinSpec],
     complete: Boolean,
-    expand: Option[ExpandSpec] = None) extends NativePlan {
+    expand: Option[ExpandSpec] = None,
+    projects: Seq[NamedExpr] = Nil,
+    rowSource: Boolean = false,
+    groupOrdinals: Seq[Int] = Nil,
+    aggOrdinals: Seq[Seq[Int]] = Nil,
+    resultAt: Seq[Int] = Nil,
+    resultDiv: Seq[Int] = Nil) extends NativePlan {
+
+  /**
+   * Plans the loaded native library cannot execute: expression projects,
+   * column-column / OR filters, expression join keys, running or min/max
+   * windows, and any stage whose input is shuffle rows. Those run on the
+   * JVM backend, which interprets the same IR.
+   */
+  def jvmOnly: Boolean = {
+    rowSource || resultAt.nonEmpty || projects.nonEmpty ||
+      probeFilters.exists(f => f.rightCol.nonEmpty || f.orGroup != 0) ||
+      aggs.exists(a => a.input.startsWith("(")) ||
+      builds.exists(b => (b.probeKeys ++ b.buildKeys).exists(_.startsWith("("))) ||
+      window.exists(_.fns.exists(f =>
+        f.kind >= NativePlan.WIN_MIN || f.frame == NativePlan.FRAME_RUNNING))
+  }
   override def files: Seq[String] = probe.paths
 
   override def withFiles(newFiles: Seq[String]): NativePlan = {

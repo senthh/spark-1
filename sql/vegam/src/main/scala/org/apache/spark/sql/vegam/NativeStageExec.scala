@@ -24,12 +24,14 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{
   Attribute, AttributeSet, BoundReference, Cast, Expression, GenericInternalRow, UnsafeProjection}
+import org.apache.spark.sql.catalyst.plans.physical.{
+  AllTuples, ClusteredDistribution, Distribution, UnspecifiedDistribution}
 import org.apache.spark.sql.execution.{
   ColumnarToRowExec, FileSourceScanExec, InputAdapter, SparkPlan, WholeStageCodegenExec}
 import org.apache.spark.sql.execution.datasources.{FilePartition, FileScanRDD}
 import org.apache.spark.sql.execution.metric.SQLMetrics
-import org.apache.spark.sql.types.{DataType, DateType, Decimal, DecimalType, DoubleType,
-  FloatType, IntegerType, LongType, StringType, StructType}
+import org.apache.spark.sql.types.{BooleanType, ByteType, DataType, DateType, Decimal,
+  DecimalType, DoubleType, FloatType, IntegerType, LongType, ShortType, StringType, StructType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.sql.vegam.exec.{VegamBackend, VegamPage, VegamTask}
 import org.apache.spark.sql.vegam.plan.{CountStar, FileRef, HashAgg, NativePlan, StagePlan}
@@ -48,16 +50,57 @@ case class NativeStageExec(
     nativePlan: NativePlan,
     output: Seq[Attribute],
     backendName: String,
-    probeScan: Option[SparkPlan] = None)
+    probeScan: Option[SparkPlan] = None,
+    rowChild: Option[SparkPlan] = None)
   extends SparkPlan {
 
-  override def children: Seq[SparkPlan] = probeScan.toSeq
+  override def children: Seq[SparkPlan] =
+    if (rowChild.isDefined) rowChild.toSeq else probeScan.toSeq
 
   override def producedAttributes: AttributeSet = outputSet
 
+  /**
+   * A shuffle-input stage merges rows that already share a partition.
+   * Keep the shuffle Spark placed under this node.
+   */
+  override def requiredChildDistribution: Seq[Distribution] = nativePlan match {
+    case s: StagePlan if rowChild.isDefined => rowDistribution(s)
+    case _ => UnspecifiedDistribution :: Nil
+  }
+
+  private def rowDistribution(s: StagePlan): Seq[Distribution] = {
+    val childOut = rowChild.map(_.output).getOrElse(Nil)
+    if (s.groupOrdinals.nonEmpty) {
+      val keys = s.groupOrdinals.flatMap { i =>
+        if (i >= 0 && i < childOut.length) Some(childOut(i)) else None
+      }
+      if (keys.length == s.groupOrdinals.length) {
+        ClusteredDistribution(keys) :: Nil
+      } else {
+        UnspecifiedDistribution :: Nil
+      }
+    } else if (s.aggs.nonEmpty) {
+      AllTuples :: Nil
+    } else s.window match {
+      case Some(w) if w.partitionBy.nonEmpty =>
+        val keys = w.partitionBy.flatMap(name => childOut.find(_.name == name))
+        if (keys.length == w.partitionBy.length) {
+          ClusteredDistribution(keys) :: Nil
+        } else {
+          UnspecifiedDistribution :: Nil
+        }
+      case Some(_) => AllTuples :: Nil
+      case None => UnspecifiedDistribution :: Nil
+    }
+  }
+
   override protected def withNewChildrenInternal(
       newChildren: IndexedSeq[SparkPlan]): NativeStageExec = {
-    copy(probeScan = newChildren.headOption)
+    if (rowChild.isDefined) {
+      copy(rowChild = newChildren.headOption)
+    } else {
+      copy(probeScan = newChildren.headOption)
+    }
   }
 
   override lazy val metrics = Map(
@@ -70,6 +113,49 @@ case class NativeStageExec(
   }
 
   override protected def doExecute(): RDD[InternalRow] = {
+    if (rowChild.isDefined) {
+      executeRows()
+    } else {
+      executeFiles()
+    }
+  }
+
+  private def executeRows(): RDD[InternalRow] = {
+    val child = rowChild.get
+    val plan = nativePlan match {
+      case s: StagePlan => s
+      case other =>
+        throw new IllegalStateException(
+          s"vegam: row stage is not a StagePlan (${other.getClass.getSimpleName})")
+    }
+    val inTypes = child.output.map(_.dataType).toArray
+    val targetTypes = output.map(_.dataType).toArray
+    val schema = output
+    val numOutputRows = longMetric("numOutputRows")
+    val nativeTime = longMetric("nativeTime")
+    child.execute().mapPartitions { iter =>
+      val rows = new ArrayBuffer[Array[Any]]()
+      while (iter.hasNext) {
+        rows += NativeStageExec.readInput(iter.next(), inTypes)
+      }
+      val t0 = System.nanoTime()
+      val page = org.apache.spark.sql.vegam.exec.JvmBackend.rowStage(plan, rows.toSeq)
+      nativeTime += System.nanoTime() - t0
+      if (page.numCols != schema.length) {
+        throw new IllegalStateException(
+          s"vegam: row stage has ${page.numCols} columns, " +
+            s"output has ${schema.length}")
+      }
+      val proj = UnsafeProjection.create(targetTypes)
+      val out = (0 until page.numRows).iterator.map { i =>
+        numOutputRows += 1
+        proj(NativeStageExec.toRow(page, i, schema)).copy()
+      }
+      out
+    }
+  }
+
+  private def executeFiles(): RDD[InternalRow] = {
     val plan = nativePlan
     val backend = backendName
     val targetTypes = output.map(_.dataType).toArray
@@ -96,6 +182,11 @@ case class NativeStageExec(
         // Legacy double pages: materialize before close, as before.
         val proj = UnsafeProjection.create(targetTypes)
         val all = NativeStageExec.pages(task).flatMap { page =>
+          if (page.numCols != schema.length) {
+            throw new IllegalStateException(
+              s"vegam: native page has ${page.numCols} columns, " +
+                s"stage output has ${schema.length}")
+          }
           (0 until page.numRows).iterator.map { i =>
             proj(NativeStageExec.toRow(page, i, schema)).copy()
           }
@@ -320,17 +411,53 @@ object NativeStageExec {
     while (c < schema.length && c < page.numCols) {
       if (page.isNull(i, c)) {
         row.setNullAt(c)
-      } else if (page.isText(i, c)) {
-        row.update(c, UTF8String.fromString(page.getText(i, c)))
       } else {
-        row.update(c, asSpark(page.getDouble(i, c), schema(c).dataType, page.sumScale(c)))
+        val dt = schema(c).dataType
+        val text = page.isText(i, c)
+        if (dt == StringType && text) {
+          row.update(c, UTF8String.fromString(page.getText(i, c)))
+        } else if (text && page.getDouble(i, c).isNaN) {
+          row.setNullAt(c)
+        } else {
+          row.update(c, asSpark(page.getDouble(i, c), dt, page.sumScale(c)))
+        }
       }
       c += 1
     }
     row
   }
 
+  def readInput(row: InternalRow, types: Array[DataType]): Array[Any] = {
+    val out = new Array[Any](types.length)
+    var i = 0
+    while (i < types.length) {
+      out(i) = if (row.isNullAt(i)) {
+        null
+      } else {
+        types(i) match {
+          case IntegerType | DateType => row.getInt(i)
+          case LongType => row.getLong(i)
+          case DoubleType => row.getDouble(i)
+          case FloatType => row.getFloat(i)
+          case BooleanType => row.getBoolean(i)
+          case d: DecimalType =>
+            val dec = row.getDecimal(i, d.precision, d.scale)
+            if (dec == null) null else Decimal(dec.toJavaBigDecimal)
+          case StringType =>
+            val s = row.getUTF8String(i)
+            if (s == null) null else s.toString
+          case other => row.get(i, other)
+        }
+      }
+      i += 1
+    }
+    out
+  }
+
   def asSpark(value: Double, dt: DataType, unscaledScale: Int = 0): Any = dt match {
+    case BooleanType => value != 0.0
+    case ByteType => value.toByte
+    case ShortType => value.toShort
     case IntegerType => value.toInt
     case LongType if unscaledScale > 0 =>
       math.round(value * math.pow(10.0, unscaledScale.toDouble))
