@@ -92,18 +92,25 @@ object VegamBackend {
   val JVM: String = "jvm"
   val AUTO: String = "auto"
 
-  def resolve(requested: String): Option[String] = requested match {
-    case NATIVE if NativeTask.isLoaded => Some(NATIVE)
+  /**
+   * The backend a session can use. AUTO means libvegam or nothing: the JVM
+   * interpreter reads whole files and carries numbers as doubles, so it only
+   * runs when JVM is requested explicitly.
+   */
+  def resolve(
+      requested: String,
+      loaded: Boolean = NativeTask.isLoaded): Option[String] = requested match {
+    case NATIVE | AUTO if loaded => Some(NATIVE)
     case JVM => Some(JVM)
-    case AUTO if NativeTask.isLoaded => Some(NATIVE)
-    case AUTO => Some(JVM)
-    case NATIVE => None
     case _ => None
   }
 
-  def supports(backend: String, plan: NativePlan): Boolean = backend match {
+  def supports(
+      backend: String,
+      plan: NativePlan,
+      loaded: Boolean = NativeTask.isLoaded): Boolean = backend match {
     case JVM => true
-    case NATIVE if NativeTask.isLoaded =>
+    case NATIVE if loaded =>
       plan match {
         case _: org.apache.spark.sql.vegam.plan.CountStar => true
         case _: org.apache.spark.sql.vegam.plan.HashAgg => true
@@ -113,14 +120,12 @@ object VegamBackend {
     case _ => false
   }
 
-  def pick(requested: String, plan: NativePlan): Option[String] = {
-    resolve(requested) match {
-      case Some(NATIVE) if supports(NATIVE, plan) => Some(NATIVE)
-      case Some(NATIVE) if requested == AUTO || requested.toLowerCase(java.util.Locale.ROOT) == AUTO =>
-        Some(JVM)
-      case Some(JVM) => Some(JVM)
-      case other => other.filter(supports(_, plan))
-    }
+  /** None leaves the stage on Spark. */
+  def pick(
+      requested: String,
+      plan: NativePlan,
+      loaded: Boolean = NativeTask.isLoaded): Option[String] = {
+    resolve(requested, loaded).filter(supports(_, plan, loaded))
   }
 
   def create(name: String): VegamBackend = name match {

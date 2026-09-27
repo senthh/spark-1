@@ -244,21 +244,36 @@ case class StagePlan(
     groupOrdinals: Seq[Int] = Nil,
     aggOrdinals: Seq[Seq[Int]] = Nil,
     resultAt: Seq[Int] = Nil,
-    resultDiv: Seq[Int] = Nil) extends NativePlan {
+    resultDiv: Seq[Int] = Nil,
+    resultMul: Seq[Double] = Nil) extends NativePlan {
 
   /**
-   * Plans the loaded native library cannot execute: expression projects,
-   * column-column / OR filters, expression join keys, running or min/max
-   * windows, and any stage whose input is shuffle rows. Those run on the
-   * JVM backend, which interprets the same IR.
+   * Plans the loaded native library cannot execute. Velox rejects them and
+   * the library falls back to a kernel that collapses a group when any key
+   * is null, drops every row when a filter column is missing, and holds whole
+   * inputs in memory. With the auto backend those stages stay on Spark.
    */
   def jvmOnly: Boolean = {
-    rowSource || resultAt.nonEmpty || projects.nonEmpty ||
+    val probeCols = probe.columns.toSet
+    // A measure that is not on the probe file is read from a join build.
+    // The loaded library looks that name up on the probe and can drop it.
+    val foreignAgg = aggs.exists { a =>
+      val names = if (a.input.startsWith("(")) VExpr.colNames(a.input) else Seq(a.col)
+      names.exists(n => n.nonEmpty && !probeCols.contains(n))
+    }
+    val dimFilter = probeFilters.exists(f => f.col.nonEmpty && !probeCols.contains(f.col))
+    val semiJoin = builds.exists(b =>
+      b.joinType == NativePlan.JOIN_SEMI || b.joinType == NativePlan.JOIN_ANTI)
+    // Velox rejects these and the library falls back to its own kernel.
+    val untyped = (probe +: builds.map(_.scan)).exists(s =>
+      s.columns.isEmpty || s.types.length != s.columns.length)
+    val veloxRejects = untyped || complete || (groups.isEmpty && aggs.isEmpty) ||
+      builds.exists(!_.broadcast)
+    veloxRejects || rowSource || resultAt.nonEmpty || projects.nonEmpty || foreignAgg ||
+      expand.isDefined || window.isDefined || semiJoin || dimFilter ||
       probeFilters.exists(f => f.rightCol.nonEmpty || f.orGroup != 0) ||
       aggs.exists(a => a.input.startsWith("(")) ||
-      builds.exists(b => (b.probeKeys ++ b.buildKeys).exists(_.startsWith("("))) ||
-      window.exists(_.fns.exists(f =>
-        f.kind >= NativePlan.WIN_MIN || f.frame == NativePlan.FRAME_RUNNING))
+      builds.exists(b => (b.probeKeys ++ b.buildKeys).exists(_.startsWith("(")))
   }
   override def files: Seq[String] = probe.paths
 

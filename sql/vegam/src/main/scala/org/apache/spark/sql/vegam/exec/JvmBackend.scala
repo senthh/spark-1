@@ -87,13 +87,18 @@ object JvmBackend extends VegamBackend {
   }
 
   private def stage(s: StagePlan): VegamPage = {
+    // Only columns that exist on the probe file. A measure that lives on
+    // the build must not be requested here: a missing parquet field is a
+    // null column of that name, and the join then drops the real one.
+    val probeNames = s.probe.columns.toSet
+    def onProbe(c: String): Boolean = c.nonEmpty && probeNames.contains(c)
     val probeWant = (
       s.probe.columns ++
-        s.aggs.map(_.col) ++
-        s.aggs.flatMap(a => VExpr.colNames(a.input)) ++
-        s.projects.flatMap(p => p.name +: VExpr.colNames(p.expr)) ++
-        s.builds.flatMap(_.probeKeys).flatMap(keyCols)
-      ).filter(_.nonEmpty).distinct
+        s.aggs.map(_.col).filter(onProbe) ++
+        s.aggs.flatMap(a => VExpr.colNames(a.input)).filter(onProbe) ++
+        s.projects.flatMap(p => (p.name +: VExpr.colNames(p.expr)).filter(onProbe)) ++
+        s.builds.flatMap(_.probeKeys).flatMap(keyCols).filter(onProbe)
+      ).distinct
     // Residual FilterExec preds (dim columns) must not run on the fact
     // scan. Same rule as vegam_run_decoded: filter after joins.
     var table = readAll(s.probe.files, probeWant, Nil)
@@ -117,7 +122,7 @@ object JvmBackend extends VegamBackend {
     } else {
       toPage(table)
     }
-    relayout(page, s.resultAt, s.resultDiv)
+    relayout(page, s.resultAt, s.resultDiv, s.resultMul)
   }
 
   private def readAll(
@@ -358,7 +363,9 @@ object JvmBackend extends VegamBackend {
   private def window(table: ParquetIO.Table, w: WinSpec): ParquetIO.Table = {
     val partIdx = w.partitionBy.map(table.colIndex)
     val orderIdx = w.orderBy.map { case (c, asc) => (table.colIndex(c), asc) }
-    val groups = table.rows.groupBy(r => keyOf(r, partIdx)).values
+    // A null in one partition column must not collapse every such row
+    // into a single group. keyOf does that; keyOfNulls keeps the rest.
+    val groups = table.rows.groupBy(r => keyOfNulls(r, partIdx)).values
     val extraNames = w.fns.map(_.alias).toArray
     val names = table.names ++ extraNames
     val out = new ArrayBuffer[Array[Any]]()
@@ -378,8 +385,8 @@ object JvmBackend extends VegamBackend {
       var dense = 0
       while (i < sorted.length) {
         val row = sorted(i)
-        val ok = keyOf(row, orderIdx.map(_._1))
-        if (ok != prevKey) {
+        val ok = keyOfNulls(row, orderIdx.map(_._1))
+        if (i == 0 || ok != prevKey) {
           rank = i + 1
           dense += 1
           prevKey = ok
@@ -631,9 +638,18 @@ object JvmBackend extends VegamBackend {
     val n = entries.length
     val spec = if (plan.resultAt.isEmpty) {
       val w = gOrds.length + calls.map(outWidth).sum
-      (0 until w).map(i => (i, 0))
+      (0 until w).map(i => (i, 0, 1.0))
     } else {
-      plan.resultAt.zip(plan.resultDiv)
+      val muls = if (plan.resultMul.isEmpty) {
+        Seq.fill(plan.resultAt.length)(1.0)
+      } else {
+        plan.resultMul
+      }
+      plan.resultAt.zipWithIndex.map { case (src, i) =>
+        val div = if (i < plan.resultDiv.length) plan.resultDiv(i) else 0
+        val mul = if (i < muls.length) muls(i) else 1.0
+        (src, div, mul)
+      }
     }
     val cols = math.max(spec.length, 1)
     val values = new Array[Double](math.max(n, 0) * cols)
@@ -650,9 +666,9 @@ object JvmBackend extends VegamBackend {
         ai += 1
       }
       var c = 0
-      spec.foreach { case (src, div) =>
+      spec.foreach { case (src, div, mul) =>
         val cell = if (src >= 0 && src < raw.length) raw(src) else null
-        writeCell(values, nulls, texts, r, c, cols, divideScale(cell, div))
+        writeCell(values, nulls, texts, r, c, cols, scaleMul(divideScale(cell, div), mul))
         c += 1
       }
       r += 1
@@ -661,7 +677,11 @@ object JvmBackend extends VegamBackend {
   }
 
   /** Reorder a groups-then-aggs page into the aggregate's result list. */
-  private def relayout(page: VegamPage, at: Seq[Int], div: Seq[Int]): VegamPage = {
+  private def relayout(
+      page: VegamPage,
+      at: Seq[Int],
+      div: Seq[Int],
+      mul: Seq[Double]): VegamPage = {
     if (at.isEmpty) {
       return page
     }
@@ -676,12 +696,13 @@ object JvmBackend extends VegamBackend {
       while (c < cols) {
         val src = at(c)
         val d = if (c < div.length) div(c) else 0
+        val m = if (c < mul.length) mul(c) else 1.0
         val cell = if (src < 0 || src >= page.numCols || page.isNull(r, src)) {
           null
         } else if (page.isText(r, src)) {
           page.getText(r, src)
         } else {
-          divideScale(page.getDouble(r, src), d)
+          scaleMul(divideScale(page.getDouble(r, src), d), m)
         }
         writeCell(values, nulls, texts, r, c, cols, cell)
         c += 1
@@ -689,6 +710,25 @@ object JvmBackend extends VegamBackend {
       r += 1
     }
     VegamPage(n, cols, values, nulls, Array.fill(math.max(cols, 1))(0), texts)
+  }
+
+  /** Apply a result-list literal factor. 1.0 leaves the cell unchanged. */
+  private def scaleMul(cell: Any, factor: Double): Any = {
+    if (cell == null || factor == 1.0) {
+      cell
+    } else {
+      val f = BigDecimal(factor)
+      cell match {
+        case n: java.lang.Long => BigDecimal(n.longValue()) * f
+        case n: java.lang.Integer => BigDecimal(n.intValue()) * f
+        case n: java.lang.Double => n.doubleValue() * factor
+        case n: Double => n * factor
+        case n: Decimal => n.toBigDecimal * f
+        case n: BigDecimal => n * f
+        case _ =>
+          ParquetIO.toDouble(cell).map(_ * factor).orNull
+      }
+    }
   }
 
   /** Unscaled long to decimal: divide by 10^scale. scale 0 leaves the cell. */

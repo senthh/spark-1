@@ -39,7 +39,7 @@ object VegamRewrite extends Logging {
       return plan
     }
     val requested = VegamConf.backend(conf)
-    if (VegamBackend.resolve(requested).isEmpty && requested != "auto") {
+    if (VegamBackend.resolve(requested).isEmpty) {
       skip("backend", requested)
       return plan
     }

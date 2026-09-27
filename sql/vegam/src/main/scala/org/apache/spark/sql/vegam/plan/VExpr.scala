@@ -39,6 +39,7 @@ case class VNeg(child: VExpr) extends VExpr
 case class VBin(op: String, left: VExpr, right: VExpr) extends VExpr
 case class VCoalesce(kids: Seq[VExpr]) extends VExpr
 case class VIsNull(child: VExpr) extends VExpr
+case class VSubstr(child: VExpr, pos: Int, len: Int) extends VExpr
 
 object VExpr {
 
@@ -58,6 +59,8 @@ object VExpr {
       val ps = cs.map(parse)
       if (ps.forall(_.isDefined)) Some(VCoalesce(ps.flatten)) else None
     case IsNull(c) => parse(c).map(VIsNull)
+    case Substring(str, Literal(p, _), Literal(n, _)) =>
+      for { c <- parse(str); pi <- asInt(p); ni <- asInt(n) } yield VSubstr(c, pi, ni)
     case Literal(null, _) => Some(VNull())
     case Literal(v, _) => lit(v)
     case _ => None
@@ -83,6 +86,8 @@ object VExpr {
       val ps = cs.map(c => parseAt(c, out))
       if (ps.forall(_.isDefined)) Some(VCoalesce(ps.flatten)) else None
     case IsNull(c) => parseAt(c, out).map(VIsNull)
+    case Substring(str, Literal(p, _), Literal(n, _)) =>
+      for { c <- parseAt(str, out); pi <- asInt(p); ni <- asInt(n) } yield VSubstr(c, pi, ni)
     case Literal(null, _) => Some(VNull())
     case Literal(v, _) => lit(v)
     case _ => None
@@ -100,6 +105,7 @@ object VExpr {
     case VBin(op, l, r) => "(" + op + " " + encode(l) + " " + encode(r) + ")"
     case VCoalesce(ks) => "(coalesce " + ks.map(encode).mkString(" ") + ")"
     case VIsNull(c) => "(isnull " + encode(c) + ")"
+    case VSubstr(c, p, n) => "(substr " + encode(c) + " " + p + " " + n + ")"
   }
 
   def firstCol(e: VExpr): Option[String] = e match {
@@ -111,6 +117,7 @@ object VExpr {
     case VBin(_, l, r) => firstCol(l).orElse(firstCol(r))
     case VCoalesce(ks) => ks.flatMap(firstCol).headOption
     case VIsNull(c) => firstCol(c)
+    case VSubstr(c, _, _) => firstCol(c)
     case _ => None
   }
 
@@ -160,6 +167,15 @@ object VExpr {
       }
     case VCoalesce(ks) =>
       ks.iterator.map(k => eval(k, names, row)).find(_ != null).orNull
+    case VSubstr(c, pos, len) =>
+      val s = eval(c, names, row)
+      if (s == null || len <= 0) {
+        null
+      } else {
+        val str = s.toString
+        val start = if (pos > 0) pos - 1 else 0
+        if (start >= str.length) "" else str.substring(start, math.min(str.length, start + len))
+      }
   }
 
   def decode(s: String): Option[VExpr] = {
@@ -179,6 +195,7 @@ object VExpr {
     case VBin(_, l, r) => colsOf(l) ++ colsOf(r)
     case VCoalesce(ks) => ks.flatMap(colsOf)
     case VIsNull(c) => colsOf(c)
+    case VSubstr(c, _, _) => colsOf(c)
     case _ => Nil
   }
 
@@ -192,6 +209,14 @@ object VExpr {
       r: Expression,
       out: Seq[Attribute]): Option[VExpr] = {
     for { a <- parseAt(l, out); b <- parseAt(r, out) } yield VBin(op, a, b)
+  }
+
+  private def asInt(v: Any): Option[Int] = v match {
+    case i: java.lang.Integer => Some(i.intValue())
+    case l: java.lang.Long => Some(l.intValue())
+    case i: Int => Some(i)
+    case l: Long => Some(l.toInt)
+    case _ => None
   }
 
   private def lit(v: Any): Option[VExpr] = v match {
@@ -292,6 +317,11 @@ object VExpr {
         }
       case "isnull" if args.length == 1 => VIsNull(args(0))
       case "coalesce" if args.nonEmpty => VCoalesce(args.toSeq)
+      case "substr" if args.length == 3 =>
+        (args(1), args(2)) match {
+          case (VLong(p), VLong(n)) => VSubstr(args(0), p.toInt, n.toInt)
+          case _ => throw new RuntimeException("substr")
+        }
       case _ => throw new RuntimeException(op)
     }
     (built, rest.substring(1))

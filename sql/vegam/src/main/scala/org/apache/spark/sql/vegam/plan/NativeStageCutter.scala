@@ -116,9 +116,10 @@ object NativeStageCutter {
         } else if (reorder.isEmpty && isSimpleGroupSum(agg, pipe)) {
           CutOk(toHashAgg(agg, pipe, complete), pipe.probeNode)
         } else {
-            val (at, div) = reorder.map(cols => (cols.map(_._1), cols.map(_._2)))
-              .getOrElse((Nil, Nil))
-            CutOk(StagePlan(
+            val (at, div, mul) = reorder.map { cols =>
+              (cols.map(_._1), cols.map(_._2), cols.map(_._3))
+            }.getOrElse((Nil, Nil, Nil))
+            val stage = StagePlan(
               probe = pipe.probe,
               builds = pipe.builds,
               probeFilters = pipe.probeFilters ++ pipe.scanFilters,
@@ -130,7 +131,15 @@ object NativeStageCutter {
               expand = pipe.expand,
               projects = pipe.projects,
               resultAt = at,
-              resultDiv = div), pipe.probeNode)
+              resultDiv = div,
+              resultMul = mul)
+            // The JVM backend reads whole files and joins them in memory: on
+            // fact tables that exhausts the executor heap or returns no rows.
+            if (stage.builds.nonEmpty && stage.jvmOnly) {
+              CutSkip("jvm-join", stage.builds.length.toString)
+            } else {
+              CutOk(stage, pipe.probeNode)
+            }
         }
     }
   }
@@ -141,7 +150,14 @@ object NativeStageCutter {
       case Right(spec) if rowInput(w.child) =>
         val names = w.child.output.map(_.name)
         val types = w.child.output.map(_.dataType.simpleString)
-        if (spec.partitionBy.exists(c => !names.contains(c)) ||
+        // Row stages carry numbers as doubles, which hold 15 digits exactly.
+        val wide = w.child.output.collectFirst {
+          case a if a.dataType.isInstanceOf[DecimalType] &&
+              a.dataType.asInstanceOf[DecimalType].precision > 15 => a.name
+        }
+        if (wide.isDefined) {
+          CutSkip("window-decimal", wide.get)
+        } else if (spec.partitionBy.exists(c => !names.contains(c)) ||
             spec.orderBy.exists { case (c, _) => !names.contains(c) } ||
             spec.fns.exists(f => f.col.nonEmpty && !names.contains(f.col))) {
           CutSkip("window-fn", "row")
@@ -218,18 +234,10 @@ object NativeStageCutter {
         lowerPipeline(e.child)
       case s: SortExec =>
         lowerPipeline(s.child)
-      case e: ExpandExec =>
-        parseExpand(e) match {
-          case Left(skip) => Left(skip)
-          case Right(spec) =>
-            lowerPipeline(e.child).flatMap { p =>
-              if (p.expand.isDefined) {
-                Left(CutSkip("nested-expand", "expand"))
-              } else {
-                Right(p.copy(expand = Some(spec)))
-              }
-            }
-        }
+      case _: ExpandExec =>
+        // Rollup null keys are wrong in the loaded library, and the JVM
+        // fallback reads whole files and gets the executor killed.
+        Left(CutSkip("expand", "rollup"))
       case u: UnionExec =>
         lowerUnion(u)
       case j: BroadcastHashJoinExec =>
@@ -622,38 +630,6 @@ object NativeStageCutter {
     case _ => NativePlan.INPUT_UNSUPPORTED
   }
 
-  private def parseExpand(e: ExpandExec): Either[CutSkip, ExpandSpec] = {
-    val names = e.output.map(_.name)
-    val projs = e.projections.map(_.map(parseExpandSlot))
-    if (projs.exists(_.exists(_.isEmpty))) {
-      Left(CutSkip("expand-expr", e.projections.flatten.map(_.prettyName).distinct.mkString(",")))
-    } else if (projs.exists(_.length != names.length)) {
-      Left(CutSkip("expand-width", e.nodeName))
-    } else {
-      Right(ExpandSpec(names, projs.map(_.flatten)))
-    }
-  }
-
-  private def parseExpandSlot(e: Expression): Option[ExpandSlot] = e match {
-    case a: Attribute => Some(ExpandSlot(NativePlan.EXPAND_COL, a.name))
-    case Alias(c, _) => parseExpandSlot(c)
-    case c: Cast => parseExpandSlot(c.child)
-    case Literal(null, _) => Some(ExpandSlot(NativePlan.EXPAND_NULL))
-    case Literal(v, _) => v match {
-      case i: java.lang.Integer => Some(ExpandSlot(NativePlan.EXPAND_LONG, lvalue = i.longValue()))
-      case l: java.lang.Long => Some(ExpandSlot(NativePlan.EXPAND_LONG, lvalue = l.longValue()))
-      case i: Int => Some(ExpandSlot(NativePlan.EXPAND_LONG, lvalue = i.toLong))
-      case l: Long => Some(ExpandSlot(NativePlan.EXPAND_LONG, lvalue = l))
-      case d: java.lang.Double => Some(ExpandSlot(NativePlan.EXPAND_DOUBLE, dvalue = d.doubleValue()))
-      case f: java.lang.Float => Some(ExpandSlot(NativePlan.EXPAND_DOUBLE, dvalue = f.doubleValue()))
-      case dec: Decimal => Some(ExpandSlot(NativePlan.EXPAND_DOUBLE, dvalue = dec.toDouble))
-      case s: UTF8String => Some(ExpandSlot(NativePlan.EXPAND_STR, svalue = s.toString))
-      case s: String => Some(ExpandSlot(NativePlan.EXPAND_STR, svalue = s))
-      case other => toLong(other).map(n => ExpandSlot(NativePlan.EXPAND_LONG, lvalue = n))
-    }
-    case _ => None
-  }
-
   private def parseWindow(w: WindowExec): Either[CutSkip, WinSpec] = {
     val part = w.partitionSpec.flatMap(leafName)
     if (part.length != w.partitionSpec.length) {
@@ -801,6 +777,11 @@ object NativeStageCutter {
     if (modes.length != 1) {
       return CutSkip("agg-mode", modes.mkString(","))
     }
+    // Final merges of unscaled sums and decimal buffers disagree with Spark.
+    // The partial below the shuffle stays native; Spark does this merge.
+    if (modes.head == Final) {
+      return CutSkip("agg-mode", "Final")
+    }
     val calls = agg.aggregateExpressions.flatMap(toAggCall)
     if (calls.length != agg.aggregateExpressions.length) {
       return CutSkip("unsupported-agg",
@@ -854,7 +835,7 @@ object NativeStageCutter {
       groupOrds: Seq[Int],
       calls: Seq[AggCall],
       ords: Seq[Seq[Int]],
-      layout: Seq[(Int, Int)] = Nil): CutResult = {
+      layout: Seq[(Int, Int, Double)] = Nil): CutResult = {
     val child = agg.child
     CutOk(StagePlan(
       probe = ScanSpec(Nil, child.output.map(_.name),
@@ -870,7 +851,8 @@ object NativeStageCutter {
       groupOrdinals = groupOrds,
       aggOrdinals = ords,
       resultAt = layout.map(_._1),
-      resultDiv = layout.map(_._2)), None, Some(child))
+      resultDiv = layout.map(_._2),
+      resultMul = layout.map(_._3)), None, Some(child))
   }
 
   /**
@@ -882,7 +864,7 @@ object NativeStageCutter {
    */
   private def bindOutput(
       agg: BaseAggregateExec,
-      divide: Boolean): Either[String, Seq[(Int, Int)]] = {
+      divide: Boolean): Either[String, Seq[(Int, Int, Double)]] = {
     val nGroups = agg.groupingExpressions.length
     val groupIds = agg.groupingExpressions.flatMap(attrId)
     val aggIds = agg.aggregateAttributes.map(_.exprId)
@@ -898,18 +880,43 @@ object NativeStageCutter {
         if (i >= 0) Some(nGroups + i) else None
       }
     }
-    def peel(e: Expression): Option[(Int, Int)] = e match {
-      case a: Attribute => locate(a).map(i => (i, 0))
+    // (column, divide-by-10^n, then multiply). Powers of ten stay on the
+    // integer divide so an unscaled decimal long is exact.
+    def peel(e: Expression): Option[(Int, Int, Double)] = e match {
+      case a: Attribute => locate(a).map(i => (i, 0, 1.0))
       case Alias(c, _) => peel(c)
       case KnownNotNull(c) => peel(c)
       case c: CheckOverflow => peel(c.child)
       case m: MakeDecimal =>
-        peel(m.child).map { case (i, s) => (i, if (divide) m.scale else s) }
+        peel(m.child).map { case (i, s, f) =>
+          (i, if (divide) m.scale else s, f)
+        }
       case c: Cast => peel(c.child)
+      case Multiply(l, r, _) =>
+        scaled(l, r, mul = true).orElse(scaled(r, l, mul = true))
       case Divide(c, Literal(v, _), _) =>
         val extra = pow10Scale(v)
-        if (extra < 0) None
-        else peel(c).map { case (i, s) => (i, if (divide) s + extra else s) }
+        if (extra >= 0) {
+          peel(c).map { case (i, s, f) =>
+            (i, if (divide) s + extra else s, f)
+          }
+        } else {
+          litFactor(v).filter(m => m != 0.0 && !m.isNaN).flatMap { m =>
+            peel(c).map { case (i, s, f) => (i, s, f / m) }
+          }
+        }
+      case _ => None
+    }
+    def scaled(
+        factor: Expression,
+        rest: Expression,
+        mul: Boolean): Option[(Int, Int, Double)] = factor match {
+      case Literal(v, _) =>
+        litFactor(v).filter(m => m != 0.0 && !m.isNaN).flatMap { m =>
+          peel(rest).map { case (i, s, f) =>
+            (i, s, if (mul) f * m else f / m)
+          }
+        }
       case _ => None
     }
     val cols = agg.resultExpressions.map(peel)
@@ -922,8 +929,19 @@ object NativeStageCutter {
     }
   }
 
-  private def identityLayout(cols: Seq[(Int, Int)]): Boolean = {
-    cols.zipWithIndex.forall { case ((i, d), n) => i == n && d == 0 }
+  private def identityLayout(cols: Seq[(Int, Int, Double)]): Boolean = {
+    cols.zipWithIndex.forall { case ((i, d, m), n) => i == n && d == 0 && m == 1.0 }
+  }
+
+  private def litFactor(v: Any): Option[Double] = v match {
+    case n: java.lang.Double => Some(n.doubleValue())
+    case n: java.lang.Float => Some(n.doubleValue())
+    case n: java.lang.Long => Some(n.doubleValue())
+    case n: java.lang.Integer => Some(n.doubleValue())
+    case n: java.lang.Short => Some(n.doubleValue())
+    case n: java.lang.Byte => Some(n.doubleValue())
+    case n: Decimal => Some(n.toDouble)
+    case _ => None
   }
 
   private def attrId(e: Expression): Option[ExprId] = e match {

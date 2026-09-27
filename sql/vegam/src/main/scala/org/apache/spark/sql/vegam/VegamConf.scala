@@ -33,8 +33,9 @@ object VegamConf {
     .createWithDefault(false)
 
   val VEGAM_BACKEND = SQLConf.buildConf("spark.sql.vegam.backend")
-    .doc("Vegam execution backend: auto (native JNI if libvegam is loaded, " +
-      "otherwise the IR interpreter), native, or jvm.")
+    .doc("Vegam execution backend: auto (libvegam for the stages it supports; " +
+      "every other stage stays on Spark), native, or jvm (the IR interpreter, " +
+      "for tests).")
     .version("4.2.0")
     .stringConf
     .createWithDefault("auto")

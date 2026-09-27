@@ -24,6 +24,7 @@ import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.vegam.exec.NativeTask
+import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.types.{DecimalType, LongType}
 import org.apache.spark.sql.vegam.plan.{AggCall, BuildJoin, CountStar, FileRef, HashAgg,
   NativePlan, NativePlanCodec, ScanSpec, StagePlan}
@@ -51,6 +52,55 @@ class VegamPathsSuite extends org.apache.spark.SparkFunSuite {
     assert(VegamPaths.clean("file:///tmp/x") === "/tmp/x")
     assert(VegamPaths.clean("/tmp/x") === "/tmp/x")
     assert(VegamPaths.clean("hdfs://nn/tmp/x") === "hdfs://nn/tmp/x")
+  }
+}
+
+class VegamBackendSuite extends org.apache.spark.SparkFunSuite {
+  import org.apache.spark.sql.vegam.exec.VegamBackend
+  import org.apache.spark.sql.vegam.exec.VegamBackend.{AUTO, JVM, NATIVE}
+
+  private def stage(window: Boolean): StagePlan = StagePlan(
+    probe = ScanSpec(Seq(FileRef("/tmp/a.parquet", Nil)), Seq("k", "v"), Seq("bigint", "bigint")),
+    builds = Nil,
+    probeFilters = Nil,
+    groups = Seq("k"),
+    groupTypes = Seq(LongType),
+    aggs = Seq(AggCall(NativePlan.AGG_SUM, "v", 0, LongType)),
+    window = if (window) {
+      Some(org.apache.spark.sql.vegam.plan.WinSpec(Seq("k"), Nil, Nil))
+    } else {
+      None
+    },
+    complete = false)
+
+  test("auto runs what libvegam supports and leaves the rest on Spark") {
+    assert(!stage(window = false).jvmOnly)
+    assert(stage(window = true).jvmOnly)
+    assert(VegamBackend.pick(AUTO, stage(window = false), loaded = true) === Some(NATIVE))
+    assert(VegamBackend.pick(AUTO, stage(window = true), loaded = true) === None)
+    assert(VegamBackend.pick(AUTO, stage(window = false), loaded = false) === None)
+    assert(VegamBackend.resolve(AUTO, loaded = false) === None)
+  }
+
+  test("stages Velox rejects are not sent to libvegam") {
+    val base = stage(window = false)
+    assert(base.copy(probe = base.probe.copy(types = Nil)).jvmOnly)
+    assert(base.copy(complete = true).jvmOnly)
+    assert(base.copy(groups = Nil, groupTypes = Nil, aggs = Nil).jvmOnly)
+    val build = BuildJoin(
+      scan = ScanSpec(Seq(FileRef("/tmp/d.parquet", Nil)), Seq("k"), Seq("bigint")),
+      probeKeys = Seq("k"),
+      buildKeys = Seq("k"),
+      joinType = NativePlan.JOIN_INNER,
+      filters = Nil)
+    assert(!base.copy(builds = Seq(build)).jvmOnly)
+    assert(base.copy(builds = Seq(build.copy(broadcast = false))).jvmOnly)
+  }
+
+  test("jvm is only used when requested") {
+    assert(VegamBackend.pick(JVM, stage(window = true), loaded = true) === Some(JVM))
+    assert(VegamBackend.pick(JVM, stage(window = false), loaded = false) === Some(JVM))
+    assert(VegamBackend.pick(NATIVE, stage(window = true), loaded = true) === None)
   }
 }
 
@@ -389,7 +439,7 @@ class VegamSuite extends SharedSparkSession {
     }
   }
 
-  test("exists and in become semi-join native stages") {
+  test("exists and in semi-joins stay on Spark") {
     withTempPath { fact =>
       withTempPath { dim =>
         val fp = fact.getCanonicalPath
@@ -400,14 +450,14 @@ class VegamSuite extends SharedSparkSession {
           val inn = sql(
             s"SELECT k, SUM(v) FROM parquet.`$fp` WHERE k IN (SELECT k FROM parquet.`$dp`) " +
               "GROUP BY k")
-          assert(hasNative(inn.queryExecution.executedPlan),
+          assert(!hasNative(inn.queryExecution.executedPlan),
             inn.queryExecution.executedPlan.toString)
           checkAnswer(inn, Seq((1L, 1.5), (2L, 3.0)).toDF("k", "sum(v)"))
 
           val ex = sql(
             s"SELECT f.k, SUM(f.v) FROM parquet.`$fp` f WHERE EXISTS (" +
               s"SELECT 1 FROM parquet.`$dp` d WHERE d.k = f.k) GROUP BY f.k")
-          assert(hasNative(ex.queryExecution.executedPlan),
+          assert(!hasNative(ex.queryExecution.executedPlan),
             ex.queryExecution.executedPlan.toString)
           checkAnswer(ex, Seq((1L, 1.5), (2L, 3.0)).toDF("k", "sum(v)"))
         }
@@ -430,11 +480,15 @@ class VegamSuite extends SharedSparkSession {
           assert(hasNative(df.queryExecution.executedPlan), df.queryExecution.executedPlan.toString)
           checkAnswer(df, Seq((1L, 3.0), (2L, 3.0)).toDF("k", "sum(v)"))
         }
+        checkVegamMatches(
+          s"SELECT k, SUM(v) FROM (" +
+            s"SELECT k, v FROM parquet.`$ap` UNION ALL SELECT k, v FROM parquet.`$bp`" +
+            ") t GROUP BY k")
       }
     }
   }
 
-  test("sort-merge join plus group-sum") {
+  test("sort-merge join plus group-sum stays on Spark") {
     withTempPath { fact =>
       withTempPath { dim =>
         val fp = fact.getCanonicalPath
@@ -446,7 +500,7 @@ class VegamSuite extends SharedSparkSession {
             val df = sql(
               s"SELECT f.k, SUM(f.v) FROM parquet.`$fp` f " +
                 s"JOIN parquet.`$dp` d ON f.k = d.k GROUP BY f.k")
-            assert(hasNative(df.queryExecution.executedPlan),
+            assert(!hasNative(df.queryExecution.executedPlan),
               df.queryExecution.executedPlan.toString)
             checkAnswer(df, Seq((1L, 4.0), (2L, 3.0)).toDF("k", "sum(v)"))
           }
@@ -455,19 +509,19 @@ class VegamSuite extends SharedSparkSession {
     }
   }
 
-  test("rollup and grouping sets fuse expand") {
+  test("rollup and grouping sets stay on Spark") {
     withTempPath { dir =>
       val path = dir.getCanonicalPath
       Seq((1L, 1.5), (1L, 2.5), (2L, 3.0)).toDF("k", "v").write.mode("overwrite").parquet(path)
       withVegam {
         val roll = sql(s"SELECT k, SUM(v) FROM parquet.`$path` GROUP BY ROLLUP(k)")
-        assert(hasNative(roll.queryExecution.executedPlan),
+        assert(!hasNative(roll.queryExecution.executedPlan),
           roll.queryExecution.executedPlan.toString)
         checkAnswer(roll, Seq(Row(1L, 4.0), Row(2L, 3.0), Row(null, 7.0)))
 
         val gs = sql(
           s"SELECT k, SUM(v) FROM parquet.`$path` GROUP BY GROUPING SETS ((k), ())")
-        assert(hasNative(gs.queryExecution.executedPlan),
+        assert(!hasNative(gs.queryExecution.executedPlan),
           gs.queryExecution.executedPlan.toString)
         checkAnswer(gs, Seq(Row(1L, 4.0), Row(2L, 3.0), Row(null, 7.0)))
       }
@@ -484,7 +538,7 @@ class VegamSuite extends SharedSparkSession {
           SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true") {
         val df = sql(s"SELECT k, SUM(v) FROM parquet.`$path` GROUP BY k")
         val plan = df.queryExecution.executedPlan
-        assert(nativeCount(plan) >= 2, plan.toString)
+        assert(nativeCount(plan) == 1, plan.toString)
         checkAnswer(df, Seq((1L, 4.0)).toDF("k", "sum(v)"))
       }
     }
@@ -590,7 +644,7 @@ class VegamSuite extends SharedSparkSession {
     }
   }
 
-  test("final aggregate over the shuffle is native") {
+  test("final aggregate over the shuffle stays on Spark") {
     withTempPath { dir =>
       val path = dir.getCanonicalPath
       Seq((1L, 1.5), (1L, 2.5), (2L, 3.0)).toDF("k", "v")
@@ -598,7 +652,7 @@ class VegamSuite extends SharedSparkSession {
       withVegam {
         val df = sql(s"SELECT k, SUM(v) FROM parquet.`$path` GROUP BY k")
         val plan = df.queryExecution.executedPlan
-        assert(nativeCount(plan) >= 2, plan.toString)
+        assert(nativeCount(plan) == 1, plan.toString)
         checkAnswer(df, Seq((1L, 4.0), (2L, 3.0)).toDF("k", "sum(v)"))
       }
     }
@@ -617,7 +671,7 @@ class VegamSuite extends SharedSparkSession {
         val df = sql(
           s"SELECT SUM(v), name, k FROM parquet.`$path` GROUP BY name, k")
         val plan = df.queryExecution.executedPlan
-        assert(nativeCount(plan) >= 2, plan.toString)
+        assert(nativeCount(plan) == 1, plan.toString)
         checkAnswer(df, Seq(
           (BigDecimal("4.04"), "a", 1L),
           (BigDecimal("3.00"), "b", 2L)).toDF("sum(v)", "name", "k"))
@@ -652,6 +706,264 @@ class VegamSuite extends SharedSparkSession {
         assert(hasNative(df.queryExecution.executedPlan), df.queryExecution.executedPlan.toString)
         checkAnswer(df, Seq((1L, 1L, 10.0), (1L, 2L, 15.0), (2L, 1L, 7.0)).toDF("k", "d", "c"))
       }
+    }
+  }
+
+  test("q1 shape: average times a literal stays scaled") {
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      Seq((1, 1, 10.0), (1, 1, 10.0), (1, 2, 1.0), (2, 3, 5.0))
+        .toDF("store", "cust", "fee").write.mode("overwrite").parquet(path)
+      val inner =
+        "SELECT cust, store, sum(fee) total FROM parquet.`" + path + "` GROUP BY cust, store"
+      val q =
+        "SELECT c.cust, c.total FROM (" + inner + ") c JOIN (" +
+          "SELECT store, avg(total) * 1.2 lim FROM (" + inner + ") GROUP BY store) a " +
+          "ON c.store = a.store WHERE c.total > a.lim"
+      val expected = sql(q).collect().toSeq
+      withVegam {
+        val df = sql(q)
+        checkAnswer(df, expected)
+      }
+    }
+  }
+
+  test("substr join key stays on Spark") {
+    withTempPath { dir =>
+      val base = dir.getCanonicalPath
+      val sales = base + "/sales"
+      val zips = base + "/zips"
+      Seq((1L, "89436", 2.0), (1L, "99999", 8.0), (2L, "30868", 4.0))
+        .toDF("k", "code", "v").write.mode("overwrite").parquet(sales)
+      Seq(("89436-1234", "keep"), ("30868-0000", "keep"))
+        .toDF("zip", "tag").write.mode("overwrite").parquet(zips)
+      val q =
+        "SELECT k, sum(v) s FROM parquet.`" + sales + "` s, parquet.`" + zips + "` z " +
+          "WHERE s.code = substr(z.zip, 1, 5) GROUP BY k"
+      val expected = sql(q).collect().toSeq
+      withVegam {
+        val df = sql(q)
+        assert(!hasNative(df.queryExecution.executedPlan),
+          df.queryExecution.executedPlan.toString)
+        checkAnswer(df, expected)
+      }
+    }
+  }
+
+  test("q65 shape: decimal sum through a date join then average") {
+    withTempPath { dir =>
+      val base = dir.getCanonicalPath
+      val sales = base + "/sales"
+      val dates = base + "/dates"
+      val stores = base + "/stores"
+      val items = base + "/items"
+      Seq(
+        (1, 1, 10, BigDecimal("0.40")),
+        (1, 1, 10, BigDecimal("0.49")),
+        (1, 1, 20, BigDecimal("1.84")),
+        (1, 2, 11, BigDecimal("10.00")),
+        (2, 3, 10, BigDecimal("0.30")))
+        .toDF("store_sk", "item_sk", "date_sk", "price")
+        .withColumn("price", col("price").cast(DecimalType(7, 2)))
+        .write.mode("overwrite").parquet(sales)
+      Seq((10, 5), (11, 6), (20, 9)).toDF("date_sk", "month")
+        .write.mode("overwrite").parquet(dates)
+      Seq((1, "s1"), (2, "s2")).toDF("store_sk", "name")
+        .write.mode("overwrite").parquet(stores)
+      Seq((1, "d1"), (2, "d2"), (3, "d3")).toDF("item_sk", "descr")
+        .write.mode("overwrite").parquet(items)
+      val q =
+        "SELECT st.name, it.descr, sc.revenue " +
+          "FROM parquet.`" + stores + "` st, parquet.`" + items + "` it, " +
+          "(SELECT store_sk, avg(revenue) ave FROM (" +
+          "SELECT store_sk, item_sk, sum(price) revenue " +
+          "FROM parquet.`" + sales + "` sa, parquet.`" + dates + "` d " +
+          "WHERE sa.date_sk = d.date_sk AND d.month BETWEEN 5 AND 6 " +
+          "GROUP BY store_sk, item_sk) x GROUP BY store_sk) sb, " +
+          "(SELECT store_sk, item_sk, sum(price) revenue " +
+          "FROM parquet.`" + sales + "` scs, parquet.`" + dates + "` d2 " +
+          "WHERE scs.date_sk = d2.date_sk AND d2.month BETWEEN 5 AND 6 " +
+          "GROUP BY store_sk, item_sk) sc " +
+          "WHERE sb.store_sk = sc.store_sk AND sc.revenue <= 0.1 * sb.ave " +
+          "AND st.store_sk = sc.store_sk AND it.item_sk = sc.item_sk"
+      checkVegamMatches(q)
+    }
+  }
+
+  test("q70 shape: rollup rank over a filtered join") {
+    withTempPath { dir =>
+      val base = dir.getCanonicalPath
+      val sales = base + "/sales"
+      val stores = base + "/stores"
+      Seq(
+        (1, 5, BigDecimal("4.00")),
+        (1, 9, BigDecimal("9.00")),
+        (2, 5, BigDecimal("1.00")),
+        (2, 6, BigDecimal("3.00")),
+        (3, 5, BigDecimal("8.00")))
+        .toDF("store_sk", "month", "profit")
+        .withColumn("profit", col("profit").cast(DecimalType(7, 2)))
+        .write.mode("overwrite").parquet(sales)
+      Seq((1, "TN", "a"), (2, "TN", "b"), (3, "AL", "c"))
+        .toDF("store_sk", "state", "county")
+        .write.mode("overwrite").parquet(stores)
+      val q =
+        "SELECT sum(profit) total_sum, state, county, " +
+          "grouping(state) + grouping(county) loch, " +
+          "rank() OVER (PARTITION BY grouping(state) + grouping(county), " +
+          "CASE WHEN grouping(county) = 0 THEN state END " +
+          "ORDER BY sum(profit) DESC) rk " +
+          "FROM parquet.`" + sales + "` sa, parquet.`" + stores + "` st " +
+          "WHERE sa.store_sk = st.store_sk AND sa.month BETWEEN 5 AND 6 " +
+          "GROUP BY ROLLUP(state, county)"
+      checkVegamMatches(q)
+    }
+  }
+
+  test("q49 shape: rank over a wide decimal ratio keeps every digit") {
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      Seq((1L, 53L, 96L), (2L, 1L, 3L), (3L, 2L, 7L))
+        .toDF("item", "ret", "qty").write.mode("overwrite").parquet(path)
+      val q =
+        "SELECT item, ratio, rank() OVER (ORDER BY ratio) rk FROM (" +
+          "SELECT item, cast(sum(ret) as decimal(15,4)) / " +
+          "cast(sum(qty) as decimal(15,4)) ratio " +
+          "FROM parquet.`" + path + "` GROUP BY item) t"
+      checkVegamMatches(q)
+      withVegam {
+        val plan = sql(q).queryExecution.executedPlan
+        assert(nativeStages(plan).forall(_.window.isEmpty), plan.toString)
+      }
+    }
+  }
+
+  test("q86 shape: rollup of string keys from a joined dimension") {
+    withTempPath { dir =>
+      val base = dir.getCanonicalPath
+      val sales = base + "/sales"
+      val dates = base + "/dates"
+      val items = base + "/items"
+      Seq(
+        (1, 10, BigDecimal("4.00")),
+        (2, 10, BigDecimal("1.00")),
+        (3, 11, BigDecimal("9.00")),
+        (1, 12, BigDecimal("3.00")))
+        .toDF("item_sk", "date_sk", "paid")
+        .withColumn("paid", col("paid").cast(DecimalType(7, 2)))
+        .write.mode("overwrite").parquet(sales)
+      Seq((10, 5), (11, 5), (12, 9)).toDF("date_sk", "month")
+        .write.mode("overwrite").parquet(dates)
+      Seq((1, "home", "a"), (2, "home", "b"), (3, "books", "c"))
+        .toDF("item_sk", "category", "klass")
+        .write.mode("overwrite").parquet(items)
+      val q =
+        "SELECT sum(paid) total_sum, category, klass, " +
+          "grouping(category) + grouping(klass) loch, " +
+          "rank() OVER (PARTITION BY grouping(category) + grouping(klass), " +
+          "CASE WHEN grouping(klass) = 0 THEN category END " +
+          "ORDER BY sum(paid) DESC) rk " +
+          "FROM parquet.`" + sales + "` sa, parquet.`" + dates + "` d, " +
+          "parquet.`" + items + "` it " +
+          "WHERE sa.date_sk = d.date_sk AND sa.item_sk = it.item_sk " +
+          "AND d.month BETWEEN 5 AND 6 " +
+          "GROUP BY ROLLUP(category, klass)"
+      checkVegamMatches(q)
+      withVegam {
+        val plan = sql(q).queryExecution.executedPlan
+        val stages = nativeStages(plan)
+        assert(stages.forall(_.expand.isEmpty), plan.toString)
+      }
+    }
+  }
+
+  test("q23 shape: semi-join filter then sum of a product") {
+    withTempPath { dir =>
+      val base = dir.getCanonicalPath
+      val sales = base + "/sales"
+      val dates = base + "/dates"
+      val items = base + "/items"
+      Seq(
+        (1, 1, 10, 2, BigDecimal("3.00")),
+        (2, 1, 10, 1, BigDecimal("4.00")),
+        (3, 9, 10, 5, BigDecimal("8.00")),
+        (1, 1, 11, 7, BigDecimal("1.00")))
+        .toDF("item_sk", "cust", "date_sk", "qty", "price")
+        .withColumn("price", col("price").cast(DecimalType(7, 2)))
+        .write.mode("overwrite").parquet(sales)
+      Seq((10, 1999, 1), (11, 2001, 1)).toDF("date_sk", "year", "moy")
+        .write.mode("overwrite").parquet(dates)
+      Seq((1, "red shirt"), (9, "blue hat")).toDF("item_sk", "descr")
+        .write.mode("overwrite").parquet(items)
+      val q =
+        "SELECT sum(qty * price) s FROM parquet.`" + sales + "` sa, " +
+          "parquet.`" + dates + "` d " +
+          "WHERE sa.date_sk = d.date_sk AND d.year = 1999 AND d.moy = 1 " +
+          "AND sa.item_sk IN (SELECT item_sk FROM parquet.`" + items + "` " +
+          "WHERE descr = 'red shirt') " +
+          "AND sa.cust IN (SELECT cust FROM parquet.`" + sales + "` " +
+          "GROUP BY cust HAVING sum(qty) > 2)"
+      checkVegamMatches(q)
+    }
+  }
+
+  test("q56 shape: color membership across a union of sums") {
+    withTempPath { dir =>
+      val base = dir.getCanonicalPath
+      val sales = base + "/sales"
+      val items = base + "/items"
+      val addr = base + "/addr"
+      Seq((1, 1, BigDecimal("5.00")), (2, 1, BigDecimal("1.00")), (3, 2, BigDecimal("9.00")))
+        .toDF("item_sk", "addr_sk", "amt")
+        .withColumn("amt", col("amt").cast(DecimalType(7, 2)))
+        .write.mode("overwrite").parquet(sales)
+      Seq((1, "A-OK", "orchid"), (2, "A-OL", "chiffon"), (3, "A-NO", "black"))
+        .toDF("item_sk", "item_id", "color")
+        .write.mode("overwrite").parquet(items)
+      Seq((1, -8), (2, 0)).toDF("addr_sk", "gmt").write.mode("overwrite").parquet(addr)
+      val q =
+        "SELECT item_id, sum(amt) total_sales FROM (" +
+          "SELECT it.item_id, sa.amt FROM parquet.`" + sales + "` sa, " +
+          "parquet.`" + items + "` it, parquet.`" + addr + "` ca " +
+          "WHERE sa.item_sk = it.item_sk AND sa.addr_sk = ca.addr_sk " +
+          "AND ca.gmt = -8 AND it.color IN ('orchid', 'chiffon')" +
+          ") t GROUP BY item_id ORDER BY item_id"
+      checkVegamMatches(q)
+    }
+  }
+
+  private def nativeStages(plan: SparkPlan): Seq[StagePlan] = {
+    val found = scala.collection.mutable.ArrayBuffer.empty[StagePlan]
+    def walk(p: SparkPlan): Unit = p match {
+      case a: AdaptiveSparkPlanExec =>
+        walk(a.inputPlan)
+        walk(a.executedPlan)
+      case n: NativeStageExec =>
+        n.nativePlan match {
+          case s: StagePlan => found += s
+          case _ =>
+        }
+        n.children.foreach(walk)
+      case other =>
+        other.children.foreach(walk)
+    }
+    walk(plan)
+    found.toSeq
+  }
+
+  private def checkVegamMatches(q: String): Unit = {
+    val expected = sql(q).collect().toSeq
+    withVegam {
+      val df = sql(q)
+      checkAnswer(df, expected)
+    }
+    withSQLConf(
+        VegamConf.VEGAM_ENABLED.key -> "true",
+        VegamConf.VEGAM_BACKEND.key -> "jvm",
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true",
+        SQLConf.SHUFFLE_PARTITIONS.key -> "4") {
+      val df = sql(q)
+      checkAnswer(df, expected)
     }
   }
 }

@@ -65,7 +65,7 @@ case class NativeStageExec(
    */
   override def requiredChildDistribution: Seq[Distribution] = nativePlan match {
     case s: StagePlan if rowChild.isDefined => rowDistribution(s)
-    case _ => UnspecifiedDistribution :: Nil
+    case _ => children.map(_ => UnspecifiedDistribution)
   }
 
   private def rowDistribution(s: StagePlan): Seq[Distribution] = {
