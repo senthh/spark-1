@@ -166,6 +166,8 @@ def main():
     p.add_argument("--only", default="", help="comma list, e.g. q3,q7")
     p.add_argument("--limit", type=int, default=0)
     p.add_argument("--runs", type=int, default=1)
+    p.add_argument("--stat", default="fastest", choices=("fastest", "mean"),
+                   help="fastest run wins, or the mean of runs")
     p.add_argument("--rel-tol", type=float, default=1e-9)
     p.add_argument("--out", default="tpcds_ab.tsv")
     args = p.parse_args()
@@ -195,6 +197,8 @@ def main():
         sql = open(os.path.join(args.queries, fn), encoding="utf-8",
                    errors="replace").read()
         off_s = on_s = float("inf")
+        off_times = []
+        on_times = []
         off_rows = on_rows = None
         frac, native = 0.0, False
         error = None
@@ -202,6 +206,7 @@ def main():
             spark.conf.set(toggle, "false")
             try:
                 off_rows, t, _ = timed_collect(spark, sql)
+                off_times.append(t)
                 off_s = min(off_s, t)
             except Exception as e:
                 error = ("OFF_ERROR", e)
@@ -209,6 +214,7 @@ def main():
             spark.conf.set(toggle, "true")
             try:
                 on_rows, t, plan = timed_collect(spark, sql)
+                on_times.append(t)
                 on_s = min(on_s, t)
                 frac, native = native_fraction(plan, marker)
             except Exception as e:
@@ -223,6 +229,9 @@ def main():
                 str(e).replace("\n", " ")[:200]))
             fails.append(name)
             continue
+        if args.stat == "mean":
+            off_s = sum(off_times) / len(off_times)
+            on_s = sum(on_times) / len(on_times)
         off_sum += off_s
         on_sum += on_s
         if native:

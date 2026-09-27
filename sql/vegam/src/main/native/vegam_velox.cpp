@@ -475,6 +475,31 @@ BuiltStage build_stage(const VegamDecoded& plan) {
     build_cols.push_back(scan_cols(b.scan));
   }
 
+  if (getenv("VEGAM_DEBUG") != nullptr) {
+    std::cerr << "vegam: DEBUG probe cols=[";
+    for (const auto& n : probe_cols.names) std::cerr << n << ",";
+    std::cerr << "] types=[";
+    for (const auto& t : probe_cols.types) std::cerr << t->toString() << ",";
+    std::cerr << "] groups=[";
+    for (const auto& g : plan.groups) std::cerr << g << ",";
+    std::cerr << "] nbuilds=" << plan.builds.size() << std::endl;
+    for (size_t i = 0; i < plan.builds.size(); i++) {
+      const auto& b = plan.builds[i];
+      std::cerr << "vegam: DEBUG build[" << i << "] cols=[";
+      for (const auto& n : build_cols[i].names) std::cerr << n << ",";
+      std::cerr << "] probe_keys=[";
+      for (const auto& k : b.probe_keys) std::cerr << k << ",";
+      std::cerr << "] build_keys=[";
+      for (const auto& k : b.build_keys) std::cerr << k << ",";
+      std::cerr << "] jt=" << b.join_type << " broadcast=" << b.broadcast
+                << " nfilters=" << b.filters.size() << std::endl;
+    }
+    for (const auto& f : plan.filters) {
+      std::cerr << "vegam: DEBUG filter col=" << f.col << " op=" << f.op
+                << std::endl;
+    }
+  }
+
   // Assign each stage filter to the scan that owns its column when that is
   // equivalent to filtering after the joins; the rest run after the joins.
   std::vector<VegamFilter> probe_filters;
@@ -521,6 +546,16 @@ BuiltStage build_stage(const VegamDecoded& plan) {
       for (const auto& k : plan.builds[i].probe_keys) acc.insert(k);
     }
     tail = acc;  // what the probe scan must produce
+  }
+  if (getenv("VEGAM_DEBUG") != nullptr) {
+    for (size_t i = 0; i < needed_after.size(); i++) {
+      std::cerr << "vegam: DEBUG needed_after[" << i << "]={";
+      for (const auto& n : needed_after[i]) std::cerr << n << ",";
+      std::cerr << "}" << std::endl;
+    }
+    std::cerr << "vegam: DEBUG probe_tail={";
+    for (const auto& n : tail) std::cerr << n << ",";
+    std::cerr << "}" << std::endl;
   }
 
   StageBuilder sb;
@@ -600,6 +635,10 @@ BuiltStage build_stage(const VegamDecoded& plan) {
 
   // Pre-projection: group keys as is, one input column per aggregate.
   const auto in_type = node->outputType();
+  if (getenv("VEGAM_DEBUG") != nullptr) {
+    std::cerr << "vegam: DEBUG final pre-projection type=" << in_type->toString()
+              << " (groups=" << plan.groups.size() << ")" << std::endl;
+  }
   auto col_type = [&](const std::string& n) {
     auto i = in_type->getChildIdxIfExists(n);
     if (!i.has_value()) throw Unsupported("column not available: " + n);
