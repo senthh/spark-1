@@ -155,6 +155,7 @@ abstract class Optimizer(catalogManager: CatalogManager)
         RemoveRedundantAliases,
         RemoveRedundantAggregates,
         PushPartialAggregateOverUnion,
+        PushPartialAggregateThroughJoin,
         UnwrapCastInBinaryComparison,
         RemoveNoopOperators,
         OptimizeUpdateFields,

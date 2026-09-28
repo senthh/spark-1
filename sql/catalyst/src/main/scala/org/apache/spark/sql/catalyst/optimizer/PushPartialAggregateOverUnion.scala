@@ -18,13 +18,13 @@
 package org.apache.spark.sql.catalyst.optimizer
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, Cast, If, Literal, NamedExpression, Not}
-import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, AggregateFunction, Count, Max, Min, Partial, Sum}
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, LogicalPlan, PartialAggregate, Project, Range, Union}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute}
+import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Partial}
+import org.apache.spark.sql.catalyst.plans.logical.{
+  Aggregate, LogicalPlan, PartialAggregate, Project, Range, Union}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern.{AGGREGATE, UNION}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.DecimalType
 
 /**
  * Gives first-class support to partial (pre-)aggregation in the Catalyst logical optimizer.
@@ -65,6 +65,7 @@ object PushPartialAggregateOverUnion extends Rule[LogicalPlan] with Logging {
 
   private val ENABLED = SQLConf.OPTIMIZER_PARTIAL_AGGREGATE_PUSHDOWN_ENABLED
   private val THRESHOLD = SQLConf.OPTIMIZER_PARTIAL_AGGREGATE_PUSHDOWN_THRESHOLD
+  import PartialAggregatePushDownHelper._
 
   override def apply(plan: LogicalPlan): LogicalPlan = plan.transformUpWithPruning(
     _.containsAnyPattern(AGGREGATE, UNION), ruleId) {
@@ -129,7 +130,6 @@ object PushPartialAggregateOverUnion extends Rule[LogicalPlan] with Logging {
     // the SAME expression objects the PartialAggregate emits, so rebinding the merge's buffer
     // references by resultId lines up with the union output by construction.
     val partialAggExprs = aggExprs.map(_.copy(mode = Partial))
-    val bufferByResultId = partialAggExprs.map(ae => ae.resultId -> ae).toMap
 
     val union = agg.child.asInstanceOf[Union]
     // Guarded: every grouping key is an Attribute referencing the union output.
@@ -162,85 +162,12 @@ object PushPartialAggregateOverUnion extends Rule[LogicalPlan] with Logging {
     // Merge result expressions: same grouping columns, but each aggregate function now reads the
     // buffer column emitted by the partial (stable aggBufferAttributes), looked up by resultId so
     // it references exactly the buffer columns the partial emitted.
-    val mergeResultExprs = agg.aggregateExpressions.map { expr =>
-      expr.transformDown {
-        case ae: AggregateExpression =>
-          val partial = bufferByResultId(ae.resultId)
-          val mergeFunc = mergeFunction(partial)
-          // Preserve the original aggregate's resultId so the output columns above are unchanged.
-          val merge = AggregateExpression(
-            mergeFunc, ae.mode, isDistinct = false, filter = None, resultId = ae.resultId)
-          // Re-applying a Complete-mode aggregate to a partial buffer can widen the type
-          // (e.g. DECIMAL: summing DECIMAL(22,2) partial sums yields DECIMAL(32,2)). Cast back to
-          // the original aggregate's result type so the output schema is unchanged. This is safe:
-          // the total of the partial sums fits in the original type by the same argument the
-          // original aggregate used.
-          if (merge.dataType != ae.dataType) {
-            Cast(merge, ae.dataType)
-          } else {
-            merge
-          }
-      }.asInstanceOf[NamedExpression]
-    }
+    val mergeResultExprs =
+      PartialAggregatePushDownHelper.mergeResultExpressions(
+        partialAggExprs, agg.aggregateExpressions)
 
     Aggregate(groupingAttrs, mergeResultExprs, newUnion)
   }
-
-  /**
-   * The merge function that reads the partial's aggregate-buffer column for the given function.
-   *
-   * For `Sum` with a single-column buffer (Long/integral result) a naive `Sum(buffer)` merge is
-   * correct. For `Sum` with a two-column buffer (Decimal / TRY-mode result: `sum` + `isEmpty`),
-   * the `isEmpty` flag records whether any non-null input was seen; an all-empty group must merge
-   * to NULL, not to the running-zero sum. We therefore null out each empty contribution so the
-   * Final `Sum` (which skips NULLs) yields NULL iff every arm was empty, and the correct total
-   * otherwise.
-   */
-  private def mergeFunction(ae: AggregateExpression): AggregateFunction = {
-    val bufferAttr = ae.aggregateFunction.aggBufferAttributes
-    ae.aggregateFunction match {
-      case _: Sum if bufferAttr.size == 2 =>
-        val value = bufferAttr(0)
-        val isEmpty = bufferAttr(1)
-        // If the partial arm saw no non-null input this group, drop its (zero) contribution so the
-        // group's merge stays NULL rather than 0. Value column is the running sum.
-        Sum(If(Not(isEmpty), value, Literal.create(null, value.dataType)))
-      case _: Sum => Sum(bufferAttr.head)
-      case _: Count => Sum(bufferAttr.head)
-      case _: Min => Min(bufferAttr.head)
-      case _: Max => Max(bufferAttr.head)
-      case f => throw new IllegalStateException(s"unreachable: $f")
-    }
-  }
-
-  /** Distinct aggregate expressions referenced by the result expressions, order-preserving. */
-  private def distinctAggregateExpressions(agg: Aggregate): Seq[AggregateExpression] = {
-    val seen = scala.collection.mutable.LinkedHashMap[AggregateExpression, Unit]()
-    agg.aggregateExpressions.foreach { expr =>
-      expr.collect { case ae: AggregateExpression => ae }.foreach { ae =>
-        seen.getOrElseUpdate(ae, (): Unit)
-      }
-    }
-    seen.keys.toSeq
-  }
-
-  private def canPreAggregate(aggs: Seq[AggregateExpression]): Boolean =
-    aggs.nonEmpty && aggs.forall { ae =>
-      !ae.isDistinct &&
-        ae.filter.isEmpty &&
-        (ae.aggregateFunction match {
-          case s: Sum =>
-            // Single-column buffer (integral/Long result): naive Sum(buffer) merge is fine.
-            val buf = s.aggBufferAttributes
-            buf.size == 1 ||
-              // Decimal Sum tracks `isEmpty` in a second buffer column; supported via the
-              // empty-aware merge in [[mergeFunction]]. TRY-mode integral Sum (also 2-column,
-              // but with overflow-propagation semantics we do not replicate) stays excluded.
-              (buf.size == 2 && s.dataType.isInstanceOf[DecimalType])
-          case _: Count | _: Min | _: Max => true
-          case _ => false
-        })
-    }
 
   /**
    * Keep the partial only if grouping on the aggregate keys is estimated to collapse rows
