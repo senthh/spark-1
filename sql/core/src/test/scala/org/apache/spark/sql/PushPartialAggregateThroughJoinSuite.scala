@@ -249,6 +249,25 @@ class PushPartialAggregateThroughJoinSuite
     } finally { Utils.deleteRecursively(dir) }
   }
 
+  test("aggregates on BOTH sides: not pushed (would multiply the raw-side measure)") {
+    val dir = scanDir()
+    try {
+      val l = Seq((1, 10, 5), (2, 20, 7)).toDF("fid", "dkey", "amt")
+      val r = Seq((10, "a", 100), (20, "b", 200)).toDF("dkey", "dname", "rw")
+      withScan("l8", dir, l) { withScan("r8", dir, r) {
+        // SUM(f.amt) on the fact AND SUM(r.rw) on the dim: collapsing one side would corrupt the
+        // measure on the other (it would be multiplied by the collapse ratio). Must not push.
+        val q = """SELECT dname, SUM(f.amt) AS s, SUM(r.rw) AS w
+                  |FROM l8 f JOIN r8 r ON f.dkey = r.dkey
+                  |GROUP BY dname ORDER BY dname""".stripMargin
+        assertCorrectness(q, "both-sides aggregates")
+        val optimized = withOptimization(enabled = true) { sql(q).queryExecution.optimizedPlan }
+        assert(!hasPartialOnEitherSide(optimized),
+          s"expected NO PartialAggregate (both sides aggregate) in:\n$optimized")
+      }}
+    } finally { Utils.deleteRecursively(dir) }
+  }
+
   test("with optimization disabled, no PartialAggregate is introduced") {
     val dir = scanDir()
     try {

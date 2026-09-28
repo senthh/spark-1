@@ -108,6 +108,11 @@ object PushPartialAggregateThroughJoin extends Rule[LogicalPlan] with Logging wi
         case Some((left, right))
             if conditionRefsCarried(left, right, join) &&
               (left.groups.nonEmpty || right.groups.nonEmpty) &&
+              // Correctness: we collapse exactly one side (the one carrying the aggregates); this
+              // is only sound when the OTHER side has no aggregates of its own - if both
+              // sides had a measure, aggregating the raw side's measure over the collapsed
+              // join would multiply it by the collapse ratio. Restrict to one side only.
+              (left.aggs.isEmpty || right.aggs.isEmpty) &&
               isProfitable(left, right, join) =>
           pushBothSides(agg, join, left, right)
         case _ => agg
