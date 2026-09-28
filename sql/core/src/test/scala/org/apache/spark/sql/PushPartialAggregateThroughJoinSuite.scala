@@ -74,6 +74,16 @@ class PushPartialAggregateThroughJoinSuite
       case _ => false
     }
 
+  /** True if some Join in the plan has a PartialAggregate under either input. */
+  private def hasPartialOnEitherSide(
+      plan: org.apache.spark.sql.catalyst.plans.logical.LogicalPlan): Boolean =
+    plan.exists {
+      case j: Join =>
+        j.left.exists(_.isInstanceOf[PartialAggregate]) ||
+          j.right.exists(_.isInstanceOf[PartialAggregate])
+      case _ => false
+    }
+
   test("one-sided star shape: SUM over inner join grouped by fact column, partial pushed, results equal") {
     val dir = scanDir()
     try {
@@ -177,6 +187,64 @@ class PushPartialAggregateThroughJoinSuite
         val optimized = withOptimization(enabled = true) { sql(q).queryExecution.optimizedPlan }
         assert(!hasPartialUnderJoin(optimized),
           s"expected NO PartialAggregate under non-equi join in:\n$optimized")
+      }}
+    } finally { Utils.deleteRecursively(dir) }
+  }
+
+  test("two-side split: GROUP BY dim column (grouping on right), aggregates on left, both partials fire") {
+    val dir = scanDir()
+    try {
+      val fact = Seq((1, 10, 5), (2, 10, 7), (3, 11, 3), (4, 12, 9), (5, 12, 1)).toDF("fid", "dkey", "amt")
+      val dim = Seq((10, "a"), (11, "b"), (12, "c")).toDF("dkey", "dname")
+      withScan("f2s", dir, fact) { withScan("d2s", dir, dim) {
+        // Grouping key dname is on the RIGHT (dim) input; SUM(amt) on the left (fact). The rule must
+        // split: partial keyed by (dkey) on the fact, by (dname, dkey) on the dim, merge by dname.
+        val q = """SELECT d.dname, SUM(f.amt) AS s
+                  |FROM f2s f JOIN d2s d ON f.dkey = d.dkey
+                  |GROUP BY d.dname ORDER BY d.dname""".stripMargin
+        assertCorrectness(q, "two-side split star")
+        val optimized = withOptimization(enabled = true) { sql(q).queryExecution.optimizedPlan }
+        assert(hasPartialOnEitherSide(optimized),
+          s"expected a PartialAggregate under the two-side join in:\n$optimized")
+      }}
+    } finally { Utils.deleteRecursively(dir) }
+  }
+
+  test("two-side split with grouping strings across both dim keys mapping to same name") {
+    val dir = scanDir()
+    try {
+      // Dim has two dkeys (20,30) sharing the SAME dname "u" - the dim partial must keep both keys
+      // separate so the join/merge multiplicity is correct.
+      val fact = Seq((1, 20, 1), (2, 30, 2), (3, 20, 3), (4, 30, 4)).toDF("fid", "dkey", "amt")
+      val dim = Seq((20, "u"), (30, "u")).toDF("dkey", "dname")
+      withScan("f3s", dir, fact) { withScan("d3s", dir, dim) {
+        val q = """SELECT d.dname, SUM(f.amt) AS s
+                  |FROM f3s f JOIN d3s d ON f.dkey = d.dkey
+                  |GROUP BY d.dname ORDER BY d.dname""".stripMargin
+        assertCorrectness(q, "two-side split multi-key group")
+        val optimized = withOptimization(enabled = true) { sql(q).queryExecution.optimizedPlan }
+        assert(hasPartialOnEitherSide(optimized),
+          s"expected a PartialAggregate under the two-side join in:\n$optimized")
+      }}
+    } finally { Utils.deleteRecursively(dir) }
+  }
+
+  test("two-side split: fact side fan-out (dim duplicate keys) still correct") {
+    val dir = scanDir()
+    try {
+      // Dim has duplicate dkey=20 (x,y,z); each fact row fans out x3. The dim partial keyed by
+      // (dname, dkey) still keeps 3 dim rows distinct per dkey, so the join multiplicity holds.
+      val fact = Seq((1, 20, 5), (2, 20, 7)).toDF("fid", "dkey", "amt")
+      val dim = Seq((20, "a"), (20, "a"), (20, "a")).toDF("dkey", "dname")
+      withScan("f4s", dir, fact) { withScan("d4s", dir, dim) {
+        val q = """SELECT d.dname, SUM(f.amt) AS s
+                  |FROM f4s f JOIN d4s d ON f.dkey = d.dkey
+                  |GROUP BY d.dname ORDER BY d.dname""".stripMargin
+        // SUM(amt) = (5+7) * 3 = 36; COUNT would be 2*3 = 6. Only 0 errors, rows match, is the contract.
+        assertCorrectness(q, "two-side split fan-out")
+        val optimized = withOptimization(enabled = true) { sql(q).queryExecution.optimizedPlan }
+        assert(hasPartialOnEitherSide(optimized),
+          s"expected a PartialAggregate under the two-side join in:\n$optimized")
       }}
     } finally { Utils.deleteRecursively(dir) }
   }

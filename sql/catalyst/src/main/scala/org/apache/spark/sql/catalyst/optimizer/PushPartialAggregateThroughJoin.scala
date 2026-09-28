@@ -28,40 +28,44 @@ import org.apache.spark.sql.catalyst.trees.TreePattern.{AGGREGATE, JOIN}
 import org.apache.spark.sql.internal.SQLConf
 
 /**
- * Pushes a partial (pre-)aggregate from a group-by below a [[Join]].
+ * Pushes partial (pre-)aggregates from a group-by below a [[Join]].
  *
- * Mirrors the paper's Fig 9, restricted to the conservative, provably-correct shape that
- * dominates the TPC-DS star pattern: the grouping keys and every aggregate-function argument come
- * from the '''left''' input of an inner-style join, and the join sits directly under the aggregate
- * (or under a chain of column-pruning [[Project]]s feeding it).
+ * Mirrors the paper's Fig 9: grouping keys and aggregate-function arguments are split across the
+ * two join inputs, and a partial aggregate is pushed onto '''each''' input that contributes them.
+ * The classical star shape (aggregate grouped by a dimension attribute) falls out as the special
+ * case where grouping + aggregates live on the right (dimension) side and the fact side only
+ * contributes its join key.
  *
- *   Aggregate(g, [F(x)])                     Aggregate(g, [merge F])
- *        |                                         |
- *     Join(L, R, on L.k=R.k) (Inner)    ->     Project(extended w/ buffers)
- *      /          \                                 |
- *     L            R                  PartialAgg(g + Lk, [partial F])   R
- *                                            |
- *                                            L        <- fact rows collapsed
+ *   Aggregate(g, [F(x)])                    Aggregate(g, [merge F_L, merge F_R])
+ *        |                                          |
+ *     Join(L, R, on L.k=R.k) (Inner)  ->       Join(
+ *      /          \                              PartialAgg(g_L + Lk, [partial F_L])  <- on L
+ *     L            R                            PartialAgg(g_R + Rk, [partial F_R])  <- on R
  *
  * Why it is correct (the crucial subtlety):
- *   - A partial keyed on ''g alone'' would be wrong: a group whose rows span multiple join-key
- *     values would be collapsed to one row, dropping the multiplicity each (g,k) pair needs for
- *     the join fan-out. So the pushed partial must key on '''g + the left join
- *     keys''', preserving
- *     every distinct (g, k) tuple the join needs.
- *   - The join then fans each partial (g,k) row out to its right-side matches exactly as before.
- *   - A merge Aggregate on top regroups by g (dropping the now-spent join keys k) and re-combines
- *     the partial buffers. Because the merge functions are associative, the total is identical to
- *     aggregating the raw left input through the join.
+ *   - A partial keyed on a side's grouping keys ''alone'' is wrong: a group whose rows span
+ *     multiple join-key values would be collapsed to one row, dropping the multiplicity each
+ *     (side-key, join-key) tuple needs for the join fan-out. So each pushed partial must key on
+ *     '''its side's grouping keys + that side's join keys''', preserving every distinct tuple the
+ *     join needs.
+ *   - The join then fans each partial row out to its matches on the other side exactly as before.
+ *   - A merge Aggregate on top regroups by the full grouping key set (dropping the now-spent join
+ *     keys) and associatively re-combines the partial buffers.
  *
- * Scope (conservative): only fires when every grouping expression and every aggregate argument is
- * resolvable to the join's left (fact) output, the join is Inner-like, and there are no non-equi
- * join predicates referencing left columns the partial would not carry. Anything else is left
- * untouched - a partial is always optional, so skipping never changes correctness.
+ * Scope (conservative): inner-style joins only; each grouping key and each aggregate function must
+ * resolve entirely to one input (an aggregate spanning both inputs is rejected); and the join
+ * condition must not reference, on a given side, columns that the pushed partial would not carry.
+ * Anything else is left untouched - a partial is always optional, so skipping never changes
+ * correctness.
  */
 object PushPartialAggregateThroughJoin extends Rule[LogicalPlan] with Logging with PredicateHelper {
 
   private val ENABLED = SQLConf.OPTIMIZER_PARTIAL_AGGREGATE_PUSHDOWN_ENABLED
+
+  /** (group keys, agg functions, join keys) for one side of a split aggregate-over-join. */
+  private case class Side(groups: Seq[Attribute], aggs: Seq[AggregateExpression],
+      joinKeys: Seq[Attribute])
+
   import PartialAggregatePushDownHelper._
 
   override def apply(plan: LogicalPlan): LogicalPlan = plan.transformUpWithPruning(
@@ -73,7 +77,7 @@ object PushPartialAggregateThroughJoin extends Rule[LogicalPlan] with Logging wi
           // Do not re-fire once we have pushed a partial into the join in a prior iteration.
           !child.exists(_.isInstanceOf[PartialAggregate]) =>
       peelToJoin(agg, child) match {
-        case Some(join) if isInnerLike(join.joinType) && aggOnLeftOnly(agg, join) =>
+        case Some(join) if isInnerLike(join.joinType) =>
           constructPartialBelowJoin(agg, join)
         case _ => agg
       }
@@ -94,128 +98,167 @@ object PushPartialAggregateThroughJoin extends Rule[LogicalPlan] with Logging wi
     case _ => None
   }
 
-  /** True if every grouping key and every aggregate argument resolves to the left output. */
-  private def aggOnLeftOnly(agg: Aggregate, join: Join): Boolean = {
-    val leftIds = join.left.outputSet.map(_.exprId).toSet
-    agg.groupingExpressions.forall(g =>
-      g.references.nonEmpty && g.references.forall(r => leftIds.contains(r.exprId))) &&
-      distinctAggregateExpressions(agg).forall(ae =>
-        ae.references.forall(r => leftIds.contains(r.exprId)))
-  }
-
-  /** Builds the pushed-down plan, or returns the original unchanged when not profitable. */
+  /** Builds the pushed-down plan, or returns the original unchanged when not suitable. */
   private def constructPartialBelowJoin(agg: Aggregate, join: Join): LogicalPlan = {
-    val grouping = agg.groupingExpressions.map(_.asInstanceOf[Attribute])
     val aggExprs = distinctAggregateExpressions(agg)
     if (aggExprs.isEmpty || !canPreAggregate(aggExprs)) {
       agg
-    } else if (!partialCoversConditionRefs(grouping, join)) {
-      // The join condition references left columns (e.g. a non-equi predicate) that the partial
-      // output would not carry; pushing would orphan them. Skip.
-      agg
-    } else if (!isProfitableBelowJoin(join, grouping)) {
-      agg
     } else {
-      pushOntoLeft(agg, join, grouping, aggExprs)
+      splitAcrossSides(agg, join, aggExprs) match {
+        case Some((left, right))
+            if conditionRefsCarried(left, right, join) &&
+              (left.groups.nonEmpty || right.groups.nonEmpty) &&
+              isProfitable(left, right, join) =>
+          pushBothSides(agg, join, left, right)
+        case _ => agg
+      }
     }
   }
 
   /**
-   * True iff the pushed partial's output set will include every left-side attribute referenced by
-   * the join condition (i.e. anything beyond the equi-join keys and grouping keys is not allowed,
-   * since the partial output only carries those plus the aggregate buffers).
+   * Splits the aggregate's grouping keys and functions across the two join inputs. Returns None
+   * unless every grouping key and every aggregate function resolves entirely to exactly one input.
    */
-  private def partialCoversConditionRefs(grouping: Seq[Attribute], join: Join): Boolean = {
-    val leftIds = join.left.outputSet.map(_.exprId).toSet
-    val groupingIds = grouping.map(_.exprId).toSet
-    val joinKeyIds =
-      equiJoinKeysOnLeft(join, leftIds).collect { case a: Attribute => a.exprId }.toSet
-    val covered = groupingIds ++ joinKeyIds
-    join.condition.map(splitConjunctivePredicates).getOrElse(Nil).forall { pred =>
-      pred.references.forall(r =>
-        !leftIds.contains(r.exprId) || covered.contains(r.exprId))
-    }
-  }
-
-  /**
-   * Pushes a partial aggregate onto the left (fact) input, preserving the join keys in the
-   * partial's grouping so the join fan-out is unchanged (see class docs).
-   */
-  private def pushOntoLeft(
+  private def splitAcrossSides(
       agg: Aggregate,
       join: Join,
-      grouping: Seq[Attribute],
-      aggExprs: Seq[AggregateExpression]): LogicalPlan = {
-    val leftIds = join.left.outputSet.map(_.exprId).toSet
+      aggExprs: Seq[AggregateExpression]): Option[(Side, Side)] = {
+    val lIds = join.left.outputSet.map(_.exprId).toSet
+    val rIds = join.right.outputSet.map(_.exprId).toSet
 
-    // Left equi-join keys (as attributes resolvable to the left input) - added to the grouping so
-    // multiplicity is preserved through the join.
-    val leftJoinKeys = equiJoinKeysOnLeft(join, leftIds)
+    val lKeys = scala.collection.mutable.ArrayBuffer[Attribute]()
+    val rKeys = scala.collection.mutable.ArrayBuffer[Attribute]()
+    for (g <- agg.groupingExpressions.map(_.asInstanceOf[Attribute])) {
+      if (lIds.contains(g.exprId)) lKeys += g
+      else if (rIds.contains(g.exprId)) rKeys += g
+      else return None // grouping key resolves to neither input - cannot split
+    }
 
-    // Dedup keys keeping order: grouping first, then any join key not already a grouping key.
-    val partialGrouping = (grouping ++ leftJoinKeys.map(_.asInstanceOf[Attribute])).distinct
-    // The merge re-groups on the original grouping keys only (join keys are spent by the join).
-    val mergeGrouping = grouping
+    val lAggs = scala.collection.mutable.ArrayBuffer[AggregateExpression]()
+    val rAggs = scala.collection.mutable.ArrayBuffer[AggregateExpression]()
+    for (ae <- aggExprs) {
+      val refs = ae.references
+      if (refs.forall(r => lIds.contains(r.exprId))) lAggs += ae
+      else if (refs.forall(r => rIds.contains(r.exprId))) rAggs += ae
+      else return None // agg spans both inputs - cannot push a per-side partial
+    }
 
-    val partialAggExprs = aggExprs.map(_.copy(mode = Partial))
-    val partial = PartialAggregate(partialGrouping, partialAggExprs, join.left)
-    val newJoin = join.copy(left = partial)
+    val lJoinKeys = equiJoinKeysOnSide(join, lIds).collect { case a: Attribute => a }
+    val rJoinKeys = equiJoinKeysOnSide(join, rIds).collect { case a: Attribute => a }
 
-    // The pass-through Project(s) column-pruning placed between the aggregate and the join
-    // reference the raw left columns that the partial now absorbs. They only trimmed columns (bare
-    // attributes, unchanged ids), so they are redundant once the partial carries grouping keys +
-    // buffer columns - which is exactly what the merge Aggregate reads. Root the merge over the
-    // join directly; its output schema is unchanged (mergeResultExpressions preserves the original
-    // result aliases/ids), so nodes above are not affected.
+    Some(Side(lKeys.toSeq, lAggs.toSeq, lJoinKeys) -> Side(rKeys.toSeq, rAggs.toSeq, rJoinKeys))
+  }
+
+  /**
+   * True iff the pushed partials will carry every attribute the join condition references on each
+   * side (a side carries its grouping keys, its join keys and its aggregate-buffer columns).
+   */
+  private def conditionRefsCarried(left: Side, right: Side, join: Join): Boolean = {
+    val lIds = join.left.outputSet.map(_.exprId).toSet
+    val rIds = join.right.outputSet.map(_.exprId).toSet
+    val lCarried = (left.groups ++ left.joinKeys).map(_.exprId).toSet
+    val rCarried = (right.groups ++ right.joinKeys).map(_.exprId).toSet
+    join.condition.map(splitConjunctivePredicates).getOrElse(Nil).forall { pred =>
+      pred.references.forall { spRef =>
+        if (lIds.contains(spRef.exprId)) lCarried.contains(spRef.exprId)
+        else if (rIds.contains(spRef.exprId)) rCarried.contains(spRef.exprId)
+        else true
+      }
+    }
+  }
+
+  /**
+   * Pushes a partial aggregate onto the side that carries the aggregate functions (the "fact"
+   * side) and leaves the other side raw. Collapsing both sides is unsafe: an inner join's fan-out
+   * multiplicity comes from the raw side's duplicate keys, so if both sides collapse, that
+   * multiplicity is destroyed. Collapsing one side is always safe, because every row merged on it
+   * shares its join key and therefore matches the same raw-side rows - so Sum/Merge sees the same
+   * total (sum of merged values) times the same fan-out count. The merge Aggregate regroups by the
+   * full grouping key set (any grouping keys that live on the raw dimension side are still
+   * present there) and reads the partial buffers.
+   */
+  private def pushBothSides(agg: Aggregate, join: Join, left: Side, right: Side): LogicalPlan = {
+    // Collapse the side with aggregates; keep the other raw (it carries the fan-out multiplicity).
+    val collapseLeft = left.aggs.nonEmpty
+
+    val lPartialKey = dedup(left.groups ++ left.joinKeys)
+    val rPartialKey = dedup(right.groups ++ right.joinKeys)
+    val lPartialAggs = left.aggs.map(_.copy(mode = Partial))
+    val rPartialAggs = right.aggs.map(_.copy(mode = Partial))
+
+    val newLeft = if (collapseLeft) {
+      PartialAggregate(lPartialKey, lPartialAggs, join.left)
+    } else {
+      join.left
+    }
+    val newRight = if (collapseLeft) {
+      join.right
+    } else {
+      PartialAggregate(rPartialKey, rPartialAggs, join.right)
+    }
+
+    val newJoin = join.copy(left = newLeft, right = newRight)
+    val mergeGrouping = agg.groupingExpressions.asInstanceOf[Seq[Attribute]]
+
+    // The partial buffers from the collapsed side are referenced by resultId so the merge reads
+    // them; aggregates on the raw side are unchanged (re-aggregate at the merge over the join).
+    val allPartialAggs = if (collapseLeft) lPartialAggs else rPartialAggs
     val mergeResultExprs =
       PartialAggregatePushDownHelper.mergeResultExpressions(
-        partialAggExprs, agg.aggregateExpressions)
+        allPartialAggs, agg.aggregateExpressions)
 
     Aggregate(mergeGrouping, mergeResultExprs, newJoin)
   }
 
-  /** Left-side equi-join keys, as expressions resolved to the left input. */
-  private def equiJoinKeysOnLeft(
-      join: Join,
-      leftIds: Set[org.apache.spark.sql.catalyst.expressions.ExprId]): Seq[Expression] = {
-    join.condition.map(splitConjunctivePredicates).getOrElse(Nil).flatMap {
-      case EqualTo(l, r)
-          if l.references.size == 1 && r.references.size == 1 =>
-        if (leftIds.contains(l.references.head.exprId)) Some(l)
-        else if (leftIds.contains(r.references.head.exprId)) Some(r)
-        else None
-      case _ => None
-    }
+  private def dedup(attrs: Seq[Attribute]): Seq[Attribute] = {
+    val seen = scala.collection.mutable.LinkedHashSet[
+      org.apache.spark.sql.catalyst.expressions.ExprId]()
+    attrs.filter(a => seen.add(a.exprId))
   }
 
   /**
-   * Cost gate. Keeps the partial (conservatively) when stats are unavailable; otherwise requires
-   * the estimated partial-group count (grouping + join keys, since that is what it actually groups
-   * on) to drop below the reduction threshold.
+   * Cost gate. Keeps the push-down (conservatively) when stats are unavailable; otherwise requires
+   * the estimated partial-group count on a side that actually aggregates (i.e. has grouping keys)
+   * to drop below the reduction threshold. A side with no grouping keys only contributes its join
+   * key (a low-cardinality fan filter) and is not itself the "collapse" opportunity.
    */
-  private def isProfitableBelowJoin(
-      join: Join,
-      grouping: Seq[Attribute]): Boolean = {
+  private def isProfitable(left: Side, right: Side, join: Join): Boolean = {
     val threshold = SQLConf.get.getConf(SQLConf.OPTIMIZER_PARTIAL_AGGREGATE_PUSHDOWN_THRESHOLD)
     if (threshold >= 1.0) {
       true
     } else {
-      val groupingIds = grouping.map(_.exprId).toSet
-      val extraKeys = equiJoinKeysOnLeft(join, join.left.outputSet.map(_.exprId).toSet)
-        .collect { case a: Attribute if !groupingIds.contains(a.exprId) => a }
-      val effectiveGrouping = grouping ++ extraKeys
+      List(
+        (left, join.left),
+        (right, join.right)
+      ).filter { case (side, _) => side.groups.nonEmpty }.exists {
+        case (side, plan) =>
+          val effectiveGrouping = dedup(side.groups ++ side.joinKeys)
+          plan.stats.rowCount.map { childRows =>
+            val groupingStats = effectiveGrouping.flatMap { a =>
+              plan.stats.attributeStats.get(a).flatMap(_.distinctCount)
+            }
+            if (groupingStats.size != effectiveGrouping.length) {
+              true // cannot estimate - keep the partial (merge still yields the correct result)
+            } else {
+              val estimatedGroups: BigInt = groupingStats.foldLeft(BigInt(1))(_ * _)
+              estimatedGroups.toDouble / childRows.toDouble <= threshold
+            }
+          }.getOrElse(true)
+      }
+    }
+  }
 
-      join.left.stats.rowCount.map { childRows =>
-        val groupingStats = effectiveGrouping.flatMap { a =>
-          join.left.stats.attributeStats.get(a).flatMap(_.distinctCount)
-        }
-        if (groupingStats.size != effectiveGrouping.length) {
-          true // cannot estimate - keep the partial (merge still yields the correct result)
-        } else {
-          val estimatedGroups: BigInt = groupingStats.foldLeft(BigInt(1))(_ * _)
-          estimatedGroups.toDouble / childRows.toDouble <= threshold
-        }
-      }.getOrElse(true)
+  /** Side-specific equi-join keys, as expressions resolved to that side's input. */
+  private def equiJoinKeysOnSide(
+      join: Join,
+      sideIds: Set[org.apache.spark.sql.catalyst.expressions.ExprId]): Seq[Expression] = {
+    join.condition.map(splitConjunctivePredicates).getOrElse(Nil).flatMap {
+      case EqualTo(l, r)
+          if l.references.size == 1 && r.references.size == 1 =>
+        if (sideIds.contains(l.references.head.exprId)) Some(l)
+        else if (sideIds.contains(r.references.head.exprId)) Some(r)
+        else None
+      case _ => None
     }
   }
 }

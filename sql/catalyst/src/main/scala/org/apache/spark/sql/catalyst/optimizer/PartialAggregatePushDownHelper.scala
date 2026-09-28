@@ -115,7 +115,7 @@ private[optimizer] object PartialAggregatePushDownHelper extends Logging {
     val bufferByResultId = aggExprs.map(ae => ae.resultId -> ae).toMap
     resultExprs.map { expr =>
       expr.transformDown {
-        case ae: AggregateExpression =>
+        case ae: AggregateExpression if bufferByResultId.contains(ae.resultId) =>
           val partial = bufferByResultId(ae.resultId)
           val mergeFunc = mergeFunction(partial)
           // Preserve the original aggregate's resultId so the output columns above are unchanged.
