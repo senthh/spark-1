@@ -186,15 +186,18 @@ object PushPartialAggregateOverUnion extends Rule[LogicalPlan] with Logging {
           case a: Attribute => childStats.attributeStats.get(a).flatMap(_.distinctCount)
           case _ => None
         }
+        // Strict gate: only add the pre-aggregate when the group count can be ESTIMATED and is
+        // small enough to prove a meaningful collapse. A partial is always optional, so when we
+        // cannot measure the reduction (missing stats, or a grouping expr with no distinctCount)
+        // we must NOT insert the extra stage on speculation - at small scales it is pure overhead.
         if (groupingStats.size != agg.groupingExpressions.length) {
-          // Cannot estimate group cardinality; assume it does not reduce enough.
-          true
+          false
         } else {
           val estimatedGroups: BigInt = groupingStats.foldLeft(BigInt(1))(_ * _)
           val ratio = estimatedGroups.toDouble / childRows.toDouble
           ratio <= threshold
         }
-      }.getOrElse(true)
+      }.getOrElse(false)
     }
   }
 }

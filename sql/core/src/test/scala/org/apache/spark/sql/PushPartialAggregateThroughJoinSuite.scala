@@ -40,7 +40,16 @@ class PushPartialAggregateThroughJoinSuite
   import testImplicits._
 
   private def withOptimization[A](enabled: Boolean)(f: => A): A =
-    withSQLConf(SQLConf.OPTIMIZER_PARTIAL_AGGREGATE_PUSHDOWN_ENABLED.key -> enabled.toString)(f)
+    if (enabled) {
+      // Force the partial to fire (threshold 1.0 bypasses the cost gate) so plan-shape assertions
+      // and the correctness run both exercise an actually-pushed-down plan. The strict-on-unknown
+      // cost gate is verified separately (see the default-threshold negative test).
+      withSQLConf(
+        SQLConf.OPTIMIZER_PARTIAL_AGGREGATE_PUSHDOWN_ENABLED.key -> "true",
+        SQLConf.OPTIMIZER_PARTIAL_AGGREGATE_PUSHDOWN_THRESHOLD.key -> "1.0")(f)
+    } else {
+      withSQLConf(SQLConf.OPTIMIZER_PARTIAL_AGGREGATE_PUSHDOWN_ENABLED.key -> "false")(f)
+    }
 
   /** Runs `query` with the optimization on and off and asserts the results agree. */
   private def assertCorrectness(query: String, name: String): Unit = {
@@ -264,6 +273,27 @@ class PushPartialAggregateThroughJoinSuite
         val optimized = withOptimization(enabled = true) { sql(q).queryExecution.optimizedPlan }
         assert(!hasPartialOnEitherSide(optimized),
           s"expected NO PartialAggregate (both sides aggregate) in:\n$optimized")
+      }}
+    } finally { Utils.deleteRecursively(dir) }
+  }
+
+  test("strict cost gate: no distinctCount stats -> partial NOT fired at default threshold") {
+    val dir = scanDir()
+    try {
+      val l = Seq((1, 10, 5), (2, 10, 7), (3, 11, 3)).toDF("fid", "dkey", "amt")
+      val r = Seq((10, "a")).toDF("dkey", "dname")
+      withScan("lsg", dir, l) { withScan("rsg", dir, r) {
+        val q = """SELECT dname, SUM(f.amt) AS s FROM lsg f JOIN rsg r ON f.dkey = r.dkey
+                  |GROUP BY dname""".stripMargin
+        // These parquet views have NO column statistics (distinctCount), so the strict gate cannot
+        // prove a row collapse and must NOT insert the extra pre-aggregate stage.
+        withSQLConf(
+          SQLConf.OPTIMIZER_PARTIAL_AGGREGATE_PUSHDOWN_ENABLED.key -> "true",
+          SQLConf.OPTIMIZER_PARTIAL_AGGREGATE_PUSHDOWN_THRESHOLD.key -> "0.5") {
+          val optimized = sql(q).queryExecution.optimizedPlan
+          assert(!hasPartialOnEitherSide(optimized),
+            s"expected NO PartialAggregate without distinctCount stats in:\n$optimized")
+        }
       }}
     } finally { Utils.deleteRecursively(dir) }
   }

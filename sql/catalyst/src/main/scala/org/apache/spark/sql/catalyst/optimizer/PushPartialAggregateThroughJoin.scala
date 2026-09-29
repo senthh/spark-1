@@ -242,13 +242,17 @@ object PushPartialAggregateThroughJoin extends Rule[LogicalPlan] with Logging wi
             val groupingStats = effectiveGrouping.flatMap { a =>
               plan.stats.attributeStats.get(a).flatMap(_.distinctCount)
             }
+            // Strict gate: the pre-aggregate is only worth it if the group count can be ESTIMATED
+            // and is small enough to prove a meaningful row collapse. A partial is always optional,
+            // so when we cannot measure the reduction we must NOT add the extra hash-build +
+            // shuffle stage on speculation - at small scales (or with sparse stats) it is overhead.
             if (groupingStats.size != effectiveGrouping.length) {
-              true // cannot estimate - keep the partial (merge still yields the correct result)
+              false
             } else {
               val estimatedGroups: BigInt = groupingStats.foldLeft(BigInt(1))(_ * _)
               estimatedGroups.toDouble / childRows.toDouble <= threshold
             }
-          }.getOrElse(true)
+          }.getOrElse(false)
       }
     }
   }

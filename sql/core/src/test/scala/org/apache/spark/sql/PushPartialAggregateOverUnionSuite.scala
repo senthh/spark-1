@@ -39,7 +39,16 @@ class PushPartialAggregateOverUnionSuite
   import testImplicits._
 
   private def withOptimization[A](enabled: Boolean)(f: => A): A =
-    withSQLConf(SQLConf.OPTIMIZER_PARTIAL_AGGREGATE_PUSHDOWN_ENABLED.key -> enabled.toString)(f)
+    if (enabled) {
+      // Force the partial to fire (threshold 1.0 bypasses the cost gate) so plan-shape assertions
+      // and the correctness run both exercise an actually-pushed-down plan. The strict-on-unknown
+      // cost gate is verified separately.
+      withSQLConf(
+        SQLConf.OPTIMIZER_PARTIAL_AGGREGATE_PUSHDOWN_ENABLED.key -> "true",
+        SQLConf.OPTIMIZER_PARTIAL_AGGREGATE_PUSHDOWN_THRESHOLD.key -> "1.0")(f)
+    } else {
+      withSQLConf(SQLConf.OPTIMIZER_PARTIAL_AGGREGATE_PUSHDOWN_ENABLED.key -> "false")(f)
+    }
 
   /** Registers `data` as a scan-backed temp view (parquet) so the partial push-down actually fires.
    *  LocalRelation-backed views (toDF) are skipped by the rule by design (ConvertToLocalRelation
